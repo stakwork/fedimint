@@ -552,7 +552,12 @@ impl ClnHtlcInterceptor {
 
         info!("Intercepted htlc with SCID: {:?}", short_channel_id);
 
-        if let Some(subscription) = self.subscriptions.lock().await.get(&short_channel_id) {
+        let subs = self.subscriptions.lock().await;
+        let mut thesub = subs.get(&short_channel_id);
+        if let None = thesub {
+            thesub = subs.get(&0)
+        }
+        if let Some(subscription) = thesub {
             let payment_hash = payload.htlc.payment_hash.to_vec();
 
             // This has a chance of collision since payment_hashes are not guaranteed to be
