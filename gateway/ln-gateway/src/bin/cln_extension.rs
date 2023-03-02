@@ -102,6 +102,8 @@ pub struct Onion {
     pub short_channel_id: Option<String>,
     #[serde(deserialize_with = "as_fedimint_amount")]
     pub forward_msat: Amount,
+    #[serde(default)]
+    pub next_onion: Vec<u8>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -577,6 +579,7 @@ impl ClnHtlcInterceptor {
                     incoming_expiry: htlc_expiry,
                     short_channel_id,
                     intercepted_htlc_id: intercepted_htlc_id.into_inner().to_vec(),
+                    next_onion: payload.onion.next_onion,
                 }))
                 .await
             {

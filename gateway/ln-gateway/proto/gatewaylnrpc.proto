@@ -93,6 +93,9 @@ message SubscribeInterceptHtlcsResponse {
   // A unique identifier for every intercepted HTLC
   // Used to identify an intercepted HTLC through processing and settlement
   bytes intercepted_htlc_id = 11;
+
+  // The next onion blob
+  bytes next_onion = 12;
 }
 
 message CompleteHtlcsRequest {
