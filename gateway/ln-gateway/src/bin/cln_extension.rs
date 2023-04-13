@@ -103,7 +103,7 @@ pub struct Onion {
     #[serde(deserialize_with = "as_fedimint_amount")]
     pub forward_msat: Amount,
     #[serde(default)]
-    pub next_onion: Vec<u8>,
+    pub next_onion: String,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -571,44 +571,49 @@ impl ClnHtlcInterceptor {
                 intercepted_htlc_id
             );
 
-            match subscription
-                .send(Ok(SubscribeInterceptHtlcsResponse {
-                    payment_hash: payment_hash.clone(),
-                    incoming_amount_msat: payload.htlc.amount_msat.msats,
-                    outgoing_amount_msat: payload.onion.forward_msat.msats,
-                    incoming_expiry: htlc_expiry,
-                    short_channel_id,
-                    intercepted_htlc_id: intercepted_htlc_id.into_inner().to_vec(),
-                    next_onion: payload.onion.next_onion,
-                }))
-                .await
-            {
-                Ok(_) => {
-                    // Open a channel to receive the outcome of the HTLC processing
-                    let (sender, receiver) = oneshot::channel::<serde_json::Value>();
-                    self.outcomes
-                        .lock()
-                        .await
-                        .insert(intercepted_htlc_id, sender);
-
-                    // If the gateway does not respond within the HTLC expiry,
-                    // Automatically respond with a failure message.
-                    return tokio::time::timeout(Duration::from_secs(30), async {
-                        receiver.await.unwrap_or_else(|e| {
-                            error!("Failed to receive outcome of intercepted htlc: {:?}", e);
-                            htlc_processing_failure()
-                        })
-                    })
+            if let Ok(next_onion) = hex::decode(payload.onion.next_onion) {
+            
+                match subscription
+                    .send(Ok(SubscribeInterceptHtlcsResponse {
+                        payment_hash: payment_hash.clone(),
+                        incoming_amount_msat: payload.htlc.amount_msat.msats,
+                        outgoing_amount_msat: payload.onion.forward_msat.msats,
+                        incoming_expiry: htlc_expiry,
+                        short_channel_id,
+                        intercepted_htlc_id: intercepted_htlc_id.into_inner().to_vec(),
+                        next_onion: next_onion,
+                    }))
                     .await
-                    .unwrap_or_else(|e| {
-                        error!("await_htlc_processing error {:?}", e);
-                        htlc_processing_failure()
-                    });
+                {
+                    Ok(_) => {
+                        // Open a channel to receive the outcome of the HTLC processing
+                        let (sender, receiver) = oneshot::channel::<serde_json::Value>();
+                        self.outcomes
+                            .lock()
+                            .await
+                            .insert(intercepted_htlc_id, sender);
+
+                        // If the gateway does not respond within the HTLC expiry,
+                        // Automatically respond with a failure message.
+                        return tokio::time::timeout(Duration::from_secs(30), async {
+                            receiver.await.unwrap_or_else(|e| {
+                                error!("Failed to receive outcome of intercepted htlc: {:?}", e);
+                                htlc_processing_failure()
+                            })
+                        })
+                        .await
+                        .unwrap_or_else(|e| {
+                            error!("await_htlc_processing error {:?}", e);
+                            htlc_processing_failure()
+                        });
+                    }
+                    Err(e) => {
+                        error!("Failed to send htlc to subscription: {:?}", e);
+                        return htlc_processing_failure();
+                    }
                 }
-                Err(e) => {
-                    error!("Failed to send htlc to subscription: {:?}", e);
-                    return htlc_processing_failure();
-                }
+            } else {
+                error!("invalid next onion (not hex string)");
             }
         }
 
