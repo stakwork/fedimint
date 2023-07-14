@@ -111,6 +111,8 @@ pub struct Onion {
     pub short_channel_id: Option<String>,
     #[serde(deserialize_with = "as_fedimint_amount")]
     pub forward_msat: Amount,
+    #[serde(default)]
+    pub next_onion: String,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -594,6 +596,7 @@ impl ClnHtlcInterceptor {
                     Err(_) => return serde_json::json!({ "result": "continue" }),
                 };
 
+            let next_onion = hex::decode(payload.onion.next_onion).unwrap_or(Vec::new());
             let htlc_ret = match sender
                 .send(Ok(InterceptHtlcRequest {
                     payment_hash: payment_hash.clone(),
@@ -603,6 +606,7 @@ impl ClnHtlcInterceptor {
                     short_channel_id,
                     incoming_chan_id,
                     htlc_id: payload.htlc.id,
+                    next_onion,
                 }))
                 .await
             {

@@ -135,6 +135,7 @@ impl GatewayLndClient {
                         short_channel_id: htlc.outgoing_requested_chan_id,
                         incoming_chan_id: incoming_circuit_key.chan_id,
                         htlc_id: incoming_circuit_key.htlc_id,
+                        next_onion: htlc.onion_blob,
                     };
 
                     match actor_sender.send(Ok(intercept)).await {
