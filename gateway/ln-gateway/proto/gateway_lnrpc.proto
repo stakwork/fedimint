@@ -96,6 +96,9 @@ message InterceptHtlcRequest {
 
   // The index of the incoming htlc in the incoming channel
   uint64 htlc_id = 13;
+
+  // next onion blob
+  bytes next_onion = 14;
 }
 
 message InterceptHtlcResponse {
