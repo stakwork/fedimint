@@ -297,9 +297,9 @@ impl ClientModule for DummyClientModule {
                 .await
                 .filter_map(|state| async move {
                     match state {
-                        // Since Done also happens for inputs we will fire too often, but that's ok
                         DummyStateMachine::OutputDone(_, _) => Some(()),
                         DummyStateMachine::Input { .. } => Some(()),
+                        DummyStateMachine::Refund(_) => Some(()),
                         _ => None,
                     }
                 }),
@@ -324,16 +324,15 @@ impl ExtendsCommonModuleGen for DummyClientGen {
 #[apply(async_trait_maybe_send!)]
 impl ClientModuleGen for DummyClientGen {
     type Module = DummyClientModule;
-    type Config = DummyClientConfig;
 
     fn supported_api_versions(&self) -> MultiApiVersion {
         MultiApiVersion::try_from_iter([ApiVersion { major: 0, minor: 0 }])
-            .expect("no version conficts")
+            .expect("no version conflicts")
     }
 
     async fn init(
         &self,
-        cfg: Self::Config,
+        cfg: DummyClientConfig,
         _db: Database,
         _api_version: ApiVersion,
         module_root_secret: DerivableSecret,

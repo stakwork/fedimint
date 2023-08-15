@@ -70,14 +70,16 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::{Debug, Formatter};
 use std::io::{Error, Read, Write};
+use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{anyhow, bail};
 use async_stream::stream;
-use db::{CachedApiVersionSet, CachedApiVersionSetKey};
+use db::{CachedApiVersionSet, CachedApiVersionSetKey, ClientConfigKey, ClientConfigKeyPrefix};
 use fedimint_core::api::{
     ApiVersionSet, DynGlobalApi, DynModuleApi, GlobalFederationApi, IGlobalFederationApi,
-    WsFederationApi,
+    InviteCode, WsFederationApi,
 };
 use fedimint_core::config::{ClientConfig, FederationId, ModuleGenRegistry};
 use fedimint_core::core::{DynInput, DynOutput, IInput, IOutput, ModuleInstanceId, ModuleKind};
@@ -88,7 +90,7 @@ use fedimint_core::module::{
     ApiVersion, MultiApiVersion, SupportedApiVersionsSummary, SupportedCoreApiVersions,
     SupportedModuleApiVersions,
 };
-use fedimint_core::task::{MaybeSend, MaybeSync, TaskGroup};
+use fedimint_core::task::{sleep, MaybeSend, MaybeSync, TaskGroup};
 use fedimint_core::time::now;
 use fedimint_core::transaction::Transaction;
 use fedimint_core::util::{BoxStream, NextOrPending};
@@ -104,7 +106,7 @@ use rand::thread_rng;
 use secp256k1_zkp::{PublicKey, Secp256k1};
 use secret::DeriveableSecretClientExt;
 use serde::Serialize;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::backup::Metadata;
 use crate::db::ClientSecretKey;
@@ -447,9 +449,55 @@ fn states_add_instance(
     })
 }
 
-#[derive(Clone)]
 pub struct Client {
     inner: Arc<ClientInner>,
+}
+
+impl Clone for Client {
+    fn clone(&self) -> Self {
+        self.inner
+            .client_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Client {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+/// We need a separate drop implementation for `Client` that triggers
+/// `Executor::stop_executor` even though the `Drop` implementation of
+/// `ExecutorInner` should already take care of that. The reason is that as long
+/// as the executor task is active there may be a cycle in the
+/// `Arc<ClientInner>`s such that at least one `Executor` never gets dropped.
+impl Drop for Client {
+    fn drop(&mut self) {
+        // Not sure if Ordering::SeqCst is strictly needed here, but better safe than
+        // sorry.
+        let client_count = self
+            .inner
+            .client_count
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+
+        // `fetch_sub` returns previous value, so if it is 1, it means this is the last
+        // client reference
+        if client_count == 1 {
+            info!("Last client reference dropped, shutting down client task group");
+            let maybe_shutdown_confirmation = self.inner.executor.stop_executor();
+
+            // Just in case the shutdown does not take immediate effect we block here if
+            // possible
+            #[cfg(not(target_family = "wasm"))]
+            if let Some(shutdown_confirmation) = maybe_shutdown_confirmation {
+                tokio::task::block_in_place(move || {
+                    futures::executor::block_on(async {
+                        if shutdown_confirmation.await.is_err() {
+                            error!("Error while awaiting client shutdown confirmation");
+                        }
+                    });
+                });
+            }
+        }
+    }
 }
 
 /// List of core api versions supported by the implementation.
@@ -467,11 +515,15 @@ impl Client {
         ClientBuilder::default()
     }
 
-    pub async fn start_executor(&self, tg: &mut TaskGroup) {
+    pub async fn start_executor(&self) {
+        debug!(
+            "Starting fedimint client executor (version: {})",
+            env!("FEDIMINT_BUILD_CODE_VERSION")
+        );
         self.inner
             .executor
-            .start_executor(tg, self.inner.context_gen())
-            .await
+            .start_executor(self.inner.context_gen())
+            .await;
     }
 
     pub fn api(&self) -> &(dyn IGlobalFederationApi + 'static) {
@@ -504,6 +556,15 @@ impl Client {
 
     /// Add funding and/or change to the transaction builder as needed, finalize
     /// the transaction and submit it to the federation.
+    ///
+    /// ## Errors
+    /// The function will return an error if the operation with given id already
+    /// exists.
+    ///
+    /// ## Panics
+    /// The function will panic if the the database transaction collides with
+    /// other and fails with others too often, this should not happen except for
+    /// excessively concurrent scenarios.
     pub async fn finalize_and_submit_transaction<F, M>(
         &self,
         operation_id: OperationId,
@@ -697,14 +758,22 @@ impl Client {
     /// changes.
     pub async fn subscribe_balance_changes(&self) -> BoxStream<'_, Amount> {
         let mut balance_changes = self.primary_module().subscribe_balance_changes().await;
+        let initial_balance = self.get_balance().await;
         Box::pin(stream! {
+            yield initial_balance;
+            let mut prev_balance = initial_balance;
             while let Some(()) = balance_changes.next().await {
                 let mut dbtx = self.db().begin_transaction().await;
                 let balance = self
                     .primary_module()
                     .get_balance(self.inner.primary_module_instance, &mut dbtx)
                     .await;
-                yield balance;
+
+                // Deduplicate in case modules cannot always tell if the balance actually changed
+                if balance != prev_balance {
+                    prev_balance = balance;
+                    yield balance;
+                }
             }
         })
     }
@@ -860,6 +929,13 @@ struct ClientInner {
     root_secret: DerivableSecret,
     operation_log: OperationLog,
     secp_ctx: Secp256k1<secp256k1_zkp::All>,
+    /// Number of [`Client`] instances using this `ClientInner`.
+    ///
+    /// The `ClientInner` struct is both used for the client itself as well as
+    /// for the global context used in the state machine executor. This means we
+    /// cannot rely on the reference count of the `Arc<ClientInner>` to
+    /// determine if the client should shut down.
+    client_count: AtomicUsize,
 }
 
 impl ClientInner {
@@ -1108,8 +1184,15 @@ impl TransactionUpdates {
 pub struct ClientBuilder {
     module_gens: ClientModuleGenRegistry,
     primary_module_instance: Option<ModuleInstanceId>,
-    config: Option<ClientConfig>,
+    config_source: Option<ConfigSource>,
     db: Option<DatabaseSource>,
+}
+
+#[derive(Clone)]
+#[allow(clippy::large_enum_variant)]
+pub enum ConfigSource {
+    Config(ClientConfig),
+    Invite(InviteCode),
 }
 
 pub enum DatabaseSource {
@@ -1128,15 +1211,35 @@ impl ClientBuilder {
         self.module_gens.attach(module_gen);
     }
 
-    /// Uses this config to initialize modules
+    /// Uses this invite code to connect to the federation
     ///
     /// ## Panics
-    /// If there was a config added previously
-    pub fn with_config(&mut self, config: ClientConfig) {
-        let was_replaced = self.config.replace(config).is_some();
+    /// If there was a config or invite code added previously
+    pub fn with_invite_code(&mut self, invite_code: InviteCode) {
+        let was_replaced = self
+            .config_source
+            .replace(ConfigSource::Invite(invite_code))
+            .is_some();
         assert!(
             !was_replaced,
-            "Only one config can be given to the builder."
+            "Only one configuration source can be given to the builder."
+        )
+    }
+
+    /// FIXME: <https://github.com/fedimint/fedimint/issues/2769>
+    ///
+    /// Uses this config to initialize the client
+    ///
+    /// ## Panics
+    /// If there is a invite code or config added previously
+    pub fn with_config(&mut self, config: ClientConfig) {
+        let was_replaced = self
+            .config_source
+            .replace(ConfigSource::Config(config))
+            .is_some();
+        assert!(
+            !was_replaced,
+            "Only one config source can be given to the builder."
         )
     }
 
@@ -1191,7 +1294,6 @@ impl ClientBuilder {
 
     pub async fn build_restoring_from_backup<S>(
         self,
-        tg: &mut TaskGroup,
         secret: ClientSecret<S>,
     ) -> anyhow::Result<(Client, Metadata)>
     where
@@ -1226,19 +1328,19 @@ impl ClientBuilder {
         set_client_root_secret(&mut dbtx, &secret).await;
         dbtx.commit_tx().await;
 
-        let client = self.build::<S>(tg).await?;
+        let client = self.build::<S>().await?;
         let metadata = client.restore_from_backup().await?;
 
         Ok((client, metadata))
     }
 
     /// Build a [`Client`] and start its executor
-    pub async fn build<S>(self, tg: &mut TaskGroup) -> anyhow::Result<Client>
+    pub async fn build<S>(self) -> anyhow::Result<Client>
     where
         S: RootSecretStrategy,
     {
         let client = self.build_stopped::<S>().await?;
-        client.start_executor(tg).await;
+        client.start_executor().await;
         Ok(client)
     }
 
@@ -1247,37 +1349,45 @@ impl ClientBuilder {
     where
         S: RootSecretStrategy,
     {
-        let config = self.config.ok_or(anyhow!("No config was provided"))?;
+        let (config, decoders, db) = match self.db.ok_or(anyhow!("No database was provided"))? {
+            DatabaseSource::Fresh(db) => {
+                let db = Database::new_from_box(db, ModuleDecoderRegistry::default());
+                let config = get_config(&db, self.config_source.clone()).await?;
+
+                let mut decoders = client_decoders(
+                    &self.module_gens,
+                    config
+                        .modules
+                        .iter()
+                        .map(|(module_instance, module_config)| {
+                            (*module_instance, module_config.kind())
+                        }),
+                )?;
+                decoders.register_module(
+                    TRANSACTION_SUBMISSION_MODULE_INSTANCE,
+                    ModuleKind::from_static_str("tx_submission"),
+                    tx_submission_sm_decoder(),
+                );
+                let db = db.new_with_decoders(decoders.clone());
+
+                (config, decoders, db)
+            }
+            DatabaseSource::Reuse(client) => {
+                let db = client.inner.db.clone();
+                let decoders = client.inner.decoders.clone();
+                let config = get_config(&db, self.config_source.clone()).await?;
+
+                (config, decoders, db)
+            }
+        };
+
+        let config = config.redecode_raw(&decoders)?;
+
         let primary_module_instance = self
             .primary_module_instance
             .ok_or(anyhow!("No primary module instance id was provided"))?;
 
-        let mut decoders = client_decoders(
-            &self.module_gens,
-            config
-                .modules
-                .iter()
-                .map(|(module_instance, module_config)| (*module_instance, module_config.kind())),
-        )?;
-        decoders.register_module(
-            TRANSACTION_SUBMISSION_MODULE_INSTANCE,
-            ModuleKind::from_static_str("tx_submission"),
-            tx_submission_sm_decoder(),
-        );
-
-        let db = match self.db.ok_or(anyhow!("No database was provided"))? {
-            DatabaseSource::Fresh(db) => Database::new_from_box(db, decoders.clone()),
-            DatabaseSource::Reuse(client) => {
-                assert_eq!(
-                    client.inner.config, config,
-                    "Can only reuse DB for clients started with the same config"
-                );
-                client.inner.db.clone()
-            }
-        };
-
         let notifier = Notifier::new(db.clone());
-
         let api = DynGlobalApi::from(WsFederationApi::from_config(&config));
 
         let common_api_versions = Client::load_and_refresh_common_api_version_static(
@@ -1355,11 +1465,88 @@ impl ClientBuilder {
             secp_ctx: Secp256k1::new(),
             root_secret,
             operation_log: OperationLog::new(db),
+            client_count: AtomicUsize::new(1),
         });
 
         Ok(Client {
             inner: client_inner,
         })
+    }
+}
+
+// Sources config from database or from config source specified
+async fn get_config(
+    db: &Database,
+    config_source: Option<ConfigSource>,
+) -> anyhow::Result<ClientConfig> {
+    let mut dbtx = db.begin_transaction().await;
+    let config_res = match dbtx
+        .find_by_prefix(&ClientConfigKeyPrefix)
+        .await
+        .next()
+        .await
+    {
+        Some((_, config)) => {
+            // TODO: Enable after <https://github.com/fedimint/fedimint/pull/2855>
+            // assert!(
+            //     config_source.is_none(),
+            //     "Alternative config source provided but config was found in DB"
+            // );
+            Ok(config)
+        }
+        None => {
+            let config = match config_source
+                .clone()
+                .ok_or(anyhow!("No config source was provided"))?
+            {
+                ConfigSource::Config(config) => config.clone(),
+                ConfigSource::Invite(invite_code) => {
+                    try_download_config(invite_code.clone(), 10).await?
+                }
+            };
+
+            // Save config to DB
+            let mut dbtx = db.begin_transaction().await;
+            dbtx.insert_new_entry(
+                &ClientConfigKey {
+                    id: config.federation_id,
+                },
+                &config,
+            )
+            .await;
+            dbtx.commit_tx_result().await?;
+
+            Ok(config)
+        }
+    };
+
+    config_res
+}
+
+/// Tries to download the client config from the federation,
+/// attempts up to `retries` number times
+async fn try_download_config(
+    invite_code: InviteCode,
+    retries: usize,
+) -> anyhow::Result<ClientConfig> {
+    let api = Arc::new(WsFederationApi::from_invite_code(&[invite_code.clone()]))
+        as Arc<dyn IGlobalFederationApi + Send + Sync + 'static>;
+    let mut num_retries = 0;
+    let wait_millis = 500;
+    loop {
+        if num_retries > retries {
+            break Err(anyhow!("Failed to download client config"));
+        }
+        match api.download_client_config(&invite_code).await {
+            Ok(cfg) => {
+                break Ok(cfg);
+            }
+            Err(e) => {
+                debug!("Failed to download client config {:?}", e);
+                sleep(Duration::from_millis(wait_millis)).await;
+            }
+        }
+        num_retries += 1;
     }
 }
 

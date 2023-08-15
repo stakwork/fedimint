@@ -1,12 +1,12 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::time::Duration;
 
-use anyhow::bail;
+use anyhow::{bail, Context};
 use bitcoin_hashes::Hash as BitcoinHash;
 use fedimint_bitcoind::{create_bitcoind, DynBitcoindRpc};
 use fedimint_core::config::{
-    ClientModuleConfig, ConfigGenModuleParams, DkgResult, ServerModuleConfig,
-    ServerModuleConsensusConfig, TypedServerModuleConfig, TypedServerModuleConsensusConfig,
+    ConfigGenModuleParams, DkgResult, ServerModuleConfig, ServerModuleConsensusConfig,
+    TypedServerModuleConfig, TypedServerModuleConsensusConfig,
 };
 use fedimint_core::db::{Database, DatabaseVersion, ModuleDatabaseTransaction};
 use fedimint_core::encoding::{Decodable, Encodable};
@@ -34,10 +34,11 @@ use fedimint_ln_common::contracts::{
 };
 use fedimint_ln_common::db::{
     AgreedDecryptionShareContractIdPrefix, AgreedDecryptionShareKey,
-    AgreedDecryptionShareKeyPrefix, BlockHeightVoteKey, BlockHeightVotePrefix, ContractKey,
+    AgreedDecryptionShareKeyPrefix, BlockCountVoteKey, BlockCountVotePrefix, ContractKey,
     ContractKeyPrefix, ContractUpdateKey, ContractUpdateKeyPrefix, DbKeyPrefix,
-    LightningGatewayKey, LightningGatewayKeyPrefix, OfferKey, OfferKeyPrefix,
-    ProposeDecryptionShareKey, ProposeDecryptionShareKeyPrefix,
+    EncryptedPreimageIndexKey, EncryptedPreimageIndexKeyPrefix, LightningGatewayKey,
+    LightningGatewayKeyPrefix, OfferKey, OfferKeyPrefix, ProposeDecryptionShareKey,
+    ProposeDecryptionShareKeyPrefix,
 };
 use fedimint_ln_common::{
     ContractAccount, LightningCommonGen, LightningConsensusItem, LightningError, LightningGateway,
@@ -52,7 +53,7 @@ use futures::StreamExt;
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use strum::IntoEnumIterator;
-use tracing::{debug, error, info_span, instrument, trace, warn};
+use tracing::{debug, error, info_span, trace};
 
 lazy_static! {
     pub static ref LN_INCOMING_OFFER: IntCounter = register_int_counter!(opts!(
@@ -214,18 +215,13 @@ impl ServerModuleGen for LightningGen {
     fn get_client_config(
         &self,
         config: &ServerModuleConsensusConfig,
-    ) -> anyhow::Result<ClientModuleConfig> {
+    ) -> anyhow::Result<LightningClientConfig> {
         let config = LightningConfigConsensus::from_erased(config)?;
-        Ok(ClientModuleConfig::from_typed(
-            config.kind(),
-            config.version(),
-            &LightningClientConfig {
-                threshold_pub_key: config.threshold_pub_keys.public_key(),
-                fee_consensus: config.fee_consensus,
-                network: config.network,
-            },
-        )
-        .expect("Serialization can't fail"))
+        Ok(LightningClientConfig {
+            threshold_pub_key: config.threshold_pub_keys.public_key(),
+            fee_consensus: config.fee_consensus,
+            network: config.network,
+        })
     }
 
     async fn dump_database(
@@ -300,14 +296,24 @@ impl ServerModuleGen for LightningGen {
                         "Proposed Decryption Shares"
                     );
                 }
-                DbKeyPrefix::BlockHeightVote => {
+                DbKeyPrefix::BlockCountVote => {
                     push_db_pair_items!(
                         dbtx,
-                        BlockHeightVotePrefix,
-                        BlockHeightVoteKey,
+                        BlockCountVotePrefix,
+                        BlockCountVoteKey,
                         u64,
                         lightning,
-                        "Block Height Votes"
+                        "Block Count Votes"
+                    );
+                }
+                DbKeyPrefix::EncryptedPreimageIndex => {
+                    push_db_pair_items!(
+                        dbtx,
+                        EncryptedPreimageIndexKeyPrefix,
+                        EncryptedPreimageIndexKey,
+                        (),
+                        lightning,
+                        "Encrypted Preimage Hashes"
                     );
                 }
             }
@@ -368,176 +374,165 @@ impl ServerModule for Lightning {
             .collect()
             .await;
 
-        let block_height_vote = self.block_height().await;
+        let block_count_vote = self.block_count().await;
 
-        if block_height_vote != self.consensus_block_height(dbtx).await {
-            items.push(LightningConsensusItem::BlockHeight(block_height_vote));
+        if block_count_vote != self.consensus_block_count(dbtx).await {
+            items.push(LightningConsensusItem::BlockCount(block_count_vote));
         }
 
         ConsensusProposal::new_auto_trigger(items)
     }
 
-    async fn begin_consensus_epoch<'a, 'b>(
+    async fn process_consensus_item<'a, 'b>(
         &'a self,
         dbtx: &mut ModuleDatabaseTransaction<'b>,
-        consensus_items: Vec<(PeerId, LightningConsensusItem)>,
-        _consensus_peers: &BTreeSet<PeerId>,
-    ) -> Vec<PeerId> {
-        for (peer_id, item) in consensus_items.into_iter() {
-            let span = info_span!("process decryption share", %peer_id);
-            let _guard = span.enter();
+        consensus_item: LightningConsensusItem,
+        peer_id: PeerId,
+    ) -> anyhow::Result<()> {
+        let span = info_span!("process decryption share", %peer_id);
+        let _guard = span.enter();
 
-            match item {
-                LightningConsensusItem::DecryptPreimage(contract_id, share) => {
-                    // check if we already have a decryption share for this peer
-                    if dbtx
-                        .get_value(&AgreedDecryptionShareKey(contract_id, peer_id))
-                        .await
-                        .is_some()
-                    {
-                        warn!("Received redundant decryption share");
-                        continue;
+        match consensus_item {
+            LightningConsensusItem::DecryptPreimage(contract_id, share) => {
+                if dbtx
+                    .get_value(&AgreedDecryptionShareKey(contract_id, peer_id))
+                    .await
+                    .is_some()
+                {
+                    bail!("Already received a valid decryption share for this peer");
+                }
+
+                let account = dbtx
+                    .get_value(&ContractKey(contract_id))
+                    .await
+                    .context("Contract account for this decryption share does not exist")?;
+
+                let (contract, out_point) = match account.contract {
+                    FundedContract::Incoming(contract) => (contract.contract, contract.out_point),
+                    FundedContract::Outgoing(..) => {
+                        bail!("Contract account for this decryption share is outgoing");
                     }
+                };
 
-                    let account = match self.get_contract_account(dbtx, contract_id).await {
-                        Some(account) => account,
-                        None => {
-                            warn!("Received decryption share for non-existent contract account");
-                            continue;
-                        }
-                    };
+                if contract.decrypted_preimage != DecryptedPreimage::Pending {
+                    bail!("Contract for this decryption share is not pending");
+                }
 
-                    let (contract, out_point) = match account.contract {
-                        FundedContract::Incoming(contract) => {
-                            (contract.contract, contract.out_point)
-                        }
-                        FundedContract::Outgoing(..) => {
-                            warn!("Received decryption share for outgoing contract");
-                            continue;
-                        }
-                    };
+                if !self.validate_decryption_share(peer_id, &share, &contract.encrypted_preimage) {
+                    bail!("Decryption share is invalid");
+                }
 
-                    if contract.decrypted_preimage != DecryptedPreimage::Pending {
-                        warn!("Received decryption share for non-pending incoming contract");
-                        continue;
+                // we save the first ordered valid decryption share for every peer
+                dbtx.insert_new_entry(&AgreedDecryptionShareKey(contract_id, peer_id), &share)
+                    .await;
+
+                // collect all valid decryption shares previously received for this contract
+                let decryption_shares = dbtx
+                    .find_by_prefix(&AgreedDecryptionShareContractIdPrefix(contract_id))
+                    .await
+                    .map(|(key, decryption_share)| (key.1, decryption_share))
+                    .collect::<Vec<_>>()
+                    .await;
+
+                if decryption_shares.len() < self.cfg.consensus.threshold() {
+                    return Ok(());
+                }
+
+                debug!("Beginning to decrypt preimage");
+
+                let preimage_vec = match self.cfg.consensus.threshold_pub_keys.decrypt(
+                    decryption_shares
+                        .iter()
+                        .map(|(peer, share)| (peer.to_usize(), &share.0)),
+                    &contract.encrypted_preimage.0,
+                ) {
+                    Ok(preimage_vec) => preimage_vec,
+                    Err(_) => {
+                        // TODO: check if that can happen even though shares are verified
+                        // before
+                        error!(contract_hash = %contract.hash, "Failed to decrypt preimage");
+                        return Ok(());
                     }
+                };
 
-                    if !self.validate_decryption_share(
-                        peer_id,
-                        &share,
-                        &contract.encrypted_preimage,
-                    ) {
-                        warn!("Received invalid decryption share for incoming contract");
-                        continue;
-                    }
+                // Delete decryption shares once we've decrypted the preimage
+                dbtx.remove_entry(&ProposeDecryptionShareKey(contract_id))
+                    .await;
 
-                    // we save the first ordered valid decryption share for every peer
-                    dbtx.insert_new_entry(&AgreedDecryptionShareKey(contract_id, peer_id), &share)
-                        .await;
+                dbtx.remove_by_prefix(&AgreedDecryptionShareContractIdPrefix(contract_id))
+                    .await;
 
-                    // collect all valid decryption shares for this contract_id
-                    let decryption_shares = dbtx
-                        .find_by_prefix(&AgreedDecryptionShareContractIdPrefix(contract_id))
-                        .await
-                        .map(|(key, decryption_share)| (key.1, decryption_share))
-                        .collect::<Vec<_>>()
-                        .await;
-
-                    if decryption_shares.len() < self.cfg.consensus.threshold() {
-                        continue;
-                    }
-
-                    debug!("Beginning to decrypt preimage");
-
-                    let preimage_vec = match self.cfg.consensus.threshold_pub_keys.decrypt(
-                        decryption_shares
-                            .iter()
-                            .map(|(peer, share)| (peer.to_usize(), &share.0)),
-                        &contract.encrypted_preimage.0,
-                    ) {
-                        Ok(preimage_vec) => preimage_vec,
-                        Err(_) => {
-                            // TODO: check if that can happen even though shares are verified
-                            // before
-                            error!(contract_hash = %contract.hash, "Failed to decrypt preimage");
-                            continue;
-                        }
-                    };
-
-                    // Delete decryption shares once we've decrypted the preimage
-                    dbtx.remove_entry(&ProposeDecryptionShareKey(contract_id))
-                        .await;
-
-                    dbtx.remove_by_prefix(&AgreedDecryptionShareContractIdPrefix(contract_id))
-                        .await;
-
-                    let decrypted_preimage = if preimage_vec.len() == 32
-                        && contract.hash == bitcoin_hashes::sha256::Hash::hash(&preimage_vec)
-                    {
-                        let preimage = Preimage(
-                            preimage_vec
-                                .as_slice()
-                                .try_into()
-                                .expect("Invalid preimage length"),
-                        );
-                        if preimage.to_public_key().is_ok() {
-                            DecryptedPreimage::Some(preimage)
-                        } else {
-                            DecryptedPreimage::Invalid
-                        }
+                let decrypted_preimage = if preimage_vec.len() == 32
+                    && contract.hash == bitcoin_hashes::sha256::Hash::hash(&preimage_vec)
+                {
+                    let preimage = Preimage(
+                        preimage_vec
+                            .as_slice()
+                            .try_into()
+                            .expect("Invalid preimage length"),
+                    );
+                    if preimage.to_public_key().is_ok() {
+                        DecryptedPreimage::Some(preimage)
                     } else {
                         DecryptedPreimage::Invalid
-                    };
-
-                    debug!(?decrypted_preimage);
-
-                    // TODO: maybe define update helper fn
-                    // Update contract
-                    let contract_db_key = ContractKey(contract_id);
-                    let mut contract_account = dbtx
-                        .get_value(&contract_db_key)
-                        .await
-                        .expect("checked before that it exists");
-                    let mut incoming = match &mut contract_account.contract {
-                        FundedContract::Incoming(incoming) => incoming,
-                        _ => unreachable!("previously checked that it's an incoming contrac"),
-                    };
-                    incoming.contract.decrypted_preimage = decrypted_preimage.clone();
-                    trace!(?contract_account, "Updating contract account");
-                    dbtx.insert_entry(&contract_db_key, &contract_account).await;
-
-                    // Update output outcome
-                    let mut outcome = dbtx
-                        .get_value(&ContractUpdateKey(out_point))
-                        .await
-                        .expect("outcome was created on funding");
-                    let incoming_contract_outcome_preimage = match &mut outcome {
-                        LightningOutputOutcome::Contract {
-                            outcome: ContractOutcome::Incoming(decryption_outcome),
-                            ..
-                        } => decryption_outcome,
-                        _ => panic!("We are expeccting an incoming contract"),
-                    };
-                    *incoming_contract_outcome_preimage = decrypted_preimage.clone();
-                    dbtx.insert_entry(&ContractUpdateKey(out_point), &outcome)
-                        .await;
-                }
-                LightningConsensusItem::BlockHeight(block_height) => {
-                    let current_vote = dbtx
-                        .get_value(&BlockHeightVoteKey(peer_id))
-                        .await
-                        .unwrap_or(0);
-
-                    // consensus block height can never decrease
-                    if block_height > current_vote {
-                        dbtx.insert_entry(&BlockHeightVoteKey(peer_id), &block_height)
-                            .await;
                     }
+                } else {
+                    DecryptedPreimage::Invalid
+                };
+
+                debug!(?decrypted_preimage);
+
+                // TODO: maybe define update helper fn
+                // Update contract
+                let contract_db_key = ContractKey(contract_id);
+                let mut contract_account = dbtx
+                    .get_value(&contract_db_key)
+                    .await
+                    .expect("checked before that it exists");
+                let mut incoming = match &mut contract_account.contract {
+                    FundedContract::Incoming(incoming) => incoming,
+                    _ => unreachable!("previously checked that it's an incoming contract"),
+                };
+                incoming.contract.decrypted_preimage = decrypted_preimage.clone();
+                trace!(?contract_account, "Updating contract account");
+                dbtx.insert_entry(&contract_db_key, &contract_account).await;
+
+                // Update output outcome
+                let mut outcome = dbtx
+                    .get_value(&ContractUpdateKey(out_point))
+                    .await
+                    .expect("outcome was created on funding");
+                let incoming_contract_outcome_preimage = match &mut outcome {
+                    LightningOutputOutcome::Contract {
+                        outcome: ContractOutcome::Incoming(decryption_outcome),
+                        ..
+                    } => decryption_outcome,
+                    _ => panic!("We are expeccting an incoming contract"),
+                };
+                *incoming_contract_outcome_preimage = decrypted_preimage.clone();
+                dbtx.insert_entry(&ContractUpdateKey(out_point), &outcome)
+                    .await;
+            }
+            LightningConsensusItem::BlockCount(block_count) => {
+                let current_vote = dbtx
+                    .get_value(&BlockCountVoteKey(peer_id))
+                    .await
+                    .unwrap_or(0);
+
+                if block_count < current_vote {
+                    bail!("Block count vote decreased");
                 }
+
+                if block_count == current_vote {
+                    bail!("Block height vote is redundant");
+                }
+
+                dbtx.insert_entry(&BlockCountVoteKey(peer_id), &block_count)
+                    .await;
             }
         }
 
-        vec![]
+        Ok(())
     }
 
     fn build_verification_cache<'a>(
@@ -547,14 +542,14 @@ impl ServerModule for Lightning {
         LightningVerificationCache
     }
 
-    async fn validate_input<'a, 'b>(
-        &self,
-        dbtx: &mut ModuleDatabaseTransaction<'b>,
-        _verification_cache: &Self::VerificationCache,
-        input: &'a LightningInput,
+    async fn process_input<'a, 'b, 'c>(
+        &'a self,
+        dbtx: &mut ModuleDatabaseTransaction<'c>,
+        input: &'b LightningInput,
+        _cache: &Self::VerificationCache,
     ) -> Result<InputMeta, ModuleError> {
-        let account: ContractAccount = self
-            .get_contract_account(dbtx, input.contract_id)
+        let mut account = dbtx
+            .get_value(&ContractKey(input.contract_id))
             .await
             .ok_or(LightningError::UnknownContract(input.contract_id))
             .into_module_error_other()?;
@@ -567,10 +562,11 @@ impl ServerModule for Lightning {
             .into_module_error_other();
         }
 
-        let consensus_height = self.consensus_block_height(dbtx).await;
-        let pub_key = match account.contract {
+        let consensus_block_count = self.consensus_block_count(dbtx).await;
+
+        let pub_key = match &account.contract {
             FundedContract::Outgoing(outgoing) => {
-                if outgoing.timelock as u64 > consensus_height && !outgoing.cancelled {
+                if outgoing.timelock as u64 + 1 > consensus_block_count && !outgoing.cancelled {
                     // If the timelock hasn't expired yet …
                     let preimage_hash = bitcoin_hashes::sha256::Hash::hash(
                         &input
@@ -593,7 +589,7 @@ impl ServerModule for Lightning {
                     outgoing.user_key
                 }
             }
-            FundedContract::Incoming(incoming) => match incoming.contract.decrypted_preimage {
+            FundedContract::Incoming(incoming) => match &incoming.contract.decrypted_preimage {
                 // Once the preimage has been decrypted …
                 DecryptedPreimage::Pending => {
                     return Err(LightningError::ContractNotReady).into_module_error_other();
@@ -610,6 +606,11 @@ impl ServerModule for Lightning {
             },
         };
 
+        account.amount -= input.amount;
+
+        dbtx.insert_entry(&ContractKey(input.contract_id), &account)
+            .await;
+
         Ok(InputMeta {
             amount: TransactionItemAmount {
                 amount: input.amount,
@@ -619,29 +620,11 @@ impl ServerModule for Lightning {
         })
     }
 
-    async fn apply_input<'a, 'b, 'c>(
+    async fn process_output<'a, 'b>(
         &'a self,
-        dbtx: &mut ModuleDatabaseTransaction<'c>,
-        input: &'b LightningInput,
-        cache: &Self::VerificationCache,
-    ) -> Result<InputMeta, ModuleError> {
-        let meta = self.validate_input(dbtx, cache, input).await?;
-
-        let account_db_key = ContractKey(input.contract_id);
-        let mut contract_account = dbtx
-            .get_value(&account_db_key)
-            .await
-            .expect("Should fail validation if contract account doesn't exist");
-        contract_account.amount -= meta.amount.amount;
-        dbtx.insert_entry(&account_db_key, &contract_account).await;
-
-        Ok(meta)
-    }
-
-    async fn validate_output(
-        &self,
-        dbtx: &mut ModuleDatabaseTransaction<'_>,
-        output: &LightningOutput,
+        dbtx: &mut ModuleDatabaseTransaction<'b>,
+        output: &'a LightningOutput,
+        out_point: OutPoint,
     ) -> Result<TransactionItemAmount, ModuleError> {
         match output {
             LightningOutput::Contract(contract) => {
@@ -664,79 +647,28 @@ impl ServerModule for Lightning {
                 }
 
                 if contract.amount == Amount::ZERO {
-                    Err(LightningError::ZeroOutput).into_module_error_other()
-                } else {
-                    Ok(TransactionItemAmount {
-                        amount: contract.amount,
-                        fee: self.cfg.consensus.fee_consensus.contract_output,
-                    })
+                    return Err(LightningError::ZeroOutput).into_module_error_other();
                 }
-            }
-            LightningOutput::Offer(offer) => {
-                if !offer.encrypted_preimage.0.verify() {
-                    Err(LightningError::InvalidEncryptedPreimage).into_module_error_other()
-                } else {
-                    Ok(TransactionItemAmount::ZERO)
-                }
-            }
-            LightningOutput::CancelOutgoing {
-                contract,
-                gateway_signature,
-            } => {
-                let contract_account = dbtx
-                    .get_value(&ContractKey(*contract))
-                    .await
-                    .ok_or(LightningError::UnknownContract(*contract))
-                    .into_module_error_other()?;
 
-                let outgoing_contract = match &contract_account.contract {
-                    FundedContract::Outgoing(contract) => contract,
-                    _ => {
-                        return Err(LightningError::NotOutgoingContract).into_module_error_other();
-                    }
-                };
-
-                secp256k1::global::SECP256K1
-                    .verify_schnorr(
-                        gateway_signature,
-                        &outgoing_contract.cancellation_message().into(),
-                        &outgoing_contract.gateway_key,
-                    )
-                    .map_err(|_| LightningError::InvalidCancellationSignature)
-                    .into_module_error_other()?;
-
-                Ok(TransactionItemAmount::ZERO)
-            }
-        }
-    }
-
-    async fn apply_output<'a, 'b>(
-        &'a self,
-        dbtx: &mut ModuleDatabaseTransaction<'b>,
-        output: &'a LightningOutput,
-        out_point: OutPoint,
-    ) -> Result<TransactionItemAmount, ModuleError> {
-        let amount = self.validate_output(dbtx, output).await?;
-
-        match output {
-            LightningOutput::Contract(contract) => {
                 let contract_db_key = ContractKey(contract.contract.contract_id());
+
                 let updated_contract_account = dbtx
                     .get_value(&contract_db_key)
                     .await
                     .map(|mut value: ContractAccount| {
-                        value.amount += amount.amount;
+                        value.amount += contract.amount;
                         value
                     })
                     .unwrap_or_else(|| ContractAccount {
-                        amount: amount.amount,
+                        amount: contract.amount,
                         contract: contract.contract.clone().to_funded(out_point),
                     });
-                let previous = dbtx
+
+                if dbtx
                     .insert_entry(&contract_db_key, &updated_contract_account)
-                    .await;
-                let inserted = previous.is_none();
-                if inserted {
+                    .await
+                    .is_none()
+                {
                     match &updated_contract_account.contract {
                         FundedContract::Incoming(_) => {
                             LN_FUNDED_CONTRACT_INCOMING_ACCOUNT_AMOUNTS_SATS
@@ -772,26 +704,79 @@ impl ServerModule for Lightning {
                         .threshold_sec_key
                         .decrypt_share(&incoming.encrypted_preimage.0)
                         .expect("We checked for decryption share validity on contract creation");
+
                     dbtx.insert_new_entry(
                         &ProposeDecryptionShareKey(contract.contract.contract_id()),
                         &PreimageDecryptionShare(decryption_share),
                     )
                     .await;
+
                     dbtx.remove_entry(&OfferKey(offer.hash)).await;
                 }
+
+                Ok(TransactionItemAmount {
+                    amount: contract.amount,
+                    fee: self.cfg.consensus.fee_consensus.contract_output,
+                })
             }
             LightningOutput::Offer(offer) => {
+                if !offer.encrypted_preimage.0.verify() {
+                    return Err(LightningError::InvalidEncryptedPreimage).into_module_error_other();
+                }
+
+                // Check that each preimage is only offered for sale once, see #1397
+                if dbtx
+                    .insert_entry(
+                        &EncryptedPreimageIndexKey(offer.encrypted_preimage.consensus_hash()),
+                        &(),
+                    )
+                    .await
+                    .is_some()
+                {
+                    return Err(LightningError::DuplicateEncryptedPreimage)
+                        .into_module_error_other();
+                }
+
                 dbtx.insert_new_entry(
                     &ContractUpdateKey(out_point),
                     &LightningOutputOutcome::Offer { id: offer.id() },
                 )
                 .await;
+
                 // TODO: sanity-check encrypted preimage size
                 dbtx.insert_new_entry(&OfferKey(offer.hash), &(*offer).clone())
                     .await;
+
                 LN_INCOMING_OFFER.inc();
+
+                Ok(TransactionItemAmount::ZERO)
             }
-            LightningOutput::CancelOutgoing { contract, .. } => {
+            LightningOutput::CancelOutgoing {
+                contract,
+                gateway_signature,
+            } => {
+                let contract_account = dbtx
+                    .get_value(&ContractKey(*contract))
+                    .await
+                    .ok_or(LightningError::UnknownContract(*contract))
+                    .into_module_error_other()?;
+
+                let outgoing_contract = match &contract_account.contract {
+                    FundedContract::Outgoing(contract) => contract,
+                    _ => {
+                        return Err(LightningError::NotOutgoingContract).into_module_error_other();
+                    }
+                };
+
+                secp256k1::global::SECP256K1
+                    .verify_schnorr(
+                        gateway_signature,
+                        &outgoing_contract.cancellation_message().into(),
+                        &outgoing_contract.gateway_key,
+                    )
+                    .map_err(|_| LightningError::InvalidCancellationSignature)
+                    .into_module_error_other()?;
+
                 let updated_contract_account = {
                     let mut contract_account = dbtx
                         .get_value(&ContractKey(*contract))
@@ -818,20 +803,12 @@ impl ServerModule for Lightning {
                     &LightningOutputOutcome::CancelOutgoingContract { id: *contract },
                 )
                 .await;
+
                 LN_OUTPUT_OUTCOME_CANCEL_OUTGOING_CONTRACT.inc();
+
+                Ok(TransactionItemAmount::ZERO)
             }
         }
-
-        Ok(amount)
-    }
-
-    #[instrument(skip_all)]
-    async fn end_consensus_epoch<'a, 'b>(
-        &'a self,
-        _consensus_peers: &BTreeSet<PeerId>,
-        _dbtx: &mut ModuleDatabaseTransaction<'b>,
-    ) -> Vec<PeerId> {
-        vec![]
     }
 
     async fn output_status(
@@ -851,9 +828,9 @@ impl ServerModule for Lightning {
     fn api_endpoints(&self) -> Vec<ApiEndpoint<Self>> {
         vec![
             api_endpoint! {
-                "block_height",
+                "block_count",
                 async |module: &Lightning, context, _v: ()| -> Option<u64> {
-                    Ok(Some(module.consensus_block_height(&mut context.dbtx()).await))
+                    Ok(Some(module.consensus_block_count(&mut context.dbtx()).await))
                 }
             },
             api_endpoint! {
@@ -911,32 +888,32 @@ impl Lightning {
         Ok(Lightning { cfg, btc_rpc })
     }
 
-    pub async fn block_height(&self) -> u64 {
+    pub async fn block_count(&self) -> u64 {
         self.btc_rpc
-            .get_block_height()
+            .get_block_count()
             .await
             .expect("bitcoind rpc failed")
     }
 
-    pub async fn consensus_block_height(&self, dbtx: &mut ModuleDatabaseTransaction<'_>) -> u64 {
+    pub async fn consensus_block_count(&self, dbtx: &mut ModuleDatabaseTransaction<'_>) -> u64 {
         let peer_count = 3 * (self.cfg.consensus.threshold() / 2) + 1;
 
-        let mut heights = dbtx
-            .find_by_prefix(&BlockHeightVotePrefix)
+        let mut counts = dbtx
+            .find_by_prefix(&BlockCountVotePrefix)
             .await
-            .map(|(.., height)| height)
+            .map(|(.., count)| count)
             .collect::<Vec<_>>()
             .await;
 
-        assert!(heights.len() <= peer_count);
+        assert!(counts.len() <= peer_count);
 
-        while heights.len() < peer_count {
-            heights.push(0);
+        while counts.len() < peer_count {
+            counts.push(0);
         }
 
-        heights.sort_unstable();
+        counts.sort_unstable();
 
-        heights[peer_count / 2]
+        counts[peer_count / 2]
     }
 
     fn validate_decryption_share(
@@ -1031,6 +1008,119 @@ pub struct LightningVerificationCache;
 impl fedimint_core::server::VerificationCache for LightningVerificationCache {}
 
 #[cfg(test)]
+mod tests {
+    use assert_matches::assert_matches;
+    use bitcoin_hashes::Hash as BitcoinHash;
+    use fedimint_core::bitcoinrpc::BitcoinRpcConfig;
+    use fedimint_core::config::ConfigGenModuleParams;
+    use fedimint_core::db::mem_impl::MemDatabase;
+    use fedimint_core::db::Database;
+    use fedimint_core::encoding::Encodable;
+    use fedimint_core::module::ServerModuleGen;
+    use fedimint_core::task::TaskGroup;
+    use fedimint_core::{Amount, OutPoint, PeerId, ServerModule, TransactionId};
+    use fedimint_ln_common::config::{
+        LightningClientConfig, LightningConfig, LightningGenParams, LightningGenParamsConsensus,
+        LightningGenParamsLocal, Network,
+    };
+    use fedimint_ln_common::contracts::incoming::IncomingContractOffer;
+    use fedimint_ln_common::contracts::EncryptedPreimage;
+    use fedimint_ln_common::LightningOutput;
+
+    use crate::{Lightning, LightningGen};
+
+    const MINTS: usize = 4;
+
+    fn build_configs() -> (Vec<LightningConfig>, LightningClientConfig) {
+        let peers = (0..MINTS as u16).map(PeerId::from).collect::<Vec<_>>();
+        let server_cfg = ServerModuleGen::trusted_dealer_gen(
+            &LightningGen,
+            &peers,
+            &ConfigGenModuleParams::from_typed(LightningGenParams {
+                local: LightningGenParamsLocal {
+                    bitcoin_rpc: BitcoinRpcConfig {
+                        kind: "bitcoind".to_string(),
+                        url: "http://localhost:18332".parse().unwrap(),
+                    },
+                },
+                consensus: LightningGenParamsConsensus {
+                    network: Network::Regtest,
+                },
+            })
+            .expect("valid config params"),
+        );
+
+        let client_cfg = ServerModuleGen::get_client_config(
+            &LightningGen,
+            &server_cfg[&PeerId::from(0)].consensus,
+        )
+        .unwrap();
+
+        let server_cfg = server_cfg
+            .into_values()
+            .map(|config| {
+                config
+                    .to_typed()
+                    .expect("Config was just generated by the same configgen")
+            })
+            .collect::<Vec<LightningConfig>>();
+
+        (server_cfg, client_cfg)
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn encrypted_preimage_only_usable_once() {
+        let (server_cfg, client_cfg) = build_configs();
+        let mut tg = TaskGroup::new();
+        let server = Lightning::new(server_cfg[0].clone(), &mut tg).unwrap();
+
+        let preimage = [42u8; 32];
+        let encrypted_preimage = EncryptedPreimage(client_cfg.threshold_pub_key.encrypt([42; 32]));
+
+        let hash = preimage.consensus_hash();
+        let offer = IncomingContractOffer {
+            amount: Amount::from_sats(10),
+            hash,
+            encrypted_preimage: encrypted_preimage.clone(),
+            expiry_time: None,
+        };
+        let output = LightningOutput::Offer(offer);
+        let out_point = OutPoint {
+            txid: TransactionId::all_zeros(),
+            out_idx: 0,
+        };
+
+        let db = Database::new(MemDatabase::new(), Default::default());
+        let mut dbtx = db.begin_transaction().await;
+
+        server
+            .process_output(&mut dbtx.with_module_prefix(42), &output, out_point)
+            .await
+            .expect("First time works");
+
+        let hash2 = [21u8, 32].consensus_hash();
+        let offer2 = IncomingContractOffer {
+            amount: Amount::from_sats(1),
+            hash: hash2,
+            encrypted_preimage,
+            expiry_time: None,
+        };
+        let output2 = LightningOutput::Offer(offer2);
+        let out_point2 = OutPoint {
+            txid: TransactionId::all_zeros(),
+            out_idx: 1,
+        };
+
+        assert_matches!(
+            server
+                .process_output(&mut dbtx.with_module_prefix(42), &output2, out_point2)
+                .await,
+            Err(_)
+        );
+    }
+}
+
+#[cfg(test)]
 mod fedimint_migration_tests {
     use std::str::FromStr;
     use std::time::SystemTime;
@@ -1038,6 +1128,7 @@ mod fedimint_migration_tests {
     use bitcoin_hashes::Hash;
     use fedimint_core::core::LEGACY_HARDCODED_INSTANCE_ID_LN;
     use fedimint_core::db::{apply_migrations, DatabaseTransaction};
+    use fedimint_core::encoding::Encodable;
     use fedimint_core::module::registry::ModuleDecoderRegistry;
     use fedimint_core::module::{CommonModuleGen, DynServerModuleGen};
     use fedimint_core::{OutPoint, ServerModule, TransactionId};
@@ -1050,9 +1141,9 @@ mod fedimint_migration_tests {
     };
     use fedimint_ln_common::db::{
         AgreedDecryptionShareKey, AgreedDecryptionShareKeyPrefix, ContractKey, ContractKeyPrefix,
-        ContractUpdateKey, ContractUpdateKeyPrefix, DbKeyPrefix, LightningGatewayKey,
-        LightningGatewayKeyPrefix, OfferKey, OfferKeyPrefix, ProposeDecryptionShareKey,
-        ProposeDecryptionShareKeyPrefix,
+        ContractUpdateKey, ContractUpdateKeyPrefix, DbKeyPrefix, EncryptedPreimageIndexKey,
+        EncryptedPreimageIndexKeyPrefix, LightningGatewayKey, LightningGatewayKeyPrefix, OfferKey,
+        OfferKeyPrefix, ProposeDecryptionShareKey, ProposeDecryptionShareKeyPrefix,
     };
     use fedimint_ln_common::LightningCommonGen;
     use fedimint_testing::db::{prepare_snapshot, validate_migrations, BYTE_32, BYTE_8, STRING_64};
@@ -1155,7 +1246,7 @@ mod fedimint_migration_tests {
 
         let gateway = LightningGateway {
             mint_channel_id: 100,
-            gateway_pub_key: pk.x_only_public_key().0,
+            gateway_redeem_key: pk.x_only_public_key().0,
             node_pub_key: pk,
             api: Url::parse("http://example.com")
                 .expect("Could not parse URL to generate GatewayClientConfig API endpoint"),
@@ -1165,8 +1256,12 @@ mod fedimint_migration_tests {
                 base_msat: 0,
                 proportional_millionths: 0,
             },
+            gateway_id: pk,
         };
         dbtx.insert_new_entry(&LightningGatewayKey(pk), &gateway)
+            .await;
+
+        dbtx.insert_new_entry(&EncryptedPreimageIndexKey("foobar".consensus_hash()), &())
             .await;
 
         dbtx.commit_tx().await;
@@ -1284,7 +1379,19 @@ mod fedimint_migration_tests {
                             "validate_migrations was not able to read any ProposeDecryptionShares"
                         );
                         }
-                        DbKeyPrefix::BlockHeightVote => {}
+                        DbKeyPrefix::BlockCountVote => {}
+                        DbKeyPrefix::EncryptedPreimageIndex => {
+                            let encrypted_preimage_index = dbtx
+                                .find_by_prefix(&EncryptedPreimageIndexKeyPrefix)
+                                .await
+                                .collect::<Vec<_>>()
+                                .await;
+                            let num_shares = encrypted_preimage_index.len();
+                            assert!(
+                                num_shares > 0,
+                                "validate_migrations was not able to read any EncryptedPreimageIndexKeys"
+                            );
+                        }
                     }
                 }
             },

@@ -12,9 +12,9 @@ craneLib.overrideScope' (self: prev: {
   commonSrc = builtins.path { path = src; name = "fedimint"; };
 
   commonProfile = "release";
-  # placeholder we use to avoid actually needing to detect hash via runnning `git`
+  # placeholder we use to avoid actually needing to detect hash via running `git`
   # 012345... for easy recognizability (in case something went wrong),
-  # rest randomized to avoid accidentally overwritting innocent bytes in the binary
+  # rest randomized to avoid accidentally overwriting innocent bytes in the binary
   gitHashPlaceholderValue = "01234569abcdef7afa1d2683a099c7af48a523c1";
 
   filterSrcWithRegexes = regexes: src:
@@ -56,7 +56,7 @@ craneLib.overrideScope' (self: prev: {
   filterWorkspaceFiles = src: self.filterSrcWithRegexes [ "Cargo.lock" "Cargo.toml" ".cargo" ".cargo/.*" ".*/Cargo.toml" ".*\.rs" ".*\.html" ".*/proto/.*" "db/migrations/.*" "devimint/src/cfg/.*" ] src;
 
   # Like `filterWorkspaceFiles` but with `./scripts/` included
-  filterWorkspaceTestFiles = src: self.filterSrcWithRegexes [ "Cargo.lock" "Cargo.toml" ".cargo" ".cargo/.*" ".*/Cargo.toml" ".*\.rs" ".*\.html" ".*/proto/.*" "devimint/src/cfg/.*" "scripts/.*" ] src;
+  filterWorkspaceTestFiles = src: self.filterSrcWithRegexes [ "Cargo.lock" "Cargo.toml" ".cargo" ".cargo/.*" ".*/Cargo.toml" ".*\.rs" ".*\.html" ".*/proto/.*" "db/migrations/.*" "devimint/src/cfg/.*" "scripts/.*" ] src;
 
   cargo-llvm-cov = self.buildPackage rec {
     pname = "cargo-llvm-cov";

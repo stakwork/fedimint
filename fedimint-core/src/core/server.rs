@@ -4,7 +4,6 @@
 //!
 //! This (Rust) module defines common interoperability types
 //! and functionality that are only used on the server side.
-use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use fedimint_core::module::audit::Audit;
@@ -64,19 +63,15 @@ pub trait IServerModule: Debug {
         module_instance_id: ModuleInstanceId,
     ) -> ConsensusProposal<DynModuleConsensusItem>;
 
-    /// This function is called once before transaction processing starts.
-    ///
-    /// All module consensus items of this round are supplied as
-    /// `consensus_items`. The database transaction will be committed to the
-    /// database after all other modules ran `begin_consensus_epoch`, so the
-    /// results are available when processing transactions. Returns any
-    /// peers that need to be dropped.
-    async fn begin_consensus_epoch<'a>(
+    /// This function is called once for every consensus item. The function
+    /// returns an error if any only if the consensus item does not change
+    /// our state and therefore may be safely discarded by the atomic broadcast.
+    async fn process_consensus_item<'a>(
         &self,
         dbtx: &mut ModuleDatabaseTransaction<'a>,
-        consensus_items: Vec<(PeerId, DynModuleConsensusItem)>,
-        consensus_peers: &BTreeSet<PeerId>,
-    ) -> Vec<PeerId>;
+        consensus_item: DynModuleConsensusItem,
+        peer_id: PeerId,
+    ) -> anyhow::Result<()>;
 
     /// Some modules may have slow to verify inputs that would block transaction
     /// processing. If the slow part of verification can be modeled as a
@@ -85,43 +80,16 @@ pub trait IServerModule: Debug {
     /// constructing such lookup tables.
     fn build_verification_cache(&self, inputs: &[DynInput]) -> DynVerificationCache;
 
-    /// Validate a transaction input before submitting it to the unconfirmed
-    /// transaction pool. This function has no side effects and may be
-    /// called at any time. False positives due to outdated database state
-    /// are ok since they get filtered out after consensus has been reached on
-    /// them and merely generate a warning.
-    async fn validate_input<'a>(
-        &self,
-        dbtx: &mut ModuleDatabaseTransaction<'_>,
-        verification_cache: &DynVerificationCache,
-        input: &DynInput,
-    ) -> Result<InputMeta, ModuleError>;
-
     /// Try to spend a transaction input. On success all necessary updates will
     /// be part of the database transaction. On failure (e.g. double spend)
     /// the database transaction is rolled back and the operation will take
     /// no effect.
-    ///
-    /// This function may only be called after `begin_consensus_epoch` and
-    /// before `end_consensus_epoch`. Data is only written to the database
-    /// once all transactions have been processed
-    async fn apply_input<'a, 'b, 'c>(
+    async fn process_input<'a, 'b, 'c>(
         &'a self,
         dbtx: &mut ModuleDatabaseTransaction<'c>,
         input: &'b DynInput,
         verification_cache: &DynVerificationCache,
     ) -> Result<InputMeta, ModuleError>;
-
-    /// Validate a transaction output before submitting it to the unconfirmed
-    /// transaction pool. This function has no side effects and may be
-    /// called at any time. False positives due to outdated database state
-    /// are ok since they get filtered out after consensus has been reached on
-    /// them and merely generate a warning.
-    async fn validate_output(
-        &self,
-        dbtx: &mut ModuleDatabaseTransaction<'_>,
-        output: &DynOutput,
-    ) -> Result<TransactionItemAmount, ModuleError>;
 
     /// Try to create an output (e.g. issue notes, peg-out BTC, …). On success
     /// all necessary updates to the database will be part of the database
@@ -131,28 +99,12 @@ pub trait IServerModule: Debug {
     /// The supplied `out_point` identifies the operation (e.g. a peg-out or
     /// note issuance) and can be used to retrieve its outcome later using
     /// `output_status`.
-    ///
-    /// This function may only be called after `begin_consensus_epoch` and
-    /// before `end_consensus_epoch`. Data is only written to the database
-    /// once all transactions have been processed.
-    async fn apply_output<'a>(
+    async fn process_output<'a>(
         &self,
         dbtx: &mut ModuleDatabaseTransaction<'a>,
         output: &DynOutput,
         out_point: OutPoint,
     ) -> Result<TransactionItemAmount, ModuleError>;
-
-    /// This function is called once all transactions have been processed and
-    /// changes were written to the database. This allows running
-    /// finalization code before the next epoch.
-    ///
-    /// Passes in the `consensus_peers` that contributed to this epoch and
-    /// returns a list of peers to drop if any are misbehaving.
-    async fn end_consensus_epoch<'a>(
-        &self,
-        consensus_peers: &BTreeSet<PeerId>,
-        dbtx: &mut ModuleDatabaseTransaction<'a>,
-    ) -> Vec<PeerId>;
 
     /// Retrieve the current status of the output. Depending on the module this
     /// might contain data needed by the client to access funds or give an
@@ -213,37 +165,24 @@ where
             .map(|v| DynModuleConsensusItem::from_typed(module_instance_id, v))
     }
 
-    /// This function is called once before transaction processing starts.
-    ///
-    /// All module consensus items of this round are supplied as
-    /// `consensus_items`. The database transaction will be committed to the
-    /// database after all other modules ran `begin_consensus_epoch`, so the
-    /// results are available when processing transactions. Returns any
-    /// peers that need to be dropped.
-    async fn begin_consensus_epoch<'a>(
+    /// This function is called once for every consensus item. The function
+    /// returns an error if any only if the consensus item does not change
+    /// our state and therefore may be safely discarded by the atomic broadcast.
+    async fn process_consensus_item<'a>(
         &self,
         dbtx: &mut ModuleDatabaseTransaction<'a>,
-        consensus_items: Vec<(PeerId, DynModuleConsensusItem)>,
-        consensus_peers: &BTreeSet<PeerId>,
-    ) -> Vec<PeerId> {
-        <Self as ServerModule>::begin_consensus_epoch(
+        consensus_item: DynModuleConsensusItem,
+        peer_id: PeerId,
+    ) -> anyhow::Result<()> {
+        <Self as ServerModule>::process_consensus_item(
             self,
             dbtx,
-            consensus_items
-                .into_iter()
-                .map(|(peer, item)| {
-                    (
-                        peer,
-                        Clone::clone(
-                            item.as_any()
-                                .downcast_ref::<<<Self as ServerModule>::Common as ModuleCommon>::ConsensusItem>(
-                                )
-                                .expect("incorrect consensus item type passed to module plugin"),
-                        ),
-                    )
-                })
-                .collect(),
-            consensus_peers
+            Clone::clone(
+                consensus_item.as_any()
+                    .downcast_ref::<<<Self as ServerModule>::Common as ModuleCommon>::ConsensusItem>()
+                    .expect("incorrect consensus item type passed to module plugin"),
+            ),
+            peer_id
         )
         .await
     }
@@ -265,48 +204,17 @@ where
         .into()
     }
 
-    /// Validate a transaction input before submitting it to the unconfirmed
-    /// transaction pool. This function has no side effects and may be
-    /// called at any time. False positives due to outdated database state
-    /// are ok since they get filtered out after consensus has been reached on
-    /// them and merely generate a warning.
-    async fn validate_input<'a>(
-        &self,
-        dbtx: &mut ModuleDatabaseTransaction<'_>,
-        verification_cache: &DynVerificationCache,
-        input: &DynInput,
-    ) -> Result<InputMeta, ModuleError> {
-        <Self as ServerModule>::validate_input(
-            self,
-            dbtx,
-            verification_cache
-                .as_any()
-                .downcast_ref::<<Self as ServerModule>::VerificationCache>()
-                .expect("incorrect verification cache type passed to module plugin"),
-            input
-                .as_any()
-                .downcast_ref::<<<Self as ServerModule>::Common as ModuleCommon>::Input>()
-                .expect("incorrect input type passed to module plugin"),
-        )
-        .await
-        .map(Into::into)
-    }
-
     /// Try to spend a transaction input. On success all necessary updates will
     /// be part of the database transaction. On failure (e.g. double spend)
     /// the database transaction is rolled back and the operation will take
     /// no effect.
-    ///
-    /// This function may only be called after `begin_consensus_epoch` and
-    /// before `end_consensus_epoch`. Data is only written to the database
-    /// once all transactions have been processed
-    async fn apply_input<'a, 'b, 'c>(
+    async fn process_input<'a, 'b, 'c>(
         &'a self,
         dbtx: &mut ModuleDatabaseTransaction<'c>,
         input: &'b DynInput,
         verification_cache: &DynVerificationCache,
     ) -> Result<InputMeta, ModuleError> {
-        <Self as ServerModule>::apply_input(
+        <Self as ServerModule>::process_input(
             self,
             dbtx,
             input
@@ -320,27 +228,6 @@ where
         )
         .await
         .map(Into::into)
-    }
-
-    /// Validate a transaction output before submitting it to the unconfirmed
-    /// transaction pool. This function has no side effects and may be
-    /// called at any time. False positives due to outdated database state
-    /// are ok since they get filtered out after consensus has been reached on
-    /// them and merely generate a warning.
-    async fn validate_output(
-        &self,
-        dbtx: &mut ModuleDatabaseTransaction<'_>,
-        output: &DynOutput,
-    ) -> Result<TransactionItemAmount, ModuleError> {
-        <Self as ServerModule>::validate_output(
-            self,
-            dbtx,
-            output
-                .as_any()
-                .downcast_ref::<<<Self as ServerModule>::Common as ModuleCommon>::Output>()
-                .expect("incorrect output type passed to module plugin"),
-        )
-        .await
     }
 
     /// Try to create an output (e.g. issue notes, peg-out BTC, …). On success
@@ -351,17 +238,13 @@ where
     /// The supplied `out_point` identifies the operation (e.g. a peg-out or
     /// note issuance) and can be used to retrieve its outcome later using
     /// `output_status`.
-    ///
-    /// This function may only be called after `begin_consensus_epoch` and
-    /// before `end_consensus_epoch`. Data is only written to the database
-    /// once all transactions have been processed.
-    async fn apply_output<'a>(
+    async fn process_output<'a>(
         &self,
         dbtx: &mut ModuleDatabaseTransaction<'a>,
         output: &DynOutput,
         out_point: OutPoint,
     ) -> Result<TransactionItemAmount, ModuleError> {
-        <Self as ServerModule>::apply_output(
+        <Self as ServerModule>::process_output(
             self,
             dbtx,
             output
@@ -371,20 +254,6 @@ where
             out_point,
         )
         .await
-    }
-
-    /// This function is called once all transactions have been processed and
-    /// changes were written to the database. This allows running
-    /// finalization code before the next epoch.
-    ///
-    /// Passes in the `consensus_peers` that contributed to this epoch and
-    /// returns a list of peers to drop if any are misbehaving.
-    async fn end_consensus_epoch<'a>(
-        &self,
-        consensus_peers: &BTreeSet<PeerId>,
-        dbtx: &mut ModuleDatabaseTransaction<'a>,
-    ) -> Vec<PeerId> {
-        <Self as ServerModule>::end_consensus_epoch(self, consensus_peers, dbtx).await
     }
 
     /// Retrieve the current status of the output. Depending on the module this

@@ -1,5 +1,5 @@
 use std::str::FromStr;
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail};
 use bitcoin::secp256k1;
@@ -12,19 +12,21 @@ use fedimint_client::sm::OperationId;
 use fedimint_client::Client;
 use fedimint_core::config::ClientConfig;
 use fedimint_core::core::{ModuleInstanceId, ModuleKind};
-use fedimint_core::encoding::{Decodable, Encodable};
-use fedimint_core::module::registry::ModuleDecoderRegistry;
 use fedimint_core::time::now;
 use fedimint_core::{Amount, ParseAmountError, TieredMulti, TieredSummary};
 use fedimint_ln_client::contracts::ContractId;
 use fedimint_ln_client::{
     InternalPayState, LightningClientExt, LnPayState, LnReceiveState, PayType,
 };
-use fedimint_mint_client::{MintClientExt, MintClientModule, SpendableNote};
+use fedimint_mint_client::{
+    parse_ecash, serialize_ecash, MintClientExt, MintClientModule, SpendableNote,
+};
 use fedimint_wallet_client::{WalletClientExt, WithdrawState};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use time::format_description::well_known::iso8601;
+use time::OffsetDateTime;
 use tracing::info;
 
 use crate::{metadata_from_clap_cli, LnInvoiceResponse};
@@ -78,12 +80,12 @@ pub enum ClientCmd {
     ListGateways,
     /// Switch active gateway
     SwitchGateway {
-        #[clap(value_parser = parse_gateway_pub_key)]
-        pubkey: secp256k1::XOnlyPublicKey,
+        #[clap(value_parser = parse_gateway_id)]
+        gateway_id: secp256k1::PublicKey,
     },
     /// Generate a new deposit address, funds sent to it can later be claimed
     DepositAddress,
-    /// Wait for desposit on previously generated address
+    /// Wait for deposit on previously generated address
     AwaitDeposit { operation_id: OperationId },
     /// Withdraw funds from the federation
     Withdraw {
@@ -118,10 +120,14 @@ pub enum ClientCmd {
     },
     /// Print the secret key of the client
     PrintSecret,
+    ListOperations {
+        #[clap(long, default_value = "10")]
+        limit: usize,
+    },
 }
 
-pub fn parse_gateway_pub_key(s: &str) -> Result<secp256k1::XOnlyPublicKey, secp256k1::Error> {
-    secp256k1::XOnlyPublicKey::from_str(s)
+pub fn parse_gateway_id(s: &str) -> Result<secp256k1::PublicKey, secp256k1::Error> {
+    secp256k1::PublicKey::from_str(s)
 }
 
 fn parse_secret(s: &str) -> Result<[u8; 64], hex::Error> {
@@ -202,7 +208,9 @@ pub async fn handle_ng_command(
                 info!("Update: {:?}", update);
             }
 
-            return Err(anyhow::anyhow!("Lightning receive failed"));
+            return Err(anyhow::anyhow!(
+                "Unexpected end of update stream. Lightning receive failed"
+            ));
         }
         ClientCmd::LnPay { bolt11 } => {
             client.select_active_gateway().await?;
@@ -226,13 +234,13 @@ pub async fn handle_ng_command(
                                 })
                                 .unwrap());
                             }
-                            InternalPayState::RefundSuccess(outpoint) => {
+                            InternalPayState::RefundSuccess { outpoint, error } => {
                                 let e = format!(
-                                    "Internal payment failed. A refund was issued to {outpoint}"
+                                    "Internal payment failed. A refund was issued to {outpoint} Error: {error}"
                                 );
                                 return Err(anyhow!(e));
                             }
-                            InternalPayState::Error(e) => {
+                            InternalPayState::UnexpectedError(e) => {
                                 return Err(anyhow!(e));
                             }
                             _ => {}
@@ -290,8 +298,8 @@ pub async fn handle_ng_command(
                 });
             Ok(serde_json::to_value(gateways_json).unwrap())
         }
-        ClientCmd::SwitchGateway { pubkey } => {
-            client.set_active_gateway(&pubkey).await?;
+        ClientCmd::SwitchGateway { gateway_id } => {
+            client.set_active_gateway(&gateway_id).await?;
             let gateway = client.select_active_gateway().await?;
             let mut gateway_json = json!(&gateway);
             gateway_json["active"] = json!(true);
@@ -345,6 +353,50 @@ pub async fn handle_ng_command(
 
             Ok(json!({
                 "secret": hex_secret,
+            }))
+        }
+        ClientCmd::ListOperations { limit } => {
+            #[derive(Serialize)]
+            struct OperationOutput {
+                id: OperationId,
+                creation_time: String,
+                operation_kind: String,
+                operation_meta: serde_json::Value,
+                #[serde(skip_serializing_if = "Option::is_none")]
+                outcome: Option<serde_json::Value>,
+            }
+
+            const ISO8601_CONFIG: iso8601::EncodedConfig = iso8601::Config::DEFAULT
+                .set_formatted_components(iso8601::FormattedComponents::DateTime)
+                .encode();
+            let operations = client
+                .operation_log()
+                .list_operations(limit, None)
+                .await
+                .into_iter()
+                .map(|(k, v)| {
+                    let creation_time = OffsetDateTime::from_unix_timestamp(
+                        k.creation_time
+                            .duration_since(UNIX_EPOCH)
+                            .expect("Couldn't convert time from SystemTime to timestamp")
+                            .as_secs() as i64,
+                    )
+                    .expect("Couldn't convert time from SystemTime to OffsetDateTime")
+                    .format(&iso8601::Iso8601::<ISO8601_CONFIG>)
+                    .expect("Couldn't format OffsetDateTime as ISO8601");
+
+                    OperationOutput {
+                        id: k.operation_id,
+                        creation_time,
+                        operation_kind: v.operation_type().to_owned(),
+                        operation_meta: v.meta(),
+                        outcome: v.outcome(),
+                    }
+                })
+                .collect::<Vec<_>>();
+
+            Ok(json!({
+                "operations": operations,
             }))
         }
         ClientCmd::Withdraw { amount, address } => {
@@ -413,23 +465,9 @@ pub fn parse_fedimint_amount(s: &str) -> Result<fedimint_core::Amount, ParseAmou
     }
 }
 
-pub fn parse_ecash(s: &str) -> anyhow::Result<TieredMulti<SpendableNote>> {
-    let bytes = base64::decode(s)?;
-    Ok(Decodable::consensus_decode(
-        &mut std::io::Cursor::new(bytes),
-        &ModuleDecoderRegistry::default(),
-    )?)
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PayInvoiceResponse {
     operation_id: OperationId,
     contract_id: ContractId,
     preimage: String,
-}
-
-pub fn serialize_ecash(c: &TieredMulti<SpendableNote>) -> String {
-    let mut bytes = Vec::new();
-    Encodable::consensus_encode(c, &mut bytes).expect("encodes correctly");
-    base64::encode(&bytes)
 }

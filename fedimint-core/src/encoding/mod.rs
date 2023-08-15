@@ -2,6 +2,7 @@
 //! consensus critical encoding than e.g. `bincode`. Over time all structs that
 //! need to be encoded to binary will be migrated to this interface.
 
+pub mod as_hex;
 mod btc;
 mod secp256k1;
 mod tbs;
@@ -12,15 +13,19 @@ mod tls;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Debug, Formatter};
-use std::io::{Error, Read, Write};
+use std::io::{self, Error, Read, Write};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{cmp, mem};
 
 use anyhow::format_err;
 use bitcoin_hashes::hex::{FromHex, ToHex};
 pub use fedimint_derive::{Decodable, Encodable, UnzipConsensus};
+use lightning::util::ser::{Readable, Writeable};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use url::Url;
 
+use crate::core::ModuleInstanceId;
 use crate::module::registry::ModuleDecoderRegistry;
 
 /// Object-safe trait for things that can encode themselves
@@ -143,7 +148,27 @@ impl DecodeError {
     }
 }
 
-macro_rules! impl_encode_decode_num {
+pub use lightning::util::ser::BigSize;
+
+impl Encodable for BigSize {
+    fn consensus_encode<W: std::io::Write>(&self, writer: &mut W) -> Result<usize, std::io::Error> {
+        let mut writer = CountWrite::from(writer);
+        self.write(&mut writer)?;
+        Ok(usize::try_from(writer.count()).expect("can't overflow"))
+    }
+}
+
+impl Decodable for BigSize {
+    fn consensus_decode<R: std::io::Read>(
+        r: &mut R,
+        _modules: &ModuleDecoderRegistry,
+    ) -> Result<Self, DecodeError> {
+        BigSize::read(r)
+            .map_err(|e| DecodeError::new_custom(anyhow::anyhow!("BigSize decoding error: {e:?}")))
+    }
+}
+
+macro_rules! impl_encode_decode_num_as_plain {
     ($num_type:ty) => {
         impl Encodable for $num_type {
             fn consensus_encode<W: std::io::Write>(&self, writer: &mut W) -> Result<usize, Error> {
@@ -166,10 +191,31 @@ macro_rules! impl_encode_decode_num {
     };
 }
 
-impl_encode_decode_num!(u64);
-impl_encode_decode_num!(u32);
-impl_encode_decode_num!(u16);
-impl_encode_decode_num!(u8);
+macro_rules! impl_encode_decode_num_as_bigsize {
+    ($num_type:ty) => {
+        impl Encodable for $num_type {
+            fn consensus_encode<W: std::io::Write>(&self, writer: &mut W) -> Result<usize, Error> {
+                BigSize(*self as u64).consensus_encode(writer)
+            }
+        }
+
+        impl Decodable for $num_type {
+            fn consensus_decode<D: std::io::Read>(
+                d: &mut D,
+                _modules: &ModuleDecoderRegistry,
+            ) -> Result<Self, crate::encoding::DecodeError> {
+                let varint = BigSize::consensus_decode(d, &Default::default())
+                    .map_err(crate::encoding::DecodeError::from_err)?;
+                <$num_type>::try_from(varint.0).map_err(crate::encoding::DecodeError::from_err)
+            }
+        }
+    };
+}
+
+impl_encode_decode_num_as_bigsize!(u64);
+impl_encode_decode_num_as_bigsize!(u32);
+impl_encode_decode_num_as_bigsize!(u16);
+impl_encode_decode_num_as_plain!(u8);
 
 macro_rules! impl_encode_decode_tuple {
     ($($x:ident),*) => (
@@ -228,8 +274,43 @@ where
         modules: &ModuleDecoderRegistry,
     ) -> Result<Self, DecodeError> {
         let len = u64::consensus_decode(d, modules)?;
-        (0..len).map(|_| T::consensus_decode(d, modules)).collect()
+
+        // `collect` under the hood uses `FromIter::from_iter`, which can potentially be
+        // backed by code like:
+        // <https://github.com/rust-lang/rust/blob/fe03b46ee4688a99d7155b4f9dcd875b6903952d/library/alloc/src/vec/spec_from_iter_nested.rs#L31>
+        // This can take `size_hint` from input iterator and pre-allocate memory
+        // upfront with `Vec::with_capacity`. Because of that untrusted `len`
+        // should not be used directly.
+        let cap_len = cmp::min(8_000 / mem::size_of::<T>() as u64, len);
+
+        // Up to a cap, use the (potentially specialized for better perf in stdlib)
+        // `from_iter`.
+        let mut v: Vec<_> = (0..cap_len)
+            .map(|_| T::consensus_decode(d, modules))
+            .collect::<Result<Vec<_>, DecodeError>>()?;
+
+        // Add any excess manually avoiding any surprises.
+        while (v.len() as u64) < len {
+            v.push(T::consensus_decode(d, modules)?);
+        }
+
+        assert_eq!(v.len() as u64, len);
+
+        Ok(v)
     }
+}
+
+#[test]
+fn vec_decode_sanity() {
+    let buf = [
+        0xffu8, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ];
+
+    // On malicious large len, return an error instead of panicking.
+    // Note: This was supposed to expose the panic, but I was not able to trigger it
+    // for some reason.
+    assert!(Vec::<u8>::consensus_decode(&mut buf.as_slice(), &Default::default()).is_err());
+    assert!(Vec::<u16>::consensus_decode(&mut buf.as_slice(), &Default::default()).is_err());
 }
 
 impl<T, const SIZE: usize> Encodable for [T; SIZE]
@@ -575,6 +656,183 @@ impl Decodable for Cow<'static, str> {
     }
 }
 
+/// A writer counting number of writes written to it
+///
+/// Copy&pasted from <https://github.com/SOF3/count-write> which
+/// uses Apache license (and it's a trivial amount of code, repeating
+/// on stack overflow).
+pub struct CountWrite<W> {
+    inner: W,
+    count: u64,
+}
+
+impl<W> CountWrite<W> {
+    /// Returns the number of bytes successfully written so far
+    pub fn count(&self) -> u64 {
+        self.count
+    }
+
+    /// Extracts the inner writer, discarding this wrapper
+    pub fn into_inner(self) -> W {
+        self.inner
+    }
+}
+
+impl<W> From<W> for CountWrite<W> {
+    fn from(inner: W) -> Self {
+        Self { inner, count: 0 }
+    }
+}
+
+impl<W: Write> Write for CountWrite<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        self.count += written as u64;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// A type that decodes `module_instance_id`-prefixed `T`s even
+/// when corresponding `Decoder` is not available.
+///
+/// All dyn-module types are encoded as:
+///
+/// ```norust
+/// module_instance_id | len_u64 | data
+/// ```
+///
+/// So clients that don't have a corresponding module, can read
+/// the `len_u64` and skip the amount of data specified in it.
+///
+/// This type makes it more convenient. It's possible to attempt
+/// to retry decoding after more modules become available by using
+/// [`DynRawFallback::redecode_raw`].
+///
+/// Notably this struct does not ignore any errors. It only skips
+/// decoding when the module decoder is not available.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub enum DynRawFallback<T> {
+    Raw {
+        module_instance_id: ModuleInstanceId,
+        raw: Vec<u8>,
+    },
+    Decoded(T),
+}
+
+impl<T> DynRawFallback<T>
+where
+    T: Decodable + 'static,
+{
+    pub fn expect_decoded(self) -> T {
+        match self {
+            DynRawFallback::Raw { .. } => {
+                panic!("Expected decoded value. Possibly `redecode_raw` call is missing.")
+            }
+            DynRawFallback::Decoded(v) => v,
+        }
+    }
+
+    pub fn expect_decoded_ref(&self) -> &T {
+        match self {
+            DynRawFallback::Raw { .. } => {
+                panic!("Expected decoded value. Possibly `redecode_raw` call is missing.")
+            }
+            DynRawFallback::Decoded(v) => v,
+        }
+    }
+
+    /// Attempt to re-decode raw values with new set of of `modules`
+    ///
+    /// In certain contexts it might be necessary to try again with
+    /// a new set of modules.
+    pub fn redecode_raw(
+        self,
+        decoders: &ModuleDecoderRegistry,
+    ) -> Result<Self, crate::encoding::DecodeError> {
+        Ok(match self {
+            DynRawFallback::Raw {
+                module_instance_id,
+                raw,
+            } => match decoders.get(module_instance_id) {
+                Some(decoder) => DynRawFallback::Decoded(decoder.decode(
+                    &mut &raw[..],
+                    module_instance_id,
+                    decoders,
+                )?),
+                None => DynRawFallback::Raw {
+                    module_instance_id,
+                    raw,
+                },
+            },
+            DynRawFallback::Decoded(v) => DynRawFallback::Decoded(v),
+        })
+    }
+}
+
+impl<T> From<T> for DynRawFallback<T> {
+    fn from(value: T) -> Self {
+        Self::Decoded(value)
+    }
+}
+
+impl<T> Decodable for DynRawFallback<T>
+where
+    T: Decodable + 'static,
+{
+    fn consensus_decode<R: std::io::Read>(
+        reader: &mut R,
+        decoders: &ModuleDecoderRegistry,
+    ) -> Result<Self, crate::encoding::DecodeError> {
+        let module_instance_id =
+            fedimint_core::core::ModuleInstanceId::consensus_decode(reader, decoders)?;
+        Ok(match decoders.get(module_instance_id) {
+            Some(decoder) => {
+                let total_len_u64 = u64::consensus_decode(reader, decoders)?;
+                let mut reader = reader.take(total_len_u64);
+                let v: T = decoder.decode(&mut reader, module_instance_id, decoders)?;
+
+                if reader.limit() != 0 {
+                    return Err(fedimint_core::encoding::DecodeError::new_custom(
+                        anyhow::anyhow!("Dyn type did not consume all bytes during decoding"),
+                    ));
+                }
+
+                DynRawFallback::Decoded(v)
+            }
+            None => {
+                // since the decoder is not available, just read the raw data
+                Self::Raw {
+                    module_instance_id,
+                    raw: Vec::consensus_decode(reader, decoders)?,
+                }
+            }
+        })
+    }
+}
+
+impl<T> Encodable for DynRawFallback<T>
+where
+    T: Encodable,
+{
+    fn consensus_encode<W: std::io::Write>(&self, writer: &mut W) -> Result<usize, std::io::Error> {
+        match self {
+            DynRawFallback::Raw {
+                module_instance_id,
+                raw,
+            } => {
+                let mut written = module_instance_id.consensus_encode(writer)?;
+                written += raw.consensus_encode(writer)?;
+                Ok(written)
+            }
+            DynRawFallback::Decoded(v) => v.consensus_encode(writer),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fmt::Debug;
@@ -628,7 +886,7 @@ mod tests {
             vec: vec![1, 2, 3],
             num: 42,
         };
-        let bytes = [0, 0, 0, 0, 0, 0, 0, 3, 1, 2, 3, 0, 0, 0, 42];
+        let bytes = [3, 1, 2, 3, 42];
 
         test_roundtrip_expected(reference, &bytes);
     }
@@ -639,7 +897,7 @@ mod tests {
         struct TestStruct(Vec<u8>, u32);
 
         let reference = TestStruct(vec![1, 2, 3], 42);
-        let bytes = [0, 0, 0, 0, 0, 0, 0, 3, 1, 2, 3, 0, 0, 0, 42];
+        let bytes = [3, 1, 2, 3, 42];
 
         test_roundtrip_expected(reference, &bytes);
     }
@@ -653,16 +911,13 @@ mod tests {
         }
 
         let test_cases = [
-            (
-                TestEnum::Foo(Some(42)),
-                vec![0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 42],
-            ),
-            (TestEnum::Foo(None), vec![0, 0, 0, 0, 0, 0, 0, 0, 0]),
+            (TestEnum::Foo(Some(42)), vec![0, 1, 42]),
+            (TestEnum::Foo(None), vec![0, 0]),
             (
                 TestEnum::Bar {
                     bazz: vec![1, 2, 3],
                 },
-                vec![0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 3, 1, 2, 3],
+                vec![1, 3, 1, 2, 3],
             ),
         ];
 

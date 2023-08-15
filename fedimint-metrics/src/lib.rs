@@ -3,13 +3,12 @@ use std::net::SocketAddr;
 use axum::http::StatusCode;
 use axum::routing::get;
 use axum::Router;
-use fedimint_core::task::TaskGroup;
+use fedimint_core::task::{TaskGroup, TaskShutdownToken};
 pub use lazy_static::lazy_static;
 pub use prometheus::{
     self, histogram_opts, opts, register_histogram, register_int_counter, Encoder, Histogram,
     IntCounter, TextEncoder,
 };
-use tokio::sync::oneshot;
 use tracing::error;
 
 async fn get_metrics() -> (StatusCode, String) {
@@ -29,33 +28,22 @@ async fn get_metrics() -> (StatusCode, String) {
 pub async fn run_api_server(
     bind_address: &SocketAddr,
     task_group: &mut TaskGroup,
-) -> anyhow::Result<oneshot::Receiver<()>> {
+) -> anyhow::Result<TaskShutdownToken> {
     let app = Router::new().route("/metrics", get(get_metrics));
     let server = axum::Server::bind(bind_address).serve(app.into_make_service());
 
-    let (tx, rx) = oneshot::channel::<()>();
+    let handle = task_group.make_handle();
+    let shutdown_rx = handle.make_shutdown_rx().await;
     task_group
         .spawn("Metrics Api", move |_| async move {
             let graceful = server.with_graceful_shutdown(async {
-                rx.await.ok();
+                shutdown_rx.await;
             });
 
             if let Err(e) = graceful.await {
                 error!("Error shutting down metrics api: {e:?}");
             }
         })
-        .await;
-    let handle = task_group.make_handle();
-    handle
-        .on_shutdown(Box::new(|| {
-            Box::pin(async move {
-                // Send shutdown signal to the webserver
-                let res = tx.send(());
-                if res.is_err() {
-                    error!("Error shutting down metrics api: {res:?}");
-                }
-            })
-        }))
         .await;
     let shutdown_receiver = handle.make_shutdown_rx().await;
 

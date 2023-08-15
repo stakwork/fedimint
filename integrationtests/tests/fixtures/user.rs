@@ -11,6 +11,7 @@ use fedimint_core::cancellable::Cancellable;
 use fedimint_core::config::ClientConfig;
 use fedimint_core::core::KeyPair;
 use fedimint_core::epoch::SignedEpochOutcome;
+use fedimint_core::module::registry::ModuleDecoderRegistry;
 use fedimint_core::task::TaskGroup;
 use fedimint_core::txoproof::TxOutProof;
 use fedimint_core::{Amount, OutPoint, PeerId, TieredMulti, TransactionId};
@@ -125,11 +126,11 @@ pub trait ILegacyWalletClient {
     /// Helps prevent transactions from getting stuck in the mempool
     async fn rbf_peg_out_tx(&self, rbf: Rbf) -> LegacyClientResult<OutPoint>;
 
-    /// Awaits for the federation's consensus block height to reach a target
+    /// Awaits for the federation's consensus block count to reach a target
     ///
-    /// The consensus block height will be below the actual block height to
+    /// The consensus block count will be below the actual block count to
     /// account for finality delay
-    async fn await_consensus_block_height(&self, block_height: u64) -> LegacyClientResult<u64>;
+    async fn await_consensus_block_count(&self, block_count: u64) -> LegacyClientResult<u64>;
 }
 
 #[async_trait]
@@ -270,6 +271,8 @@ pub trait ILegacyLightningClient {
 pub trait ILegacyTestClient:
     Sync + ILegacyWalletClient + ILegacyMintClient + ILegacyLightningClient
 {
+    fn decoders(&self) -> ModuleDecoderRegistry;
+
     /// Helper to make restore ecash less verbose
     async fn restore_ecash(&self, gap_limit: usize, task_group: &mut TaskGroup) -> Metadata {
         self.restore_ecash_from_federation(gap_limit, task_group)

@@ -1,14 +1,13 @@
 //! Implements the client API through which users interact with the federation
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bitcoin_hashes::sha256;
 use fedimint_core::api::{
-    ConsensusStatus, PeerConnectionStatus, PeerConsensusStatus, ServerStatus, StatusResponse,
-    WsClientConnectInfo,
+    FederationStatus, InviteCode, PeerConnectionStatus, PeerStatus, ServerStatus, StatusResponse,
 };
 use fedimint_core::backup::ClientBackupKey;
 use fedimint_core::config::{ClientConfig, ClientConfigResponse};
@@ -26,6 +25,7 @@ use fedimint_core::server::DynServerModule;
 use fedimint_core::transaction::Transaction;
 use fedimint_core::{OutPoint, PeerId, TransactionId};
 use fedimint_logging::LOG_NET_API;
+use itertools::Itertools;
 use jsonrpsee::RpcModule;
 use secp256k1_zkp::SECP256K1;
 use tokio::sync::mpsc::error::SendError;
@@ -35,19 +35,17 @@ use tracing::{debug, info};
 
 use super::peers::PeerStatusChannels;
 use crate::backup::ClientBackupSnapshot;
-use crate::config::api::{get_verification_hashes, ApiResult};
+use crate::config::api::get_verification_hashes;
 use crate::config::ServerConfig;
 use crate::consensus::server::LatestContributionByPeer;
-use crate::consensus::{
-    AcceptedTransaction, ApiEvent, FundingVerifier, TransactionSubmissionError,
-};
+use crate::consensus::{ApiEvent, FundingVerifier, VerificationCaches};
 use crate::db::{
     AcceptedTransactionKey, ClientConfigDownloadKey, ClientConfigSignatureKey, EpochHistoryKey,
-    LastEpochKey, RejectedTransactionKey,
+    LastEpochKey,
 };
 use crate::fedimint_core::encoding::Encodable;
 use crate::transaction::SerdeTransaction;
-use crate::HasApiContext;
+use crate::{check_auth, ApiResult, HasApiContext};
 
 /// A state that has context for the API, passed to each rpc handler callback
 #[derive(Clone)]
@@ -83,7 +81,7 @@ pub struct ConsensusApi {
     pub api_sender: Sender<ApiEvent>,
     pub peer_status_channels: PeerStatusChannels,
     pub latest_contribution_by_peer: Arc<RwLock<LatestContributionByPeer>>,
-    pub consensus_status_cache: ExpiringCache<ApiResult<ConsensusStatus>>,
+    pub consensus_status_cache: ExpiringCache<ApiResult<FederationStatus>>,
     pub supported_api_versions: SupportedApiVersionsSummary,
 }
 
@@ -92,10 +90,7 @@ impl ConsensusApi {
         &self.supported_api_versions
     }
 
-    pub async fn submit_transaction(
-        &self,
-        transaction: Transaction,
-    ) -> Result<(), TransactionSubmissionError> {
+    pub async fn submit_transaction(&self, transaction: Transaction) -> anyhow::Result<()> {
         // we already processed the transaction before the request was received
         if self
             .transaction_status(transaction.tx_hash())
@@ -108,41 +103,43 @@ impl ConsensusApi {
         let tx_hash = transaction.tx_hash();
         debug!(%tx_hash, "Received mint transaction");
 
-        let mut funding_verifier = FundingVerifier::default();
-
-        let mut pub_keys = Vec::new();
-
         // Create read-only DB tx so that the read state is consistent
         let mut dbtx = self.db.begin_transaction().await;
 
-        for input in &transaction.inputs {
-            let module = self.modules.get_expect(input.module_instance_id());
+        let txid = transaction.tx_hash();
+        let caches = self.build_verification_caches(transaction.clone());
 
-            let cache = module.build_verification_cache(&[input.clone()]);
-            let meta = module
-                .validate_input(
+        let mut funding_verifier = FundingVerifier::default();
+        let mut public_keys = Vec::new();
+
+        for input in transaction.inputs.iter() {
+            let meta = self
+                .modules
+                .get_expect(input.module_instance_id())
+                .process_input(
                     &mut dbtx.with_module_prefix(input.module_instance_id()),
-                    &cache,
                     input,
+                    caches.get_cache(input.module_instance_id()),
                 )
-                .await
-                .map_err(|e| TransactionSubmissionError::ModuleError(tx_hash, e))?;
+                .await?;
 
-            pub_keys.push(meta.pub_keys);
             funding_verifier.add_input(meta.amount);
+            public_keys.push(meta.pub_keys);
         }
-        transaction.validate_signature(pub_keys.into_iter().flatten())?;
 
-        for output in &transaction.outputs {
+        transaction.validate_signature(public_keys.into_iter().flatten())?;
+
+        for (output, out_idx) in transaction.outputs.iter().zip(0u64..) {
             let amount = self
                 .modules
                 .get_expect(output.module_instance_id())
-                .validate_output(
+                .process_output(
                     &mut dbtx.with_module_prefix(output.module_instance_id()),
                     output,
+                    OutPoint { txid, out_idx },
                 )
-                .await
-                .map_err(|e| TransactionSubmissionError::ModuleError(tx_hash, e))?;
+                .await?;
+
             funding_verifier.add_output(amount);
         }
 
@@ -150,91 +147,79 @@ impl ConsensusApi {
 
         self.api_sender
             .send(ApiEvent::Transaction(transaction))
-            .await
-            .map_err(|_e| TransactionSubmissionError::TxChannelError)?;
+            .await?;
+
         Ok(())
     }
 
-    pub async fn transaction_status(
-        &self,
-        txid: TransactionId,
-    ) -> Option<crate::outcome::TransactionStatus> {
-        let mut dbtx = self.db.begin_transaction().await;
+    fn build_verification_caches(&self, transaction: Transaction) -> VerificationCaches {
+        let module_inputs = transaction
+            .inputs
+            .into_iter()
+            .into_group_map_by(|input| input.module_instance_id());
 
-        let accepted: Option<AcceptedTransaction> =
-            dbtx.get_value(&AcceptedTransactionKey(txid)).await;
+        let caches = module_inputs
+            .into_iter()
+            .map(|(module_key, inputs)| {
+                let module = self.modules.get_expect(module_key);
+                (module_key, module.build_verification_cache(&inputs))
+            })
+            .collect();
 
-        if let Some(accepted) = accepted {
-            return Some(
-                self.accepted_transaction_status(txid, accepted, &mut dbtx)
-                    .await,
-            );
-        }
-
-        let rejected: Option<String> = self
-            .db
-            .begin_transaction()
-            .await
-            .get_value(&RejectedTransactionKey(txid))
-            .await;
-
-        if let Some(message) = rejected {
-            return Some(TransactionStatus::Rejected(message));
-        }
-
-        None
+        VerificationCaches { caches }
     }
 
-    pub async fn wait_transaction_status(
-        &self,
-        txid: TransactionId,
-    ) -> crate::outcome::TransactionStatus {
-        let accepted_key = AcceptedTransactionKey(txid);
-        let rejected_key = RejectedTransactionKey(txid);
-        tokio::select! {
-            (accepted, mut dbtx) = self.db.wait_key_check(&accepted_key, std::convert::identity) => {
-                self.accepted_transaction_status(txid, accepted, &mut dbtx).await
-            }
-            rejected = self.db.wait_key_exists(&rejected_key) => {
-                TransactionStatus::Rejected(rejected)
-            }
-        }
+    pub async fn transaction_status(&self, txid: TransactionId) -> Option<TransactionStatus> {
+        let mut dbtx = self.db.begin_transaction().await;
+
+        let module_ids = dbtx.get_value(&AcceptedTransactionKey(txid)).await?;
+
+        let status = self
+            .accepted_transaction_status(txid, module_ids, &mut dbtx)
+            .await;
+
+        Some(status)
+    }
+
+    pub async fn wait_transaction_status(&self, txid: TransactionId) -> TransactionStatus {
+        let (outputs, mut dbtx) = self
+            .db
+            .wait_key_check(&AcceptedTransactionKey(txid), std::convert::identity)
+            .await;
+
+        self.accepted_transaction_status(txid, outputs, &mut dbtx)
+            .await
     }
 
     async fn accepted_transaction_status(
         &self,
         txid: TransactionId,
-        accepted: AcceptedTransaction,
+        module_ids: Vec<ModuleInstanceId>,
         dbtx: &mut DatabaseTransaction<'_>,
     ) -> TransactionStatus {
         let mut outputs = Vec::new();
-        for (out_idx, output) in accepted.transaction.outputs.iter().enumerate() {
-            let outpoint = OutPoint {
-                txid,
-                out_idx: out_idx as u64,
-            };
+
+        for (module_id, out_idx) in module_ids.into_iter().zip(0u64..) {
             let outcome = self
                 .modules
-                .get_expect(output.module_instance_id())
+                .get_expect(module_id)
                 .output_status(
-                    &mut dbtx.with_module_prefix(output.module_instance_id()),
-                    outpoint,
-                    output.module_instance_id(),
+                    &mut dbtx.with_module_prefix(module_id),
+                    OutPoint { txid, out_idx },
+                    module_id,
                 )
                 .await
-                .expect("the transaction was processed, so must be known");
+                .expect("the transaction was accepted");
+
             outputs.push((&outcome).into())
         }
 
-        TransactionStatus::Accepted {
-            epoch: accepted.epoch,
-            outputs,
-        }
+        TransactionStatus::Accepted { epoch: 0, outputs }
     }
 
     pub async fn download_client_config(
         &self,
-        info: WsClientConnectInfo,
+        info: InviteCode,
         dbtx: &mut ModuleDatabaseTransaction<'_>,
     ) -> ApiResult<ClientConfig> {
         let token = self.cfg.local.download_token.clone();
@@ -299,22 +284,58 @@ impl ConsensusApi {
             .map_err(|_| ApiError::server_error("Unable send event".to_string()))
     }
 
-    pub async fn get_consensus_status(&self) -> ApiResult<ConsensusStatus> {
-        let our_last_contribution = self.get_epoch_count().await;
+    pub async fn get_federation_status(&self) -> ApiResult<FederationStatus> {
+        let peers_connection_status = self.peer_status_channels.get_all_status().await;
         let latest_contribution_by_peer = self.latest_contribution_by_peer.read().await.clone();
-        let peers_connection_status: HashMap<PeerId, anyhow::Result<PeerConnectionStatus>> =
-            self.peer_status_channels.get_all_status().await;
-        // How much time we consider a contribution recent for a "grace time".
-        // For instance, even if a peer isn't connected right now, if it contributed
-        // recently then we won't flag it.
-        const MAX_DURATION_FOR_RECENT_CONTRIBUTION: Duration = Duration::from_secs(60);
+        let epoch_count = self.get_epoch_count().await;
 
-        Ok(calculate_consensus_status(
-            latest_contribution_by_peer,
-            our_last_contribution,
-            peers_connection_status,
-            MAX_DURATION_FOR_RECENT_CONTRIBUTION,
-        ))
+        let status_by_peer = peers_connection_status
+            .into_iter()
+            .map(|(peer, connection_status)| {
+                let last_contribution = latest_contribution_by_peer.get(&peer).cloned();
+                let flagged = last_contribution.unwrap_or(0) + 1 < epoch_count;
+                let connection_status = match connection_status {
+                    Ok(status) => status,
+                    Err(e) => {
+                        debug!(target: LOG_NET_API, %peer, "Unable to get peer connection status: {e}");
+                        PeerConnectionStatus::Disconnected
+                    }
+                };
+
+                let consensus_status = PeerStatus {
+                    last_contribution,
+                    flagged,
+                    connection_status,
+                };
+
+                (peer, consensus_status)
+            })
+            .collect::<HashMap<PeerId, PeerStatus>>();
+
+        let peers_flagged = status_by_peer
+            .values()
+            .filter(|status| status.flagged)
+            .count() as u64;
+
+        let peers_online = status_by_peer
+            .values()
+            .filter(|status| status.connection_status == PeerConnectionStatus::Connected)
+            .count() as u64;
+
+        let peers_offline = status_by_peer
+            .values()
+            .filter(|status| status.connection_status == PeerConnectionStatus::Disconnected)
+            .count() as u64;
+
+        Ok(FederationStatus {
+            // the naming is in preparation for aleph bft since we will switch to
+            // the session count here and want to keep the public API stable
+            session_count: epoch_count,
+            peers_online,
+            peers_offline,
+            peers_flagged,
+            status_by_peer,
+        })
     }
 
     async fn handle_backup_request(
@@ -353,76 +374,6 @@ impl ConsensusApi {
         id: secp256k1_zkp::XOnlyPublicKey,
     ) -> Option<ClientBackupSnapshot> {
         dbtx.get_value(&ClientBackupKey(id)).await
-    }
-}
-
-fn calculate_consensus_status(
-    latest_contribution_by_peer: LatestContributionByPeer,
-    our_last_contribution: u64,
-    peers_connection_status: HashMap<PeerId, anyhow::Result<PeerConnectionStatus>>,
-    max_duration_for_recent_contribution: Duration,
-) -> ConsensusStatus {
-    let mut peers = peers_connection_status
-        .keys()
-        .copied()
-        .collect::<HashSet<_>>();
-    peers.extend(latest_contribution_by_peer.keys().copied());
-    let peer_consensus_status = peers
-        .into_iter()
-        .map(|peer| {
-            let mut consensus_status = PeerConsensusStatus::default();
-            let has_recent_contribution;
-            if let Some(contribution) = latest_contribution_by_peer.get(&peer) {
-                let is_behind_us = contribution.value < our_last_contribution;
-                has_recent_contribution =
-                    contribution.time.elapsed().unwrap() <= max_duration_for_recent_contribution;
-                consensus_status.flagged = is_behind_us && !has_recent_contribution;
-                consensus_status.last_contribution = Some(contribution.value);
-                let unix_timestamp = contribution
-                    .time
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs();
-                consensus_status.last_contribution_timestamp_seconds = Some(unix_timestamp);
-            } else {
-                has_recent_contribution = false;
-                consensus_status.flagged = true;
-            }
-            match peers_connection_status.get(&peer) {
-                Some(Err(e)) => {
-                    debug!(target: LOG_NET_API, %peer, "Unable to get peer connection status: {e}");
-                    consensus_status.flagged |= !has_recent_contribution;
-                    consensus_status.connection_status = PeerConnectionStatus::Disconnected;
-                }
-                Some(Ok(PeerConnectionStatus::Disconnected)) | None => {
-                    consensus_status.flagged |= !has_recent_contribution;
-                    consensus_status.connection_status = PeerConnectionStatus::Disconnected;
-                }
-                Some(Ok(PeerConnectionStatus::Connected)) => {
-                    consensus_status.connection_status = PeerConnectionStatus::Connected;
-                }
-            };
-            (peer, consensus_status)
-        })
-        .collect::<HashMap<_, _>>();
-    let peers_flagged = peer_consensus_status
-        .iter()
-        .filter(|(_, status)| status.flagged)
-        .count() as u64;
-    let peers_online = peer_consensus_status
-        .iter()
-        .filter(|(_, status)| status.connection_status == PeerConnectionStatus::Connected)
-        .count() as u64;
-    let peers_offline = peer_consensus_status
-        .iter()
-        .filter(|(_, status)| status.connection_status == PeerConnectionStatus::Disconnected)
-        .count() as u64;
-    ConsensusStatus {
-        last_contribution: our_last_contribution,
-        peers_online,
-        peers_offline,
-        peers_flagged,
-        status_by_peer: peer_consensus_status,
     }
 }
 
@@ -527,16 +478,16 @@ pub fn server_endpoints() -> Vec<ApiEndpoint<ConsensusApi>> {
             }
         },
         api_endpoint! {
-            "connection_code",
+            "invite_code",
             async |fedimint: &ConsensusApi, _context,  _v: ()| -> String {
-                Ok(fedimint.cfg.get_connect_info().to_string())
+                Ok(fedimint.cfg.get_invite_code().to_string())
             }
         },
         api_endpoint! {
             "config",
-            async |fedimint: &ConsensusApi, context, connection_code: String| -> ClientConfigResponse {
-                let info = connection_code.parse()
-                    .map_err(|_| ApiError::bad_request("Could not parse connection code".to_string()))?;
+            async |fedimint: &ConsensusApi, context, invite_code: String| -> ClientConfigResponse {
+                let info = invite_code.parse()
+                    .map_err(|_| ApiError::bad_request("Could not parse invite code".to_string()))?;
                 let future = context.wait_key_exists(ClientConfigSignatureKey);
                 let signature = future.await;
                 let client_config = fedimint.download_client_config(info, &mut context.dbtx()).await?;
@@ -555,24 +506,18 @@ pub fn server_endpoints() -> Vec<ApiEndpoint<ConsensusApi>> {
         api_endpoint! {
             "upgrade",
             async |fedimint: &ConsensusApi, context, _v: ()| -> () {
-                if context.has_auth() {
-                    fedimint.signal_upgrade().await.map_err(|_| ApiError::server_error("Unable to send signal to server".to_string()))?;
-                    Ok(())
-                } else {
-                    Err(ApiError::unauthorized())
-                }
+               check_auth(context)?;
+               fedimint.signal_upgrade().await.map_err(|_| ApiError::server_error("Unable to send signal to server".to_string()))?;
+               Ok(())
             }
         },
         api_endpoint! {
             "process_outcome",
             async |fedimint: &ConsensusApi, context, outcome: SerdeEpochHistory| -> () {
-                if context.has_auth() {
-                    fedimint.force_process_outcome(outcome).await
-                      .map_err(|_| ApiError::server_error("Unable to send signal to server".to_string()))?;
-                    Ok(())
-                } else {
-                    Err(ApiError::unauthorized())
-                }
+                check_auth(context)?;
+                fedimint.force_process_outcome(outcome).await
+                  .map_err(|_| ApiError::server_error("Unable to send signal to server".to_string()))?;
+                Ok(())
             }
         },
         api_endpoint! {
@@ -580,22 +525,19 @@ pub fn server_endpoints() -> Vec<ApiEndpoint<ConsensusApi>> {
             async |fedimint: &ConsensusApi, _context, _v: ()| -> StatusResponse {
                 let consensus_status = fedimint
                     .consensus_status_cache
-                    .get(|| fedimint.get_consensus_status())
+                    .get(|| fedimint.get_federation_status())
                     .await?;
                 Ok(StatusResponse {
                     server: ServerStatus::ConsensusRunning,
-                    consensus: Some(consensus_status)
+                    federation: Some(consensus_status)
                 })
             }
         },
         api_endpoint! {
             "get_verify_config_hash",
             async |fedimint: &ConsensusApi, context, _v: ()| -> BTreeMap<PeerId, sha256::Hash> {
-                if context.has_auth() {
-                    Ok(get_verification_hashes(&fedimint.cfg))
-                } else {
-                    Err(ApiError::unauthorized())
-                }
+                check_auth(context)?;
+                Ok(get_verification_hashes(&fedimint.cfg))
             }
         },
         api_endpoint! {
@@ -614,6 +556,13 @@ pub fn server_endpoints() -> Vec<ApiEndpoint<ConsensusApi>> {
                     .handle_recover_request(&mut context.dbtx(), id).await)
             }
         },
+        api_endpoint! {
+            "auth",
+            async |_config: &ConsensusApi, context, _v: ()| -> () {
+                check_auth(context)?;
+                Ok(())
+            }
+        },
     ]
 }
 
@@ -622,11 +571,11 @@ pub fn server_endpoints() -> Vec<ApiEndpoint<ConsensusApi>> {
 #[derive(Clone)]
 pub struct ExpiringCache<T> {
     data: Arc<tokio::sync::Mutex<Option<(T, Instant)>>>,
-    duration: std::time::Duration,
+    duration: Duration,
 }
 
 impl<T: Clone> ExpiringCache<T> {
-    pub fn new(duration: std::time::Duration) -> Self {
+    pub fn new(duration: Duration) -> Self {
         Self {
             data: Arc::new(tokio::sync::Mutex::new(None)),
             duration,
@@ -651,125 +600,11 @@ impl<T: Clone> ExpiringCache<T> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
 
-    use fedimint_core::api::ConsensusContribution;
     use fedimint_core::task;
-    use fedimint_core::time::now;
 
-    use super::*;
-    #[test]
-    fn test_server_status_all_ok() {
-        let now = now();
-        let our_last_contribution = 1;
-        let latest_contribution_by_peer = HashMap::from([
-            (
-                PeerId::from(0),
-                ConsensusContribution {
-                    value: 1,
-                    time: now,
-                },
-            ),
-            (
-                PeerId::from(1),
-                ConsensusContribution {
-                    value: 2,
-                    time: now,
-                },
-            ),
-        ]);
-        let peers_connection_status = HashMap::from([
-            (PeerId::from(0), Ok(PeerConnectionStatus::Connected)),
-            (PeerId::from(1), Ok(PeerConnectionStatus::Connected)),
-        ]);
-        let max_duration_for_recent_contribution = Duration::from_secs(5);
-        let result = calculate_consensus_status(
-            latest_contribution_by_peer,
-            our_last_contribution,
-            peers_connection_status,
-            max_duration_for_recent_contribution,
-        );
-        assert_eq!(result.peers_online, 2);
-        assert_eq!(result.peers_offline, 0);
-        assert_eq!(result.peers_flagged, 0);
-        assert!(result.status_by_peer.values().all(|p| !p.flagged));
-    }
-
-    #[test]
-    fn test_server_status_some_issues_not_flagged() {
-        let now = now();
-        let our_last_contribution = 3;
-        let latest_contribution_by_peer = HashMap::from([
-            (
-                PeerId::from(0),
-                ConsensusContribution {
-                    value: 2, // behind us
-                    time: now,
-                },
-            ),
-            (
-                PeerId::from(1),
-                ConsensusContribution {
-                    value: 3,
-                    time: now,
-                },
-            ),
-        ]);
-        let peers_connection_status = HashMap::from([
-            (PeerId::from(0), Ok(PeerConnectionStatus::Connected)),
-            (PeerId::from(1), Ok(PeerConnectionStatus::Disconnected)), // offline
-        ]);
-        // we have some "grace time", recent contributions keep the peer from being
-        // flagged
-        let max_duration_for_recent_contribution = Duration::from_secs(5);
-        let result = calculate_consensus_status(
-            latest_contribution_by_peer,
-            our_last_contribution,
-            peers_connection_status,
-            max_duration_for_recent_contribution,
-        );
-        assert_eq!(result.peers_online, 1);
-        assert_eq!(result.peers_offline, 1);
-        assert_eq!(result.peers_flagged, 0);
-        assert!(result.status_by_peer.values().all(|p| !p.flagged));
-    }
-
-    #[test]
-    fn test_server_status_some_issues_flagged() {
-        let now = now();
-        let our_last_contribution = 3;
-        let latest_contribution_by_peer = HashMap::from([
-            (
-                PeerId::from(0),
-                ConsensusContribution {
-                    value: 2, // behind us
-                    time: now,
-                },
-            ),
-            (
-                PeerId::from(1),
-                ConsensusContribution {
-                    value: 3,
-                    time: now,
-                },
-            ),
-        ]);
-        let peers_connection_status = HashMap::from([
-            (PeerId::from(0), Ok(PeerConnectionStatus::Connected)),
-            (PeerId::from(1), Ok(PeerConnectionStatus::Disconnected)), // offline
-        ]);
-        // no "grace time", if a peer has some issue its recent contributions won't help
-        let max_duration_for_recent_contribution = Duration::from_secs(0);
-        let result = calculate_consensus_status(
-            latest_contribution_by_peer,
-            our_last_contribution,
-            peers_connection_status,
-            max_duration_for_recent_contribution,
-        );
-        assert_eq!(result.peers_online, 1);
-        assert_eq!(result.peers_offline, 1);
-        assert_eq!(result.peers_flagged, 2);
-        assert!(result.status_by_peer.values().all(|p| p.flagged));
-    }
+    use crate::net::api::ExpiringCache;
 
     #[tokio::test]
     async fn test_expiring_cache() {

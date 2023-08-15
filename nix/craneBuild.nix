@@ -6,14 +6,14 @@ craneLib.overrideScope' (self: prev: {
 
   workspaceDeps = self.buildDepsOnly (prev.commonArgsDepsOnly // {
     version = "0.0.1";
-    buildPhaseCargoCommand = "cargo doc --locked --profile $CARGO_PROFILE ; cargo check --locked --profile $CARGO_PROFILE --all-targets ; cargo build --locked --profile $CARGO_PROFILE --all-targets";
+    buildPhaseCargoCommand = "cargo doc --workspace --locked --profile $CARGO_PROFILE ; cargo check --workspace  --locked --profile $CARGO_PROFILE --all-targets ; cargo build --locked --profile $CARGO_PROFILE --workspace --all-targets";
     doCheck = false;
   });
 
   workspaceBuild = self.cargoBuild (prev.commonArgs // {
     version = "0.0.1";
     cargoArtifacts = self.workspaceDeps;
-    cargoExtraArgs = "--locked";
+    cargoExtraArgs = "--locked --workspace --all-targets";
     doCheck = false;
   });
 
@@ -32,7 +32,7 @@ craneLib.overrideScope' (self: prev: {
     version = "0.0.1";
     cargoArtifacts = self.workspaceDeps;
 
-    cargoClippyExtraArgs = "--all-targets --no-deps -- --deny warnings";
+    cargoClippyExtraArgs = "--workspace --all-targets --no-deps -- --deny warnings --allow deprecated";
     doInstallCargoArtifacts = false;
   });
 
@@ -42,7 +42,7 @@ craneLib.overrideScope' (self: prev: {
     preConfigure = ''
       export RUSTDOCFLAGS='-D rustdoc::broken_intra_doc_links -D warnings'
     '';
-    buildPhaseCargoCommand = "cargo doc --no-deps --document-private-items";
+    buildPhaseCargoCommand = "cargo doc --workspace --no-deps --document-private-items";
     doInstallCargoArtifacts = false;
     postInstall = ''
       cp -a target/doc/ $out
@@ -59,7 +59,7 @@ craneLib.overrideScope' (self: prev: {
     preConfigure = ''
       export RUSTDOCFLAGS='-D rustdoc::broken_intra_doc_links -Z unstable-options --enable-index-page -D warnings'
     '';
-    buildPhaseCargoCommand = "cargo doc --no-deps --document-private-items";
+    buildPhaseCargoCommand = "cargo doc --workspace --no-deps --document-private-items";
     doInstallCargoArtifacts = false;
     installPhase = ''
       cp -a target/doc/ $out
@@ -266,6 +266,7 @@ craneLib.overrideScope' (self: prev: {
       fedimintd = { };
       fedimint-cli = { };
       fedimint-tests = { };
+      fedimint-dbtool = { };
     };
 
     defaultBin = "fedimintd";
@@ -287,16 +288,7 @@ craneLib.overrideScope' (self: prev: {
 
     pkgs = {
       fedimint-client-legacy = { };
-    } // lib.optionalAttrs (target == null || target.name != "wasm32-unknown-unknown") {
-      # broken on wasm32
-      fedimint-sqlite = { };
-    };
-  };
-
-  fedimint-dbtool-pkgs = self.pkgsBuild {
-    name = "fedimint-dbtool-pkgs";
-    pkgs = {
-      fedimint-dbtool = { };
+      fedimint-client = { };
     };
   };
 

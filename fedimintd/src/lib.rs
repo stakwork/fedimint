@@ -7,7 +7,9 @@ use fedimint_core::core::{
 };
 use fedimint_core::module::ServerModuleGen;
 use fedimint_core::{Amount, Tiered};
-use fedimint_ln_server::common::config::LightningGenParams;
+use fedimint_ln_server::common::config::{
+    LightningGenParams, LightningGenParamsConsensus, LightningGenParamsLocal,
+};
 use fedimint_ln_server::LightningGen;
 use fedimint_mint_server::common::config::{MintGenParams, MintGenParamsConsensus};
 use fedimint_mint_server::MintGen;
@@ -15,6 +17,7 @@ use fedimint_wallet_server::common::config::{
     WalletGenParams, WalletGenParamsConsensus, WalletGenParamsLocal,
 };
 use fedimint_wallet_server::WalletGen;
+use url::Url;
 
 /// Module for creating `fedimintd` binary with custom modules
 pub mod fedimintd;
@@ -40,6 +43,7 @@ pub fn attach_default_module_gen_params(
                     // TODO this is not very elegant, but I'm planning to get rid of it in a next
                     // commit anyway
                     finality_delay,
+                    client_default_bitcoin_rpc: default_esplora_server(network),
                 },
             },
         )
@@ -59,6 +63,27 @@ pub fn attach_default_module_gen_params(
         .attach_config_gen_params(
             LEGACY_HARDCODED_INSTANCE_ID_LN,
             LightningGen::kind(),
-            LightningGenParams::regtest(bitcoin_rpc),
+            LightningGenParams {
+                local: LightningGenParamsLocal { bitcoin_rpc },
+                consensus: LightningGenParamsConsensus { network },
+            },
         );
+}
+
+pub fn default_esplora_server(network: Network) -> BitcoinRpcConfig {
+    let url = match network {
+        Network::Bitcoin => Url::parse("https://blockstream.info/api/")
+            .expect("Failed to parse default esplora server"),
+        Network::Testnet => Url::parse("https://blockstream.info/testnet/api/")
+            .expect("Failed to parse default esplora server"),
+        Network::Regtest => {
+            Url::parse("http://127.0.0.1:50002/").expect("Failed to parse default esplora server")
+        }
+        Network::Signet => Url::parse("https://mutinynet.com/api/")
+            .expect("Failed to parse default esplora server"),
+    };
+    BitcoinRpcConfig {
+        kind: "esplora".to_string(),
+        url,
+    }
 }

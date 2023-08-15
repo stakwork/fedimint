@@ -4,7 +4,7 @@ use fedimint_client::module::gen::ClientModuleGenRegistry;
 use fedimint_client::secret::PlainRootSecretStrategy;
 use fedimint_client::{Client, ClientBuilder};
 use fedimint_core::admin_client::{ConfigGenParamsConsensus, PeerServerParams};
-use fedimint_core::api::WsClientConnectInfo;
+use fedimint_core::api::InviteCode;
 use fedimint_core::config::{
     ClientConfig, FederationId, ServerModuleGenParamsRegistry, ServerModuleGenRegistry,
     META_FEDERATION_NAME_KEY,
@@ -30,7 +30,7 @@ pub struct FederationTest {
     server_gen: ServerModuleGenRegistry,
     client_gen: ClientModuleGenRegistry,
     primary_client: ModuleInstanceId,
-    task: TaskGroup,
+    _task: TaskGroup,
 }
 
 impl FederationTest {
@@ -56,14 +56,14 @@ impl FederationTest {
         client_builder.with_config(client_config);
         client_builder.with_database(MemDatabase::new());
         client_builder
-            .build::<PlainRootSecretStrategy>(&mut self.task.make_subgroup().await)
+            .build::<PlainRootSecretStrategy>()
             .await
             .expect("Failed to build client")
     }
 
-    /// Return first connection code for gateways
-    pub fn connection_code(&self) -> WsClientConnectInfo {
-        self.configs[&PeerId::from(0)].get_connect_info()
+    /// Return first invite code for gateways
+    pub fn invite_code(&self) -> InviteCode {
+        self.configs[&PeerId::from(0)].get_invite_code()
     }
 
     ///  Return first id for gateways
@@ -123,7 +123,7 @@ impl FederationTest {
             server_gen,
             client_gen,
             primary_client,
-            task,
+            _task: task,
         }
     }
 }
@@ -176,7 +176,7 @@ pub fn local_config_gen_params(
                 local: ConfigGenParamsLocal {
                     our_id: *peer,
                     our_private_key: tls_keys[peer].1.clone(),
-                    api_auth: ApiAuth(format!("pass{}", peer.to_usize())),
+                    api_auth: ApiAuth("pass".to_string()),
                     p2p_bind: p2p_bind.parse().expect("Valid address"),
                     api_bind: api_bind.parse().expect("Valid address"),
                     download_token_limit: None,

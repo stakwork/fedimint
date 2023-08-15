@@ -22,7 +22,7 @@ use crate::btc::BitcoinTest;
 use crate::federation::FederationTest;
 use crate::gateway::GatewayTest;
 use crate::ln::mock::FakeLightningTest;
-use crate::ln::real::{ClnLightningTest, LndLightningTest};
+use crate::ln::real::{ClnLightningTest, LdkLightningTest, LndLightningTest};
 use crate::ln::LightningTest;
 
 /// A default timeout for things happening in tests
@@ -126,7 +126,7 @@ impl Fixtures {
     }
 
     /// Starts a new gateway with a given lightning node
-    pub async fn new_gateway(&self, ln: Arc<dyn LightningTest>) -> GatewayTest {
+    pub async fn new_gateway(&self, ln: Box<dyn LightningTest>) -> GatewayTest {
         // TODO: Make construction easier
         let server_gens = ServerModuleGenRegistry::from(self.servers.clone());
         let module_kinds = self.params.iter_modules().map(|(id, kind, _)| (id, kind));
@@ -147,22 +147,30 @@ impl Fixtures {
     }
 
     /// Returns the LND lightning node
-    pub async fn lnd(&self) -> Arc<dyn LightningTest> {
+    pub async fn lnd(&self) -> Box<dyn LightningTest> {
         match Fixtures::is_real_test() {
-            true => Arc::new(LndLightningTest::new().await),
-            false => Arc::new(FakeLightningTest::new()),
+            true => Box::new(LndLightningTest::new().await),
+            false => Box::new(FakeLightningTest::new()),
         }
     }
 
     /// Returns the CLN lightning node
-    pub async fn cln(&self) -> Arc<dyn LightningTest> {
+    pub async fn cln(&self) -> Box<dyn LightningTest> {
         match Fixtures::is_real_test() {
             true => {
                 let dir = env::var("FM_TEST_DIR").expect("Real tests require FM_TEST_DIR");
-                Arc::new(ClnLightningTest::new(&dir).await)
+                Box::new(ClnLightningTest::new(&dir).await)
             }
-            false => Arc::new(FakeLightningTest::new()),
+            false => Box::new(FakeLightningTest::new()),
         }
+    }
+
+    /// Spawns and returns a newly created LDK Node
+    pub async fn spawn_ldk(bitcoin: Arc<dyn BitcoinTest>) -> LdkLightningTest {
+        let db_dir = test_dir(&format!("LDKNode-{}", rand::random::<u64>())).0;
+        LdkLightningTest::new(db_dir, bitcoin.clone())
+            .await
+            .expect("Error spawning LDK Node")
     }
 
     /// Get a server bitcoin RPC config

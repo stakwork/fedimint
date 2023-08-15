@@ -4,6 +4,7 @@ use bitcoin::hashes::hex::ToHex;
 use bitcoin::util::psbt::raw::ProprietaryKey;
 use bitcoin::util::psbt::PartiallySignedTransaction;
 use bitcoin::{Amount, BlockHash, Network, Script, Transaction, Txid};
+use config::WalletClientConfig;
 use fedimint_core::core::{Decoder, ModuleInstanceId, ModuleKind};
 use fedimint_core::encoding::{Decodable, Encodable, UnzipConsensus};
 use fedimint_core::module::{CommonModuleGen, ModuleCommon, ModuleConsensusVersion};
@@ -37,8 +38,8 @@ pub type PegInDescriptor = Descriptor<CompressedPublicKey>;
     Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, UnzipConsensus, Encodable, Decodable,
 )]
 pub enum WalletConsensusItem {
-    BlockHeight(u32), /* FIXME: use block hash instead, but needs more complicated
-                       * * verification logic */
+    BlockCount(u32), /* FIXME: use block hash instead, but needs more complicated
+                      * * verification logic */
     Feerate(Feerate),
     PegOutSignature(PegOutSignatureItem),
 }
@@ -46,8 +47,8 @@ pub enum WalletConsensusItem {
 impl std::fmt::Display for WalletConsensusItem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            WalletConsensusItem::BlockHeight(height) => {
-                write!(f, "Wallet Block Height {height}")
+            WalletConsensusItem::BlockCount(count) => {
+                write!(f, "Wallet Block Count {count}")
             }
             WalletConsensusItem::Feerate(feerate) => {
                 write!(
@@ -71,6 +72,7 @@ pub struct PegOutSignatureItem {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Encodable, Decodable)]
 pub struct SpendableUTXO {
+    #[serde(with = "::fedimint_core::encoding::as_hex")]
     pub tweak: [u8; 32],
     #[serde(with = "bitcoin::util::amount::serde::as_sat")]
     pub amount: bitcoin::Amount,
@@ -135,7 +137,7 @@ impl Serialize for UnsignedTransaction {
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Hash, Deserialize, Serialize, Encodable, Decodable)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, Deserialize, Serialize, Encodable, Decodable)]
 pub struct PegOutFees {
     pub fee_rate: Feerate,
     pub total_weight: u64,
@@ -179,6 +181,9 @@ pub struct WalletCommonGen;
 impl CommonModuleGen for WalletCommonGen {
     const CONSENSUS_VERSION: ModuleConsensusVersion = CONSENSUS_VERSION;
     const KIND: ModuleKind = KIND;
+
+    type ClientConfig = WalletClientConfig;
+
     fn decoder() -> Decoder {
         WalletModuleTypes::decoder()
     }
@@ -262,6 +267,7 @@ impl Eq for PegOutSignatureItem {}
 
 plugin_types_trait_impl_common!(
     WalletModuleTypes,
+    WalletClientConfig,
     WalletInput,
     WalletOutput,
     WalletOutputOutcome,

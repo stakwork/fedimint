@@ -1,11 +1,11 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::string::ToString;
 
 use anyhow::bail;
 use async_trait::async_trait;
 use fedimint_core::config::{
-    ClientModuleConfig, ConfigGenModuleParams, DkgResult, ServerModuleConfig,
-    ServerModuleConsensusConfig, TypedServerModuleConfig, TypedServerModuleConsensusConfig,
+    ConfigGenModuleParams, DkgResult, ServerModuleConfig, ServerModuleConsensusConfig,
+    TypedServerModuleConfig, TypedServerModuleConsensusConfig,
 };
 use fedimint_core::db::{Database, DatabaseVersion, MigrationMap, ModuleDatabaseTransaction};
 use fedimint_core::epoch::{SerdeSignature, SerdeSignatureShare};
@@ -144,17 +144,12 @@ impl ServerModuleGen for DummyGen {
     fn get_client_config(
         &self,
         config: &ServerModuleConsensusConfig,
-    ) -> anyhow::Result<ClientModuleConfig> {
+    ) -> anyhow::Result<DummyClientConfig> {
         let config = DummyConfigConsensus::from_erased(config)?;
-        Ok(ClientModuleConfig::from_typed(
-            config.kind(),
-            config.version(),
-            &(DummyClientConfig {
-                tx_fee: config.tx_fee,
-                fed_public_key: config.public_key_set.public_key(),
-            }),
-        )
-        .expect("Serialization can't fail"))
+        Ok(DummyClientConfig {
+            tx_fee: config.tx_fee,
+            fed_public_key: config.public_key_set.public_key(),
+        })
     }
 
     /// Validates the private/public key of configs
@@ -275,74 +270,67 @@ impl ServerModule for Dummy {
         ConsensusProposal::new_auto_trigger(consensus_items.collect())
     }
 
-    async fn begin_consensus_epoch<'a, 'b>(
+    async fn process_consensus_item<'a, 'b>(
         &'a self,
         dbtx: &mut ModuleDatabaseTransaction<'b>,
-        consensus_items: Vec<(PeerId, DummyConsensusItem)>,
-        _consensus_peers: &BTreeSet<PeerId>,
-    ) -> Vec<PeerId> {
-        for (peer_id, DummyConsensusItem::Sign(request, share)) in consensus_items {
-            // check if we already have a signature share for this peer
-            if dbtx
-                .get_value(&DummySignatureShareKey(request.clone(), peer_id))
-                .await
-                .is_some()
-            {
-                continue;
-            }
+        consensus_item: DummyConsensusItem,
+        peer_id: PeerId,
+    ) -> anyhow::Result<()> {
+        let DummyConsensusItem::Sign(request, share) = consensus_item;
 
-            // check if the signature share is valid
-            if !self
-                .cfg
-                .consensus
-                .public_key_set
-                .public_key_share(peer_id.to_usize())
-                .verify(&share.0, request.clone())
-            {
-                continue;
-            }
-
-            // save the valid signature share
-            dbtx.insert_new_entry(&DummySignatureShareKey(request.clone(), peer_id), &share)
-                .await;
-
-            // collect all signature shares for this request
-            let signature_shares = dbtx
-                .find_by_prefix(&DummySignatureShareStringPrefix(request.clone()))
-                .await
-                .collect::<Vec<_>>()
-                .await;
-
-            // check if we have enough signature shares to create a threshold siganture
-            if signature_shares.len() <= self.cfg.consensus.public_key_set.threshold() {
-                continue;
-            }
-
-            // combine the valid signature shares into a threshold signature
-            let threshold_signature = self
-                .cfg
-                .consensus
-                .public_key_set
-                .combine_signatures(
-                    signature_shares
-                        .iter()
-                        .map(|(peer_id, share)| (peer_id.1.to_usize(), &share.0)),
-                )
-                .expect("All signatures are valid");
-
-            // remove the signature shares
-            dbtx.remove_by_prefix(&DummySignatureShareStringPrefix(request.clone()))
-                .await;
-
-            // save the treshold signature
-            dbtx.insert_entry(
-                &DummySignatureKey(request.to_string()),
-                &Some(SerdeSignature(threshold_signature)),
-            )
-            .await;
+        if dbtx
+            .get_value(&DummySignatureShareKey(request.clone(), peer_id))
+            .await
+            .is_some()
+        {
+            bail!("Already received a valid signature share")
         }
 
-        vec![]
+        if !self
+            .cfg
+            .consensus
+            .public_key_set
+            .public_key_share(peer_id.to_usize())
+            .verify(&share.0, request.clone())
+        {
+            bail!("Signature share is invalid");
+        }
+
+        dbtx.insert_new_entry(&DummySignatureShareKey(request.clone(), peer_id), &share)
+            .await;
+
+        // Collect all valid signature shares previously received
+        let signature_shares = dbtx
+            .find_by_prefix(&DummySignatureShareStringPrefix(request.clone()))
+            .await
+            .collect::<Vec<_>>()
+            .await;
+
+        if signature_shares.len() <= self.cfg.consensus.public_key_set.threshold() {
+            return Ok(());
+        }
+
+        let threshold_signature = self
+            .cfg
+            .consensus
+            .public_key_set
+            .combine_signatures(
+                signature_shares
+                    .iter()
+                    .map(|(peer_id, share)| (peer_id.1.to_usize(), &share.0)),
+            )
+            .expect("We have verified all signature shares before");
+
+        dbtx.remove_by_prefix(&DummySignatureShareStringPrefix(request.clone()))
+            .await;
+
+        dbtx.insert_entry(
+            &DummySignatureKey(request.to_string()),
+            &Some(SerdeSignature(threshold_signature)),
+        )
+        .await;
+
+        Ok(())
     }
 
     fn build_verification_cache<'a>(
@@ -352,72 +340,48 @@ impl ServerModule for Dummy {
         DummyVerificationCache
     }
 
-    async fn validate_input<'a, 'b>(
-        &self,
-        dbtx: &mut ModuleDatabaseTransaction<'b>,
-        _verification_cache: &Self::VerificationCache,
-        input: &'a DummyInput,
-    ) -> Result<InputMeta, ModuleError> {
-        let current_funds = dbtx.get_value(&DummyFundsKeyV1(input.account)).await;
-        let enough_funds = input.amount <= current_funds.unwrap_or(Amount::ZERO);
-
-        // verify user has enough funds or is using the fed account
-        if enough_funds || fed_public_key() == input.account {
-            return Ok(InputMeta {
-                amount: TransactionItemAmount {
-                    amount: input.amount,
-                    fee: self.cfg.consensus.tx_fee,
-                },
-                // IMPORTANT: include the pubkey to validate the user signed this tx
-                pub_keys: vec![input.account],
-            });
-        }
-
-        Err(DummyError::NotEnoughFunds).into_module_error_other()
-    }
-
-    async fn apply_input<'a, 'b, 'c>(
+    async fn process_input<'a, 'b, 'c>(
         &'a self,
         dbtx: &mut ModuleDatabaseTransaction<'c>,
         input: &'b DummyInput,
-        cache: &Self::VerificationCache,
+        _cache: &Self::VerificationCache,
     ) -> Result<InputMeta, ModuleError> {
-        // TODO: Boiler-plate code
-        let meta = self.validate_input(dbtx, cache, input).await?;
+        let current_funds = dbtx
+            .get_value(&DummyFundsKeyV1(input.account))
+            .await
+            .unwrap_or(Amount::ZERO);
 
-        let current_funds = dbtx.get_value(&DummyFundsKeyV1(input.account)).await;
+        // verify user has enough funds or is using the fed account
+        if input.amount > current_funds && fed_public_key() != input.account {
+            return Err(DummyError::NotEnoughFunds).into_module_error_other();
+        }
+
         // Subtract funds from normal user, or print funds for the fed
         let updated_funds = if fed_public_key() == input.account {
-            current_funds.unwrap_or(Amount::ZERO) + input.amount
+            current_funds + input.amount
         } else {
-            current_funds.unwrap_or(Amount::ZERO) - input.amount
+            current_funds - input.amount
         };
+
         dbtx.insert_entry(&DummyFundsKeyV1(input.account), &updated_funds)
             .await;
 
-        Ok(meta)
-    }
-
-    async fn validate_output(
-        &self,
-        _dbtx: &mut ModuleDatabaseTransaction<'_>,
-        output: &DummyOutput,
-    ) -> Result<TransactionItemAmount, ModuleError> {
-        Ok(TransactionItemAmount {
-            amount: output.amount,
-            fee: self.cfg.consensus.tx_fee,
+        Ok(InputMeta {
+            amount: TransactionItemAmount {
+                amount: input.amount,
+                fee: self.cfg.consensus.tx_fee,
+            },
+            // IMPORTANT: include the pubkey to validate the user signed this tx
+            pub_keys: vec![input.account],
         })
     }
 
-    async fn apply_output<'a, 'b>(
+    async fn process_output<'a, 'b>(
         &'a self,
         dbtx: &mut ModuleDatabaseTransaction<'b>,
         output: &'a DummyOutput,
         out_point: OutPoint,
     ) -> Result<TransactionItemAmount, ModuleError> {
-        // TODO: Boiler-plate code
-        let meta = self.validate_output(dbtx, output).await?;
-
         // Add output funds to the user's account
         let current_funds = dbtx.get_value(&DummyFundsKeyV1(output.account)).await;
         let updated_funds = current_funds.unwrap_or(Amount::ZERO) + output.amount;
@@ -429,15 +393,10 @@ impl ServerModule for Dummy {
         dbtx.insert_entry(&DummyOutcomeKey(out_point), &outcome)
             .await;
 
-        Ok(meta)
-    }
-
-    async fn end_consensus_epoch<'a, 'b>(
-        &'a self,
-        _consensus_peers: &BTreeSet<PeerId>,
-        _dbtx: &mut ModuleDatabaseTransaction<'b>,
-    ) -> Vec<PeerId> {
-        vec![]
+        Ok(TransactionItemAmount {
+            amount: output.amount,
+            fee: self.cfg.consensus.tx_fee,
+        })
     }
 
     async fn output_status(

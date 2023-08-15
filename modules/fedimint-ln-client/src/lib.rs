@@ -1,4 +1,4 @@
-mod db;
+pub mod db;
 pub mod pay;
 pub mod receive;
 
@@ -49,7 +49,6 @@ use lightning::routing::router::{RouteHint, RouteHintHop};
 use lightning_invoice::{Currency, Invoice, InvoiceBuilder, DEFAULT_EXPIRY_TIME};
 use rand::seq::IteratorRandom;
 use rand::{CryptoRng, Rng, RngCore};
-use secp256k1::XOnlyPublicKey;
 use secp256k1_zkp::{All, Secp256k1};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -74,7 +73,7 @@ pub trait LightningClientExt {
     async fn select_active_gateway(&self) -> anyhow::Result<LightningGateway>;
 
     /// Sets the gateway to be used by all other operations
-    async fn set_active_gateway(&self, gateway_pub_key: &XOnlyPublicKey) -> anyhow::Result<()>;
+    async fn set_active_gateway(&self, gateway_id: &secp256k1::PublicKey) -> anyhow::Result<()>;
 
     /// Gateways actively registered with the fed
     async fn fetch_registered_gateways(&self) -> anyhow::Result<Vec<LightningGateway>>;
@@ -120,10 +119,18 @@ pub enum PayType {
 pub enum InternalPayState {
     Funding,
     Preimage(Preimage),
-    RefundSuccess(OutPoint),
-    RefundError(String),
-    FundingFailed(String),
-    Error(String),
+    RefundSuccess {
+        outpoint: OutPoint,
+        error: IncomingSmError,
+    },
+    RefundError {
+        error_message: String,
+        error: IncomingSmError,
+    },
+    FundingFailed {
+        error: IncomingSmError,
+    },
+    UnexpectedError(String),
 }
 
 /// The high-level state of a pay operation over lightning,
@@ -144,7 +151,9 @@ pub enum LnPayState {
     Refunded {
         gateway_error: GatewayPayError,
     },
-    Failed,
+    UnexpectedError {
+        error_message: String,
+    },
 }
 
 /// The high-level state of a reissue operation started with
@@ -205,7 +214,7 @@ impl LightningClientExt for Client {
     }
 
     /// Switches the clients active gateway to a registered gateway.
-    async fn set_active_gateway(&self, gateway_pub_key: &XOnlyPublicKey) -> anyhow::Result<()> {
+    async fn set_active_gateway(&self, gateway_id: &secp256k1::PublicKey) -> anyhow::Result<()> {
         let (_lightning, instance) = self.get_first_module::<LightningClientModule>(&KIND);
         let mut dbtx = instance.db.begin_transaction().await;
 
@@ -216,12 +225,9 @@ impl LightningClientExt for Client {
         };
         let gateway = gateways
             .into_iter()
-            .find(|g| &g.gateway_pub_key == gateway_pub_key)
+            .find(|g| &g.gateway_id == gateway_id)
             .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Could not find gateway with gateway public key {:?}",
-                    gateway_pub_key
-                )
+                anyhow::anyhow!("Could not find gateway with gateway id {:?}", gateway_id)
             })?;
 
         dbtx.insert_entry(&LightningGatewayKey, &gateway).await;
@@ -437,7 +443,7 @@ impl LightningClientExt for Client {
                             match self.await_primary_module_output(operation_id, change).await {
                                 Ok(_) => {}
                                 Err(_) => {
-                                    yield LnPayState::Failed;
+                                    yield LnPayState::UnexpectedError { error_message: "Error occurred while waiting for the primary module's output".to_string() };
                                     return;
                                 }
                             }
@@ -460,7 +466,7 @@ impl LightningClientExt for Client {
                     _ => {}
                 }
 
-                yield LnPayState::Failed;
+                yield LnPayState::UnexpectedError { error_message: "Error occurred trying to get refund. Refund was not successful".to_string() };
             }
         }))
     }
@@ -481,18 +487,18 @@ impl LightningClientExt for Client {
                     if let Some(LightningClientStateMachines::InternalPay(state)) = stream.next().await {
                         match state.state {
                             IncomingSmStates::Preimage(preimage) => break InternalPayState::Preimage(preimage),
-                            IncomingSmStates::RefundSubmitted(txid) => {
+                            IncomingSmStates::RefundSubmitted{ txid, error } => {
                                 let out_point = OutPoint { txid, out_idx: 0};
                                 match self.await_primary_module_output(operation_id, out_point).await {
-                                    Ok(_) => break InternalPayState::RefundSuccess(out_point),
-                                    Err(e) => break InternalPayState::RefundError(e.to_string()),
+                                    Ok(_) => break InternalPayState::RefundSuccess { outpoint: out_point, error },
+                                    Err(e) => break InternalPayState::RefundError{ error_message: e.to_string(), error },
                                 }
                             },
-                            IncomingSmStates::FundingFailed(e) => break InternalPayState::FundingFailed(e),
+                            IncomingSmStates::FundingFailed { error } => break InternalPayState::FundingFailed{ error },
                             _ => {}
                         }
                     } else {
-                        break InternalPayState::Error("Unexpected State! Expected an InternalPay state".to_string())
+                        break InternalPayState::UnexpectedError("Unexpected State! Expected an InternalPay state".to_string())
                     }
                 };
                 yield state;
@@ -524,16 +530,15 @@ impl ExtendsCommonModuleGen for LightningClientGen {
 #[apply(async_trait_maybe_send!)]
 impl ClientModuleGen for LightningClientGen {
     type Module = LightningClientModule;
-    type Config = LightningClientConfig;
 
     fn supported_api_versions(&self) -> MultiApiVersion {
         MultiApiVersion::try_from_iter([ApiVersion { major: 0, minor: 0 }])
-            .expect("no version conficts")
+            .expect("no version conflicts")
     }
 
     async fn init(
         &self,
-        cfg: Self::Config,
+        cfg: LightningClientConfig,
         _db: Database,
         _api_version: ApiVersion,
         module_root_secret: DerivableSecret,
@@ -636,11 +641,11 @@ impl LightningClientModule {
             invoice_currency
         );
 
-        let consensus_height = api
-            .fetch_consensus_block_height()
+        let consensus_count = api
+            .fetch_consensus_block_count()
             .await?
-            .ok_or(format_err!("Cannot get consensus block height"))?;
-        let absolute_timelock = consensus_height + OUTGOING_LN_CONTRACT_TIMELOCK;
+            .ok_or(format_err!("Cannot get consensus block count"))?;
+        let absolute_timelock = consensus_count + OUTGOING_LN_CONTRACT_TIMELOCK - 1;
 
         // Compute amount to lock in the outgoing contract
         let invoice_amount_msat = invoice
@@ -663,7 +668,7 @@ impl LightningClientModule {
 
         let contract = OutgoingContract {
             hash: *invoice.payment_hash(),
-            gateway_key: gateway.gateway_pub_key,
+            gateway_key: gateway.gateway_redeem_key,
             timelock: absolute_timelock as u32,
             user_key: user_sk.x_only_public_key().0,
             invoice,
@@ -727,7 +732,9 @@ impl LightningClientModule {
         let invoice_amount = Amount {
             msats: invoice
                 .amount_milli_satoshis()
-                .ok_or(IncomingSmError::AmountError)?,
+                .ok_or(IncomingSmError::AmountError {
+                    invoice: invoice.clone(),
+                })?,
         };
 
         let (incoming_output, contract_id) = create_incoming_contract_output(

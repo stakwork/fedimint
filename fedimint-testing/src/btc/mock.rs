@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use anyhow::format_err;
 use async_trait::async_trait;
+use bitcoin::blockdata::constants::genesis_block;
 use bitcoin::hash_types::Txid;
 use bitcoin::hashes::Hash;
 use bitcoin::util::merkleblock::PartialMerkleTree;
@@ -77,7 +78,7 @@ impl Default for FakeBitcoinTest {
 impl FakeBitcoinTest {
     pub fn new() -> Self {
         FakeBitcoinTest {
-            blocks: Arc::new(Mutex::new(vec![])),
+            blocks: Arc::new(Mutex::new(vec![genesis_block(Network::Regtest)])),
             pending: Arc::new(Mutex::new(vec![])),
             addresses: Arc::new(Mutex::new(Default::default())),
             proofs: Arc::new(Mutex::new(Default::default())),
@@ -127,7 +128,7 @@ impl FakeBitcoinTest {
 
 #[async_trait]
 impl BitcoinTest for FakeBitcoinTest {
-    async fn lock_exclusive(&self) -> Box<dyn BitcoinTest + Send> {
+    async fn lock_exclusive(&self) -> Box<dyn BitcoinTest + Send + Sync> {
         // With  FakeBitcoinTest, every test spawns their own instance,
         // so not need to lock anything
         Box::new(self.clone())
@@ -242,12 +243,12 @@ impl IBitcoindRpc for FakeBitcoinTest {
         Ok(Network::Regtest)
     }
 
-    async fn get_block_height(&self) -> BitcoinRpcResult<u64> {
+    async fn get_block_count(&self) -> BitcoinRpcResult<u64> {
         Ok(self.blocks.lock().unwrap().len() as u64)
     }
 
     async fn get_block_hash(&self, height: u64) -> BitcoinRpcResult<BlockHash> {
-        Ok(self.blocks.lock().unwrap()[(height - 1) as usize]
+        Ok(self.blocks.lock().unwrap()[height as usize]
             .header
             .block_hash())
     }

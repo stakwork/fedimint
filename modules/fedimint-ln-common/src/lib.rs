@@ -19,6 +19,7 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::bail;
 use bitcoin_hashes::sha256;
+use config::LightningClientConfig;
 use fedimint_client::oplog::OperationLogEntry;
 use fedimint_client::sm::{Context, OperationId};
 use fedimint_client::Client;
@@ -184,7 +185,7 @@ pub struct LightningGateway {
     /// gateway.
     pub mint_channel_id: u64,
     /// Key used to pay the gateway
-    pub gateway_pub_key: secp256k1::XOnlyPublicKey,
+    pub gateway_redeem_key: secp256k1::XOnlyPublicKey,
     pub node_pub_key: secp256k1::PublicKey,
     pub api: Url,
     /// Route hints to reach the LN node of the gateway.
@@ -197,12 +198,13 @@ pub struct LightningGateway {
     /// Gateway configured routing fees
     #[serde(with = "serde_routing_fees")]
     pub fees: RoutingFees,
+    pub gateway_id: secp256k1::PublicKey,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Encodable, Decodable, Serialize, Deserialize)]
 pub enum LightningConsensusItem {
     DecryptPreimage(ContractId, PreimageDecryptionShare),
-    BlockHeight(u64),
+    BlockCount(u64),
 }
 
 impl std::fmt::Display for LightningConsensusItem {
@@ -211,7 +213,7 @@ impl std::fmt::Display for LightningConsensusItem {
             LightningConsensusItem::DecryptPreimage(contract_id, _) => {
                 write!(f, "LN Decryption Share for contract {contract_id}")
             }
-            LightningConsensusItem::BlockHeight(height) => write!(f, "LN block height {height}"),
+            LightningConsensusItem::BlockCount(count) => write!(f, "LN block count {count}"),
         }
     }
 }
@@ -222,6 +224,9 @@ pub struct LightningCommonGen;
 impl CommonModuleGen for LightningCommonGen {
     const CONSENSUS_VERSION: ModuleConsensusVersion = CONSENSUS_VERSION;
     const KIND: ModuleKind = KIND;
+
+    type ClientConfig = LightningClientConfig;
+
     fn decoder() -> Decoder {
         LightningModuleTypes::decoder()
     }
@@ -231,6 +236,7 @@ pub struct LightningModuleTypes;
 
 plugin_types_trait_impl_common!(
     LightningModuleTypes,
+    LightningClientConfig,
     LightningInput,
     LightningOutput,
     LightningOutputOutcome,
@@ -359,6 +365,8 @@ pub enum LightningError {
     ZeroOutput,
     #[error("Offer contains invalid threshold-encrypted data")]
     InvalidEncryptedPreimage,
+    #[error("Offer contains a ciphertext that has already been used")]
+    DuplicateEncryptedPreimage,
     #[error(
         "The incoming LN account requires more funding according to the offer (need {0} got {1})"
     )]
@@ -395,14 +403,23 @@ async fn fetch_and_validate_offer(
 ) -> anyhow::Result<IncomingContractOffer, IncomingSmError> {
     let offer = timeout(Duration::from_secs(5), module_api.fetch_offer(payment_hash))
         .await
-        .map_err(|_| IncomingSmError::Timeout)?
-        .map_err(|_| IncomingSmError::FetchContractError)?;
+        .map_err(|_| IncomingSmError::TimeoutFetchingOffer { payment_hash })?
+        .map_err(|e| IncomingSmError::FetchContractError {
+            payment_hash,
+            error_message: e.to_string(),
+        })?;
 
     if offer.amount > amount_msat {
-        return Err(IncomingSmError::ViolatedFeePolicy);
+        return Err(IncomingSmError::ViolatedFeePolicy {
+            offer_amount: offer.amount,
+            payment_amount: amount_msat,
+        });
     }
     if offer.hash != payment_hash {
-        return Err(IncomingSmError::InvalidOffer);
+        return Err(IncomingSmError::InvalidOffer {
+            offer_hash: offer.hash,
+            payment_hash,
+        });
     }
     Ok(offer)
 }

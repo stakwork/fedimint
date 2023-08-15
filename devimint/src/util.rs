@@ -1,39 +1,44 @@
 use std::ffi::OsStr;
 
-use anyhow::{anyhow, bail};
+use anyhow::bail;
 use fedimint_core::task;
 use serde::de::DeserializeOwned;
 use tokio::fs::OpenOptions;
 use tokio::process::Child;
+use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
 use super::*;
 
-fn kill(child: &Child) {
+fn send_sigterm(child: &Child) {
     let _ = nix::sys::signal::kill(
         nix::unistd::Pid::from_raw(child.id().expect("pid should be present") as _),
         nix::sys::signal::Signal::SIGTERM,
     );
 }
 
+fn send_sigkill(child: &Child) {
+    let _ = nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(child.id().expect("pid should be present") as _),
+        nix::sys::signal::Signal::SIGKILL,
+    );
+}
+
 /// Kills process when all references to ProcessHandle are dropped.
 ///
 /// NOTE: drop order is significant make sure fields in struct are declared in
-/// correct order it is generallly clients, process handle, deps
+/// correct order it is generally clients, process handle, deps
 #[derive(Debug, Clone)]
-pub struct ProcessHandle(Arc<ProcessHandleInner>);
+pub struct ProcessHandle(Arc<Mutex<ProcessHandleInner>>);
 
 impl ProcessHandle {
-    pub async fn kill(self) -> Result<()> {
-        let arc_process_handle_inner = self.0;
-        let mut process_handle_inner = match Arc::try_unwrap(arc_process_handle_inner) {
-            Ok(process_handler_inner) => process_handler_inner,
-            Err(_) => return Err(anyhow!("Cannot kill process because of clones")),
-        };
-        let mut child = std::mem::take(&mut process_handle_inner.child).unwrap();
-        info!(LOG_DEVIMINT, "killing {}", process_handle_inner.name);
-        kill(&child);
-        child.wait().await?;
+    pub async fn terminate(&self) -> Result<()> {
+        let mut inner = self.0.lock().await;
+        if let Some(mut child) = inner.child.take() {
+            info!(LOG_DEVIMINT, "sending SIGTERM to {}", inner.name);
+            send_sigterm(&child);
+            child.wait().await?;
+        }
         Ok(())
     }
 }
@@ -47,8 +52,8 @@ pub struct ProcessHandleInner {
 impl Drop for ProcessHandleInner {
     fn drop(&mut self) {
         let Some(child) = &mut self.child else { return; };
-        info!(LOG_DEVIMINT, "killing {}", self.name);
-        kill(child);
+        info!(LOG_DEVIMINT, "sending SIGKILL to {}", self.name);
+        send_sigkill(child);
     }
 }
 
@@ -79,10 +84,11 @@ impl ProcessManager {
             .cmd
             .spawn()
             .with_context(|| format!("Could not spawn: {name}"))?;
-        Ok(ProcessHandle(Arc::new(ProcessHandleInner {
+        let handle = ProcessHandle(Arc::new(Mutex::new(ProcessHandleInner {
             name: name.to_owned(),
             child: Some(child),
-        })))
+        })));
+        Ok(handle)
     }
 }
 
@@ -236,6 +242,39 @@ macro_rules! cmd {
 
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
+/// Will retry calling `f` until it returns `Ok(true)` or `retries` times.
+/// A notable difference from [`poll`] is that `f` may fail with an error at any
+/// time and we will still keep retrying.
+pub async fn poll_max_retries<Fut>(name: &str, retries: usize, f: impl Fn() -> Fut) -> Result<()>
+where
+    Fut: Future<Output = Result<bool>>,
+{
+    let mut i = 0;
+    loop {
+        let result = f().await;
+        if i == retries - 1 {
+            match result {
+                Ok(true) => return Ok(()),
+                Ok(false) => {
+                    bail!("{name} failed to reach good state after {retries} retries");
+                }
+                Err(e) => {
+                    bail!("{name} failed after {retries} retries with: {e:?}");
+                }
+            }
+        } else {
+            match result {
+                Ok(true) => return Ok(()),
+                other => {
+                    i += 1;
+                    debug!("polling {name} failed with: {other:?}, will retry... ({i}/{retries})");
+                    task::sleep(Duration::from_secs(1)).await;
+                }
+            }
+        }
+    }
+}
+
 pub async fn poll<Fut>(name: &str, f: impl Fn() -> Fut) -> Result<()>
 where
     Fut: Future<Output = Result<bool>>,
@@ -256,8 +295,8 @@ where
         }
         // report every 20 seconds
         let now = fedimint_core::time::now();
-        if now.duration_since(last_time)? > Duration::from_secs(20) {
-            let total_duration = now.duration_since(start)?;
+        if now.duration_since(last_time).unwrap_or_default() > Duration::from_secs(20) {
+            let total_duration = now.duration_since(start).unwrap_or_default();
             warn!(
                 LOG_DEVIMINT,
                 "waiting {name} for over {} seconds",

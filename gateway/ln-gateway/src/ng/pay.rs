@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use fedimint_client::sm::{ClientSMDatabaseTransaction, OperationId, State, StateTransition};
 use fedimint_client::transaction::{ClientInput, ClientOutput};
@@ -16,6 +17,7 @@ use thiserror::Error;
 
 use super::{GatewayClientContext, GatewayClientStateMachines};
 use crate::gatewaylnrpc::{PayInvoiceRequest, PayInvoiceResponse};
+use crate::lnrpc_client::LightningRpcError;
 
 #[cfg_attr(doc, aquamarine::aquamarine)]
 /// State machine that executes the Lightning payment on behalf of
@@ -39,9 +41,16 @@ pub enum GatewayPayStates {
     CancelContract(Box<GatewayPayCancelContract>),
     Preimage(OutPoint, Preimage),
     OfferDoesNotExist(ContractId),
-    Canceled(TransactionId, ContractId),
+    Canceled {
+        txid: TransactionId,
+        contract_id: ContractId,
+        error: OutgoingPaymentError,
+    },
     ClaimOutgoingContract(Box<GatewayPayClaimOutgoingContract>),
-    Failed,
+    Failed {
+        error: OutgoingPaymentError,
+        error_message: String,
+    },
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Decodable, Encodable)]
@@ -110,6 +119,8 @@ pub enum OutgoingContractError {
     TimeoutTooClose,
     #[error("Gateway could not retrieve metadata about the contract.")]
     MissingContractData,
+    #[error("The invoice is expired. Expiry duration: {0:?}")]
+    InvoiceExpired(Duration),
 }
 
 #[derive(Error, Debug, Serialize, Deserialize, Encodable, Decodable, Clone, Eq, PartialEq)]
@@ -117,7 +128,10 @@ pub enum OutgoingPaymentError {
     #[error("OutgoingContract does not exist {contract_id}")]
     OutgoingContractDoesNotExist { contract_id: ContractId },
     #[error("An error occurred while paying the lightning invoice.")]
-    LightningPayError { contract: OutgoingContractAccount },
+    LightningPayError {
+        contract: OutgoingContractAccount,
+        lightning_error: LightningRpcError,
+    },
     #[error("An invalid contract was specified.")]
     InvalidOutgoingContract {
         error: OutgoingContractError,
@@ -166,16 +180,16 @@ impl GatewayPayInvoice {
                 contract,
             };
 
-            let consensus_block_height = global_context
+            let consensus_block_count = global_context
                 .module_api()
-                .fetch_consensus_block_height()
+                .fetch_consensus_block_count()
                 .await
                 .map_err(|_| OutgoingPaymentError::InvalidOutgoingContract {
                     error: OutgoingContractError::TimeoutTooClose,
                     contract: outgoing_contract_account.clone(),
                 })?;
 
-            if consensus_block_height.is_none() {
+            if consensus_block_count.is_none() {
                 return Err(OutgoingPaymentError::InvalidOutgoingContract {
                     error: OutgoingContractError::MissingContractData,
                     contract: outgoing_contract_account.clone(),
@@ -186,7 +200,7 @@ impl GatewayPayInvoice {
                 &outgoing_contract_account,
                 context.redeem_key,
                 context.timelock_delta,
-                consensus_block_height.unwrap(),
+                consensus_block_count.unwrap(),
             )
             .await
             .map_err(|e| OutgoingPaymentError::InvalidOutgoingContract {
@@ -222,8 +236,10 @@ impl GatewayPayInvoice {
                 let slice: [u8; 32] = preimage.try_into().expect("Failed to parse preimage");
                 Ok(Preimage(slice))
             }
-            // TODO: Get status code from failed RPC request
-            Err(_) => Err(OutgoingPaymentError::LightningPayError { contract }),
+            Err(error) => Err(OutgoingPaymentError::LightningPayError {
+                contract,
+                lightning_error: error,
+            }),
         }
     }
 
@@ -265,7 +281,10 @@ impl GatewayPayInvoice {
                         )),
                     }
                 }
-                OutgoingPaymentError::LightningPayError { contract } => GatewayPayStateMachine {
+                OutgoingPaymentError::LightningPayError {
+                    contract,
+                    lightning_error: _,
+                } => GatewayPayStateMachine {
                     common,
                     state: GatewayPayStates::CancelContract(Box::new(GatewayPayCancelContract {
                         contract,
@@ -286,7 +305,7 @@ impl GatewayPayInvoice {
         account: &OutgoingContractAccount,
         redeem_key: bitcoin::KeyPair,
         timelock_delta: u64,
-        consensus_block_height: u64,
+        consensus_block_count: u64,
     ) -> Result<PaymentParameters, OutgoingContractError> {
         let our_pub_key = secp256k1::XOnlyPublicKey::from_keypair(&redeem_key).0;
 
@@ -313,10 +332,14 @@ impl GatewayPayInvoice {
         }
 
         let max_delay = (account.contract.timelock as u64)
-            .checked_sub(consensus_block_height)
+            .checked_sub(consensus_block_count.saturating_sub(1))
             .and_then(|delta| delta.checked_sub(timelock_delta));
         if max_delay.is_none() {
             return Err(OutgoingContractError::TimeoutTooClose);
+        }
+
+        if invoice.is_expired() {
+            return Err(OutgoingContractError::InvoiceExpired(invoice.expiry_time()));
         }
 
         Ok(PaymentParameters {
@@ -401,6 +424,7 @@ impl GatewayPayCancelContract {
         common: GatewayPayCommon,
     ) -> Vec<StateTransition<GatewayPayStateMachine>> {
         let contract = self.contract.clone();
+        let error = self.error.clone();
         vec![StateTransition::new(
             future::ready(()),
             move |dbtx, _, _| {
@@ -410,6 +434,7 @@ impl GatewayPayCancelContract {
                     global_context.clone(),
                     context.clone(),
                     common.clone(),
+                    error.clone(),
                 ))
             },
         )]
@@ -421,6 +446,7 @@ impl GatewayPayCancelContract {
         global_context: DynGlobalClientContext,
         context: GatewayClientContext,
         common: GatewayPayCommon,
+        error: OutgoingPaymentError,
     ) -> GatewayPayStateMachine {
         let cancel_signature = context.secp.sign_schnorr(
             &contract.contract.cancellation_message().into(),
@@ -438,11 +464,20 @@ impl GatewayPayCancelContract {
         match global_context.fund_output(dbtx, client_output).await {
             Ok((txid, _)) => GatewayPayStateMachine {
                 common,
-                state: GatewayPayStates::Canceled(txid, contract.contract.contract_id()),
+                state: GatewayPayStates::Canceled {
+                    txid,
+                    contract_id: contract.contract.contract_id(),
+                    error,
+                },
             },
-            Err(_) => GatewayPayStateMachine {
+            Err(e) => GatewayPayStateMachine {
                 common,
-                state: GatewayPayStates::Failed,
+                state: GatewayPayStates::Failed {
+                    error,
+                    error_message: format!(
+                        "Failed to submit refund transaction to federation {e:?}"
+                    ),
+                },
             },
         }
     }

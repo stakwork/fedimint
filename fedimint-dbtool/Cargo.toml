@@ -7,7 +7,7 @@ edition = "2021"
 
 [[bin]]
 path = "src/main.rs"
-name = "dbtool"
+name = "fedimint-dbtool"
 
 [dependencies]
 anyhow = "1.0.68"
@@ -31,3 +31,4 @@ serde_json = "1.0.91"
 strum = "0.24"
 strum_macros = "0.24"
 tokio = "1.26.0"
+tracing = "0.1.37"

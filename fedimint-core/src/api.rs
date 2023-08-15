@@ -6,7 +6,7 @@ use std::ops::Add;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 use std::{cmp, result};
 
 use anyhow::{anyhow, ensure};
@@ -38,7 +38,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 use threshold_crypto::{PublicKey, PK_SIZE};
-use tracing::{debug, error, instrument, trace};
+use tracing::{debug, error, instrument, trace, warn};
 use url::Url;
 
 use crate::backup::ClientBackupSnapshot;
@@ -48,20 +48,19 @@ use crate::epoch::{SerdeEpochHistory, SignedEpochOutcome};
 use crate::module::{ApiRequestErased, ApiVersion, SupportedApiVersionsSummary};
 use crate::outcome::TransactionStatus;
 use crate::query::{
-    CurrentConsensus, DiscoverApiVersionSet, EventuallyConsistent, QueryStep, QueryStrategy,
-    UnionResponsesSingle, VerifiableResponse,
+    DiscoverApiVersionSet, QueryStep, QueryStrategy, ThresholdConsensus, UnionResponsesSingle,
+    VerifiableResponse,
 };
-use crate::task;
 use crate::transaction::{SerdeTransaction, Transaction};
+use crate::{serde_as_encodable_hex, task};
 
-pub type MemberResult<T> = result::Result<T, MemberError>;
+pub type PeerResult<T> = Result<T, PeerError>;
+pub type JsonRpcResult<T> = Result<T, jsonrpsee_core::Error>;
+pub type FederationResult<T> = Result<T, FederationError>;
 
-pub type JsonRpcResult<T> = result::Result<T, jsonrpsee_core::Error>;
-pub type FederationResult<T> = result::Result<T, FederationError>;
-
-/// An API request error when calling a single federation member
+/// An API request error when calling a single federation peer
 #[derive(Debug, Error)]
-pub enum MemberError {
+pub enum PeerError {
     #[error("Response deserialization error: {0}")]
     ResponseDeserialization(anyhow::Error),
     #[error("Invalid peer id: {peer_id}")]
@@ -72,12 +71,12 @@ pub enum MemberError {
     InvalidResponse(String),
 }
 
-impl MemberError {
+impl PeerError {
     pub fn is_retryable(&self) -> bool {
         match self {
-            MemberError::ResponseDeserialization(_) => false,
-            MemberError::InvalidPeerId { peer_id: _ } => false,
-            MemberError::Rpc(rpc_e) => match rpc_e {
+            PeerError::ResponseDeserialization(_) => false,
+            PeerError::InvalidPeerId { peer_id: _ } => false,
+            PeerError::Rpc(rpc_e) => match rpc_e {
                 // TODO: Does this cover all retryable cases?
                 JsonRpcError::Transport(_) => true,
                 JsonRpcError::MaxSlotsExceeded => true,
@@ -85,7 +84,7 @@ impl MemberError {
                 JsonRpcError::Call(e) => e.code() == 404,
                 _ => false,
             },
-            MemberError::InvalidResponse(_) => false,
+            PeerError::InvalidResponse(_) => false,
         }
     }
 }
@@ -94,21 +93,21 @@ impl MemberError {
 #[derive(Debug, Error)]
 pub struct FederationError {
     general: Option<anyhow::Error>,
-    members: BTreeMap<PeerId, MemberError>,
+    peers: BTreeMap<PeerId, PeerError>,
 }
 
-impl fmt::Display for FederationError {
+impl Display for FederationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("Federation rpc error {")?;
         if let Some(general) = self.general.as_ref() {
             f.write_fmt(format_args!("general => {general})"))?;
-            if !self.members.is_empty() {
+            if !self.peers.is_empty() {
                 f.write_str(", ")?;
             }
         }
-        for (i, (peer, e)) in self.members.iter().enumerate() {
+        for (i, (peer, e)) in self.peers.iter().enumerate() {
             f.write_fmt(format_args!("{peer} => {e})"))?;
-            if i == self.members.len() - 1 {
+            if i == self.peers.len() - 1 {
                 f.write_str(", ")?;
             }
         }
@@ -119,7 +118,7 @@ impl fmt::Display for FederationError {
 
 impl FederationError {
     pub fn is_retryable(&self) -> bool {
-        self.members.iter().any(|(_, e)| e.is_retryable())
+        self.peers.iter().any(|(_, e)| e.is_retryable())
     }
 }
 
@@ -144,18 +143,18 @@ pub enum OutputOutcomeError {
 /// An API (module or global) that can query a federation
 #[apply(async_trait_maybe_send!)]
 pub trait IFederationApi: Debug + MaybeSend + MaybeSync {
-    /// List of all federation members for the purpose of iterating each member
+    /// List of all federation peers for the purpose of iterating each peer
     /// in the federation.
     ///
     /// The underlying implementation is responsible for knowing how many
     /// and `PeerId`s of each. The caller of this interface most probably
     /// have some idea as well, but passing this set across every
     /// API call to the federation would be inconvenient.
-    fn all_members(&self) -> &BTreeSet<PeerId>;
+    fn all_peers(&self) -> &BTreeSet<PeerId>;
 
     fn with_module(&self, id: ModuleInstanceId) -> DynModuleApi;
 
-    /// Make request to a specific federation member by `peer_id`
+    /// Make request to a specific federation peer by `peer_id`
     async fn request_raw(
         &self,
         peer_id: PeerId,
@@ -179,9 +178,9 @@ pub struct ApiVersionSet {
 pub trait FederationApiExt: IFederationApi {
     /// Make an aggregate request to federation, using `strategy` to logically
     /// merge the responses.
-    async fn request_with_strategy<MemberRet: serde::de::DeserializeOwned, FedRet: Debug>(
+    async fn request_with_strategy<PeerRet: serde::de::DeserializeOwned, FedRet: Debug>(
         &self,
-        mut strategy: impl QueryStrategy<MemberRet, FedRet> + MaybeSend,
+        mut strategy: impl QueryStrategy<PeerRet, FedRet> + MaybeSend,
         method: String,
         params: ApiRequestErased,
     ) -> FederationResult<FedRet> {
@@ -192,7 +191,7 @@ pub trait FederationApiExt: IFederationApi {
         #[cfg(target_family = "wasm")]
         let mut futures = FuturesUnordered::<Pin<Box<dyn Future<Output = _>>>>::new();
 
-        let peers = self.all_members();
+        let peers = self.all_peers();
 
         for peer_id in peers {
             futures.push(Box::pin(async {
@@ -218,21 +217,20 @@ pub trait FederationApiExt: IFederationApi {
             }));
         }
 
-        let mut member_delay_ms = BTreeMap::new();
-        let mut member_errors = BTreeMap::new();
+        let mut peer_delay_ms = BTreeMap::new();
 
         // Delegates the response handling to the `QueryStrategy` with an exponential
         // back-off with every new set of requests
         let max_delay_ms = 1000;
         loop {
             let response = futures.next().await;
-            trace!(?response, method, params = ?AbbreviateDebug(params.to_json()), "Received member response");
+            trace!(?response, method, params = ?AbbreviateDebug(params.to_json()), "Received peer response");
             match response {
                 Some(PeerResponse { peer, result }) => {
-                    let result: MemberResult<MemberRet> =
-                        result.map_err(MemberError::Rpc).and_then(|o| {
-                            serde_json::from_value::<MemberRet>(o.0)
-                                .map_err(|e| MemberError::ResponseDeserialization(e.into()))
+                    let result: PeerResult<PeerRet> =
+                        result.map_err(PeerError::Rpc).and_then(|o| {
+                            serde_json::from_value::<PeerRet>(o.0)
+                                .map_err(|e| PeerError::ResponseDeserialization(e.into()))
                         });
 
                     let strategy_step = strategy.process(peer, result);
@@ -240,17 +238,15 @@ pub trait FederationApiExt: IFederationApi {
                         method,
                         ?params,
                         ?strategy_step,
-                        "Taking strategy step to the response after member response"
+                        "Taking strategy step to the response after peer response"
                     );
                     match strategy_step {
-                        QueryStep::RetryMembers(peers) => {
+                        QueryStep::Retry(peers) => {
                             for retry_peer in peers {
-                                member_errors.remove(&retry_peer);
-
                                 let mut delay_ms =
-                                    member_delay_ms.get(&retry_peer).copied().unwrap_or(10);
+                                    peer_delay_ms.get(&retry_peer).copied().unwrap_or(10);
                                 delay_ms = cmp::min(max_delay_ms, delay_ms * 2);
-                                member_delay_ms.insert(retry_peer, delay_ms);
+                                peer_delay_ms.insert(retry_peer, delay_ms);
 
                                 futures.push(Box::pin({
                                     let method = &method;
@@ -274,29 +270,15 @@ pub trait FederationApiExt: IFederationApi {
                                 }));
                             }
                         }
-                        QueryStep::FailMembers(failed) => {
-                            for (failed_peer, error) in failed {
-                                member_errors.insert(failed_peer, error);
-                            }
-                        }
                         QueryStep::Continue => {}
-                        QueryStep::Failure { general, members } => {
-                            for (failed_peer, error) in members {
-                                member_errors.insert(failed_peer, error);
-                            }
-                            return Err(FederationError {
-                                general,
-                                members: member_errors,
-                            });
+                        QueryStep::Failure { general, peers } => {
+                            return Err(FederationError { general, peers })
                         }
                         QueryStep::Success(response) => return Ok(response),
                     }
                 }
                 None => {
-                    return Err(FederationError {
-                        general: None,
-                        members: BTreeMap::new(),
-                    })
+                    panic!("Query strategy ran out of peers to query without returning a result");
                 }
             }
         }
@@ -311,23 +293,7 @@ pub trait FederationApiExt: IFederationApi {
         Ret: serde::de::DeserializeOwned + Eq + Debug + Clone + MaybeSend,
     {
         self.request_with_strategy(
-            CurrentConsensus::new(self.all_members().one_honest()),
-            method,
-            params,
-        )
-        .await
-    }
-
-    async fn request_eventually_consistent<Ret>(
-        &self,
-        method: String,
-        params: ApiRequestErased,
-    ) -> FederationResult<Ret>
-    where
-        Ret: serde::de::DeserializeOwned + Eq + Debug + Clone + MaybeSend,
-    {
-        self.request_with_strategy(
-            EventuallyConsistent::new(self.all_members().one_honest()),
+            ThresholdConsensus::new(self.all_peers().total()),
             method,
             params,
         )
@@ -397,10 +363,7 @@ pub trait GlobalFederationApi {
         R: OutputOutcome;
 
     /// Fetch client configuration info only if verified against a federation id
-    async fn download_client_config(
-        &self,
-        info: &WsClientConnectInfo,
-    ) -> FederationResult<ClientConfig>;
+    async fn download_client_config(&self, info: &InviteCode) -> FederationResult<ClientConfig>;
 
     /// Fetches the server consensus hash if enough peers agree on it
     async fn consensus_config_hash(&self) -> FederationResult<sha256::Hash>;
@@ -502,20 +465,17 @@ where
             fn process(
                 &mut self,
                 peer: PeerId,
-                result: MemberResult<SerdeEpochHistory>,
+                result: PeerResult<SerdeEpochHistory>,
             ) -> QueryStep<SignedEpochOutcome> {
                 let response = result.and_then(|hist| {
                     hist.try_into_inner(&self.decoders)
-                        .map_err(|e| MemberError::Rpc(jsonrpsee_core::Error::Custom(e.to_string())))
+                        .map_err(|e| PeerError::Rpc(jsonrpsee_core::Error::Custom(e.to_string())))
                 });
                 match self.strategy.process(peer, response) {
-                    QueryStep::RetryMembers(r) => QueryStep::RetryMembers(r),
-                    QueryStep::FailMembers(failed) => QueryStep::FailMembers(failed),
+                    QueryStep::Retry(r) => QueryStep::Retry(r),
                     QueryStep::Continue => QueryStep::Continue,
                     QueryStep::Success(res) => QueryStep::Success(res),
-                    QueryStep::Failure { general, members } => {
-                        QueryStep::Failure { general, members }
-                    }
+                    QueryStep::Failure { general, peers } => QueryStep::Failure { general, peers },
                 }
             }
         }
@@ -523,9 +483,9 @@ where
         let qs = ValidHistoryWrapper {
             decoders,
             strategy: VerifiableResponse::new(
-                self.all_members().one_honest(),
-                true,
                 move |epoch: &SignedEpochOutcome| epoch.verify_sig(&epoch_pk).is_ok(),
+                true,
+                self.all_peers().total(),
             ),
         };
 
@@ -538,11 +498,8 @@ where
     }
 
     async fn fetch_epoch_count(&self) -> FederationResult<u64> {
-        self.request_eventually_consistent(
-            "fetch_epoch_count".to_owned(),
-            ApiRequestErased::default(),
-        )
-        .await
+        self.request_current_consensus("fetch_epoch_count".to_owned(), ApiRequestErased::default())
+            .await
     }
 
     async fn fetch_output_outcome<R>(
@@ -578,18 +535,15 @@ where
         .map_err(|_| OutputOutcomeError::Timeout(timeout))?
     }
 
-    async fn download_client_config(
-        &self,
-        info: &WsClientConnectInfo,
-    ) -> FederationResult<ClientConfig> {
+    async fn download_client_config(&self, info: &InviteCode) -> FederationResult<ClientConfig> {
         let id = info.id;
         let qs = VerifiableResponse::new(
-            self.all_members().total(),
-            false,
             move |config: &ClientConfigResponse| {
                 let hash = config.client_config.consensus_hash();
                 id.0.verify(&config.signature.0, hash)
             },
+            false,
+            self.all_peers().total(),
         );
 
         self.request_with_strategy(
@@ -608,7 +562,7 @@ where
 
     async fn upload_backup(&self, request: &SignedBackupRequest) -> FederationResult<()> {
         self.request_with_strategy(
-            CurrentConsensus::new(self.all_members().threshold()),
+            ThresholdConsensus::new(self.all_peers().total()),
             "backup".to_owned(),
             ApiRequestErased::new(request),
         )
@@ -621,9 +575,7 @@ where
     ) -> FederationResult<Vec<ClientBackupSnapshot>> {
         Ok(self
             .request_with_strategy(
-                UnionResponsesSingle::<Option<ClientBackupSnapshot>>::new(
-                    self.all_members().threshold(),
-                ),
+                UnionResponsesSingle::<Option<ClientBackupSnapshot>>::new(self.all_peers().total()),
                 "recover".to_owned(),
                 ApiRequestErased::new(id),
             )
@@ -640,7 +592,7 @@ where
         let timeout = Duration::from_secs(60);
         self.request_with_strategy(
             DiscoverApiVersionSet::new(
-                self.all_members().len(),
+                self.all_peers().len(),
                 now().add(timeout),
                 client_versions.clone(),
             ),
@@ -651,18 +603,18 @@ where
     }
 }
 
-/// Mint API client that will try to run queries against all `members` expecting
-/// equal results from at least `min_eq_results` of them. Members that return
-/// differing results are returned as a member faults list.
+/// Mint API client that will try to run queries against all `peers` expecting
+/// equal results from at least `min_eq_results` of them. Peers that return
+/// differing results are returned as a peer faults list.
 #[derive(Debug, Clone)]
 pub struct WsFederationApi<C = WsClient> {
-    peers: BTreeSet<PeerId>,
-    members: Arc<Vec<FederationMember<C>>>,
+    peer_ids: BTreeSet<PeerId>,
+    peers: Arc<Vec<FederationPeer<C>>>,
     module_id: Option<ModuleInstanceId>,
 }
 
 #[derive(Debug)]
-struct FederationMember<C> {
+struct FederationPeer<C> {
     url: Url,
     peer_id: PeerId,
     client: RwLock<Option<C>>,
@@ -672,7 +624,7 @@ struct FederationMember<C> {
 ///
 /// Can be used to download the configs and bootstrap a client
 #[derive(Clone, Debug, Eq, PartialEq, Encodable)]
-pub struct WsClientConnectInfo {
+pub struct InviteCode {
     /// Url to reach an API that we can download configs from
     pub url: Url,
     /// Config download token (might only be used a certain number of times)
@@ -685,10 +637,12 @@ pub struct WsClientConnectInfo {
 const CONFIG_DOWNLOAD_TOKEN_BYTES: usize = 12;
 
 /// Allows a client to download the config
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Encodable, Decodable)]
+#[derive(Debug, Clone, Eq, PartialEq, Encodable, Decodable)]
 pub struct ClientConfigDownloadToken(pub [u8; CONFIG_DOWNLOAD_TOKEN_BYTES]);
 
-/// We can represent client connect info as a bech32 string for compactness and
+serde_as_encodable_hex!(ClientConfigDownloadToken);
+
+/// We can represent client invite code as a bech32 string for compactness and
 /// error-checking
 ///
 /// Human readable part (HRP) includes the version
@@ -697,7 +651,7 @@ pub struct ClientConfigDownloadToken(pub [u8; CONFIG_DOWNLOAD_TOKEN_BYTES]);
 /// ```
 const BECH32_HRP: &str = "fed1";
 
-impl FromStr for WsClientConnectInfo {
+impl FromStr for InviteCode {
     type Err = anyhow::Error;
 
     fn from_str(encoded: &str) -> Result<Self, Self::Err> {
@@ -729,8 +683,8 @@ impl FromStr for WsClientConnectInfo {
     }
 }
 
-/// Parses the connect info from a bech32 string
-impl Display for WsClientConnectInfo {
+/// Parses the invite code from a bech32 string
+impl Display for InviteCode {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         let mut data = vec![];
         data.extend(self.id.0.to_bytes());
@@ -745,7 +699,7 @@ impl Display for WsClientConnectInfo {
     }
 }
 
-impl Serialize for WsClientConnectInfo {
+impl Serialize for InviteCode {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
@@ -754,7 +708,7 @@ impl Serialize for WsClientConnectInfo {
     }
 }
 
-impl<'de> Deserialize<'de> for WsClientConnectInfo {
+impl<'de> Deserialize<'de> for InviteCode {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
@@ -773,14 +727,14 @@ impl<C: JsonRpcClient + Debug + 'static> IModuleFederationApi for WsFederationAp
 /// Can function as either the global or module API
 #[apply(async_trait_maybe_send!)]
 impl<C: JsonRpcClient + Debug + 'static> IFederationApi for WsFederationApi<C> {
-    fn all_members(&self) -> &BTreeSet<PeerId> {
-        &self.peers
+    fn all_peers(&self) -> &BTreeSet<PeerId> {
+        &self.peer_ids
     }
 
     fn with_module(&self, id: ModuleInstanceId) -> DynModuleApi {
         WsFederationApi {
+            peer_ids: self.peer_ids.clone(),
             peers: self.peers.clone(),
-            members: self.members.clone(),
             module_id: Some(id),
         }
         .into()
@@ -792,8 +746,8 @@ impl<C: JsonRpcClient + Debug + 'static> IFederationApi for WsFederationApi<C> {
         method: &str,
         params: &[Value],
     ) -> JsonRpcResult<Value> {
-        let member = self
-            .members
+        let peer = self
+            .peers
             .iter()
             .find(|m| m.peer_id == peer_id)
             .ok_or_else(|| JsonRpcError::Custom(format!("Invalid peer_id: {peer_id}")))?;
@@ -802,7 +756,7 @@ impl<C: JsonRpcClient + Debug + 'static> IFederationApi for WsFederationApi<C> {
             None => method.to_string(),
             Some(id) => format!("module_{id}_{method}"),
         };
-        member.request(&method, params).await
+        peer.request(&method, params).await
     }
 }
 
@@ -834,8 +788,8 @@ impl JsonRpcClient for WsClient {
 
 impl WsFederationApi<WsClient> {
     /// Creates a new API client
-    pub fn new(members: Vec<(PeerId, Url)>) -> Self {
-        Self::new_with_client(members)
+    pub fn new(peers: Vec<(PeerId, Url)>) -> Self {
+        Self::new_with_client(peers)
     }
 
     /// Creates a new API client from a client config
@@ -849,9 +803,9 @@ impl WsFederationApi<WsClient> {
         )
     }
 
-    /// Creates a new API client from a connect info, assumes they are in peer
+    /// Creates a new API client from a invite code, assumes they are in peer
     /// id order
-    pub fn from_connect_info(info: &[WsClientConnectInfo]) -> Self {
+    pub fn from_invite_code(info: &[InviteCode]) -> Self {
         Self::new(
             info.iter()
                 .enumerate()
@@ -863,15 +817,15 @@ impl WsFederationApi<WsClient> {
 
 impl<C> WsFederationApi<C> {
     pub fn peers(&self) -> Vec<PeerId> {
-        self.members.iter().map(|member| member.peer_id).collect()
+        self.peers.iter().map(|peer| peer.peer_id).collect()
     }
 
     /// Creates a new API client
-    pub fn new_with_client(members: Vec<(PeerId, Url)>) -> Self {
+    pub fn new_with_client(peers: Vec<(PeerId, Url)>) -> Self {
         WsFederationApi {
-            peers: members.iter().map(|m| m.0).collect(),
-            members: Arc::new(
-                members
+            peer_ids: peers.iter().map(|m| m.0).collect(),
+            peers: Arc::new(
+                peers
                     .into_iter()
                     .map(|(peer_id, url)| {
                         assert!(
@@ -880,7 +834,7 @@ impl<C> WsFederationApi<C> {
                         );
                         assert!(url.host().is_some(), "API client requires a target host");
 
-                        FederationMember {
+                        FederationPeer {
                             peer_id,
                             url,
                             client: RwLock::new(None),
@@ -899,7 +853,7 @@ pub struct PeerResponse<R> {
     pub result: JsonRpcResult<R>,
 }
 
-impl<C: JsonRpcClient> FederationMember<C> {
+impl<C: JsonRpcClient> FederationPeer<C> {
     #[instrument(level = "trace", fields(peer = %self.peer_id, %method), skip_all)]
     pub async fn request(&self, method: &str, params: &[Value]) -> JsonRpcResult<Value> {
         let rclient = self.client.read().await;
@@ -939,7 +893,8 @@ impl<C: JsonRpcClient> FederationMember<C> {
                             .await?
                     }
                     Err(err) => {
-                        error!(
+                        // Warn instead of Error because we will probably retry connecting later
+                        warn!(
                             target: LOG_NET_API,
                             %err, "unable to connect to server");
                         return Err(err)?;
@@ -972,12 +927,9 @@ impl<C: JsonRpcClient> WsFederationApi<C> {}
 
 /// The status of a server, including how it views its peers
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ConsensusStatus {
-    /// The last contribution that this server has made to the consensus, it's
-    /// equivalent to [`PeerConsensusStatus::last_contribution`] and
-    /// [`ConsensusContribution::value`]
-    pub last_contribution: u64,
-    pub status_by_peer: HashMap<PeerId, PeerConsensusStatus>,
+pub struct FederationStatus {
+    pub session_count: u64,
+    pub status_by_peer: HashMap<PeerId, PeerStatus>,
     pub peers_online: u64,
     pub peers_offline: u64,
     /// This should always be 0 if everything is okay, so a monitoring tool
@@ -986,13 +938,11 @@ pub struct ConsensusStatus {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PeerConsensusStatus {
+pub struct PeerStatus {
     pub last_contribution: Option<u64>,
-    pub last_contribution_timestamp_seconds: Option<u64>,
     pub connection_status: PeerConnectionStatus,
-    /// Indicates that this peer needs attention from the operator. For instance
-    /// it may be suffering too many disconnections or it hasn't contributed for
-    /// the consensus in a long time
+    /// Indicates that this peer needs attention from the operator since
+    /// it has not contributed to the consensus in a long time
     pub flagged: bool,
 }
 
@@ -1001,16 +951,6 @@ pub enum PeerConnectionStatus {
     #[default]
     Disconnected,
     Connected,
-}
-
-/// Tracks the consensus contribution for a peer
-#[derive(Debug, Clone, Copy)]
-pub struct ConsensusContribution {
-    /// Using HBBFT this is the epoch count. In general it should be an
-    /// increasing number
-    pub value: u64,
-    /// When the contribution was received
-    pub time: SystemTime,
 }
 
 /// The state of the server returned via APIs
@@ -1027,6 +967,8 @@ pub enum ServerStatus {
     ConfigGenFailed,
     /// Config is generated, peers should verify the config
     VerifyingConfigs,
+    /// We have verified all our peer configs
+    VerifiedConfigs,
     /// Restarted from a planned upgrade (requires action to start)
     Upgrading,
     /// Consensus is running
@@ -1036,7 +978,7 @@ pub enum ServerStatus {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct StatusResponse {
     pub server: ServerStatus,
-    pub consensus: Option<ConsensusStatus>,
+    pub federation: Option<FederationStatus>,
 }
 
 #[cfg(test)]
@@ -1114,8 +1056,8 @@ mod tests {
         }
     }
 
-    fn federation_member<C: SimpleClient + MaybeSend + MaybeSync>() -> FederationMember<Client<C>> {
-        FederationMember {
+    fn federation_peer<C: SimpleClient + MaybeSend + MaybeSync>() -> FederationPeer<Client<C>> {
+        FederationPeer {
             url: Url::from_str("http://127.0.0.1").expect("Could not parse"),
             peer_id: PeerId::from(0),
             client: RwLock::new(None),
@@ -1144,7 +1086,7 @@ mod tests {
             }
         }
 
-        let fed = federation_member::<Client>();
+        let fed = federation_peer::<Client>();
         assert_eq!(
             CONNECTION_COUNT.load(Ordering::SeqCst),
             0,
@@ -1214,7 +1156,7 @@ mod tests {
             }
         }
 
-        let fed = federation_member::<Client>();
+        let fed = federation_peer::<Client>();
 
         FAIL.lock().unwrap().insert(0);
 
@@ -1269,21 +1211,21 @@ mod tests {
     }
 
     #[test]
-    fn converts_connect_string() {
-        let connect = WsClientConnectInfo {
+    fn converts_invite_code() {
+        let connect = InviteCode {
             url: "ws://test1".parse().unwrap(),
             id: FederationId::dummy(),
             download_token: ClientConfigDownloadToken(OsRng::default().gen()),
         };
 
         let bech32 = connect.to_string();
-        let connect_parsed = WsClientConnectInfo::from_str(&bech32).expect("parses");
+        let connect_parsed = InviteCode::from_str(&bech32).expect("parses");
         assert_eq!(connect, connect_parsed);
 
         let json = serde_json::to_string(&connect).unwrap();
         let connect_as_string: String = serde_json::from_str(&json).unwrap();
         assert_eq!(connect_as_string, bech32);
-        let connect_parsed_json: WsClientConnectInfo = serde_json::from_str(&json).unwrap();
+        let connect_parsed_json: InviteCode = serde_json::from_str(&json).unwrap();
         assert_eq!(connect_parsed_json, connect_parsed);
     }
 }

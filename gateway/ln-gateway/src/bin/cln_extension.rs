@@ -14,14 +14,13 @@ use cln_rpc::model;
 use cln_rpc::primitives::ShortChannelId;
 use fedimint_core::task::TaskGroup;
 use fedimint_core::Amount;
-use futures::stream::StreamExt;
 use ln_gateway::gatewaylnrpc::gateway_lightning_server::{
     GatewayLightning, GatewayLightningServer,
 };
 use ln_gateway::gatewaylnrpc::get_route_hints_response::{RouteHint, RouteHintHop};
 use ln_gateway::gatewaylnrpc::intercept_htlc_response::{Action, Cancel, Forward, Settle};
 use ln_gateway::gatewaylnrpc::{
-    EmptyRequest, GetNodeInfoResponse, GetRouteHintsResponse, InterceptHtlcRequest,
+    EmptyRequest, EmptyResponse, GetNodeInfoResponse, GetRouteHintsResponse, InterceptHtlcRequest,
     InterceptHtlcResponse, PayInvoiceRequest, PayInvoiceResponse,
 };
 use secp256k1::PublicKey;
@@ -37,8 +36,8 @@ use tracing::{debug, error, info, trace, warn};
 #[derive(Parser)]
 pub struct ClnExtensionOpts {
     /// Gateway CLN extension service listen address
-    #[arg(long = "listen", env = "FM_CLN_EXTENSION_LISTEN_ADDRESS")]
-    pub listen: SocketAddr,
+    #[arg(long = "fm-gateway-listen", env = "FM_CLN_EXTENSION_LISTEN_ADDRESS")]
+    pub fm_gateway_listen: SocketAddr,
 }
 
 #[tokio::main]
@@ -137,12 +136,12 @@ impl ClnRpcService {
 
         if let Some(plugin) = Builder::new(stdin(), stdout())
             .option(options::ConfigOption::new(
-                "listen",
+                "fm-gateway-listen",
                 // Set an invalid default address in the extension to force the extension plugin
                 // user to supply a valid address via an environment variable or
                 // cln plugin config option.
-                options::Value::String("default-dont-use".into()),
-                "gateway cln extension address",
+                options::Value::OptString,
+                "fedimint gateway CLN extension listen address",
             ))
             .hook(
                 "htlc_accepted",
@@ -177,21 +176,19 @@ impl ClnRpcService {
             let socket = PathBuf::from(config.lightning_dir).join(config.rpc_file);
 
             // Parse configurations or read from
-            let listen: SocketAddr = match ClnExtensionOpts::try_parse() {
-                Ok(opts) => opts.listen,
-                // FIXME: cln_plugin doesn't yet support optional parameters
-                Err(_) => match plugin.option("listen") {
-                    Some(options::Value::String(listen)) => {
-                        if listen == "default-dont-use" {
-                            panic!(
-                                "Gateway cln extension is missing a listen address configuration. You can set it via FM_CLN_EXTENSION_LISTEN_ADDRESS env variable, or by adding a --listen config option to the cln plugin"
-                            )
-                        } else {
-                            SocketAddr::from_str(&listen).expect("invalid listen address")
-                        }
-                    }
-                    _ => unreachable!(),
-                },
+            let fm_gateway_listen: SocketAddr = match ClnExtensionOpts::try_parse() {
+                Ok(opts) => opts.fm_gateway_listen,
+                Err(_) => {
+
+                    let listen_val = plugin.option("fm-gateway-listen")
+                        .expect("Gateway CLN extension is missing a listen address configuration. 
+                        You can set it via FM_CLN_EXTENSION_LISTEN_ADDRESS env variable, or by adding 
+                        a --fm-gateway-listen config option to the CLN plugin.");
+                    let listen = listen_val.as_str()
+                        .expect("fm-gateway-listen isn't a string");
+
+                    SocketAddr::from_str(listen).expect("invalid fm-gateway-listen address")
+                }
             };
 
             Ok((
@@ -200,7 +197,7 @@ impl ClnRpcService {
                     interceptor,
                     task_group: TaskGroup::new()
                 },
-                listen,
+                fm_gateway_listen,
                 plugin,
             ))
         } else {
@@ -237,79 +234,6 @@ impl ClnRpcService {
                 _ => Err(ClnExtensionError::RpcWrongResponse),
             })
             .map_err(ClnExtensionError::RpcError)?
-    }
-
-    async fn complete_htlc(
-        complete_request: InterceptHtlcResponse,
-        interceptors: Arc<ClnHtlcInterceptor>,
-    ) -> Result<(), Status> {
-        let InterceptHtlcResponse {
-            action,
-            incoming_chan_id,
-            htlc_id,
-            ..
-        } = complete_request;
-        if let Some(outcome) = interceptors
-            .outcomes
-            .lock()
-            .await
-            .remove(&(incoming_chan_id, htlc_id))
-        {
-            // Translate action request into a cln rpc response for
-            // `htlc_accepted` event
-            let htlca_res = match action {
-                Some(Action::Settle(Settle { preimage })) => {
-                    let assert_pk: Result<[u8; 32], TryFromSliceError> =
-                        preimage.as_slice().try_into();
-                    if let Ok(pk) = assert_pk {
-                        serde_json::json!({ "result": "resolve", "payment_key": pk.to_hex() })
-                    } else {
-                        htlc_processing_failure()
-                    }
-                }
-                Some(Action::Cancel(Cancel { reason: _ })) => {
-                    // TODO: Translate the reason into a BOLT 4 failure message
-                    // See: https://github.com/lightning/bolts/blob/master/04-onion-routing.md#failure-messages
-                    htlc_processing_failure()
-                }
-                Some(Action::Forward(Forward {})) => {
-                    serde_json::json!({ "result": "continue" })
-                }
-                None => {
-                    error!(
-                        ?incoming_chan_id,
-                        ?htlc_id,
-                        "No action specified for intercepted htlc"
-                    );
-                    return Err(Status::internal(
-                        "No action specified on this intercepted htlc",
-                    ));
-                }
-            };
-
-            // Send translated response to the HTLC interceptor for submission
-            // to the cln rpc
-            match outcome.send(htlca_res) {
-                Ok(_) => {}
-                Err(e) => {
-                    error!(
-                        "Failed to send htlc_accepted response to interceptor: {:?}",
-                        e
-                    );
-                    return Err(Status::internal(
-                        "Failed to send htlc_accepted response to interceptor",
-                    ));
-                }
-            };
-        } else {
-            error!(
-                ?incoming_chan_id,
-                ?htlc_id,
-                "No interceptor reference found for this processed htlc",
-            );
-            return Err(Status::internal("No interceptor reference found for htlc"));
-        }
-        Ok(())
     }
 }
 
@@ -479,32 +403,92 @@ impl GatewayLightning for ClnRpcService {
 
     async fn route_htlcs(
         &self,
-        request: tonic::Request<tonic::Streaming<InterceptHtlcResponse>>,
+        _: tonic::Request<EmptyRequest>,
     ) -> Result<tonic::Response<Self::RouteHtlcsStream>, Status> {
-        let mut stream = request.into_inner();
-
         // First create new channel that we will use to send responses back to gatewayd
         let (gatewayd_sender, gatewayd_receiver) =
             mpsc::channel::<Result<InterceptHtlcRequest, Status>>(100);
 
         let mut sender = self.interceptor.sender.lock().await;
         *sender = Some(gatewayd_sender.clone());
-
-        // Spawn new thread that listens for events from the input stream
-        let interceptors = self.interceptor.clone();
-        tokio::spawn(async move {
-            while let Some(res) = stream.next().await {
-                if let Ok(complete_request) = res {
-                    let _ = Self::complete_htlc(complete_request, interceptors.clone())
-                        .await
-                        .map_err(|e| {
-                            error!("CLN extension failed to complete HTLC: {:?}", e);
-                        });
-                }
-            }
-        });
+        debug!("Gateway channel sender replaced");
 
         Ok(tonic::Response::new(ReceiverStream::new(gatewayd_receiver)))
+    }
+
+    async fn complete_htlc(
+        &self,
+        intercept_response: tonic::Request<InterceptHtlcResponse>,
+    ) -> Result<tonic::Response<EmptyResponse>, Status> {
+        let InterceptHtlcResponse {
+            action,
+            incoming_chan_id,
+            htlc_id,
+            ..
+        } = intercept_response.into_inner();
+
+        if let Some(outcome) = self
+            .interceptor
+            .outcomes
+            .lock()
+            .await
+            .remove(&(incoming_chan_id, htlc_id))
+        {
+            // Translate action request into a cln rpc response for
+            // `htlc_accepted` event
+            let htlca_res = match action {
+                Some(Action::Settle(Settle { preimage })) => {
+                    let assert_pk: Result<[u8; 32], TryFromSliceError> =
+                        preimage.as_slice().try_into();
+                    if let Ok(pk) = assert_pk {
+                        serde_json::json!({ "result": "resolve", "payment_key": pk.to_hex() })
+                    } else {
+                        htlc_processing_failure()
+                    }
+                }
+                Some(Action::Cancel(Cancel { reason: _ })) => {
+                    // TODO: Translate the reason into a BOLT 4 failure message
+                    // See: https://github.com/lightning/bolts/blob/master/04-onion-routing.md#failure-messages
+                    htlc_processing_failure()
+                }
+                Some(Action::Forward(Forward {})) => {
+                    serde_json::json!({ "result": "continue" })
+                }
+                None => {
+                    error!(
+                        ?incoming_chan_id,
+                        ?htlc_id,
+                        "No action specified for intercepted htlc"
+                    );
+                    return Err(Status::internal(
+                        "No action specified on this intercepted htlc",
+                    ));
+                }
+            };
+
+            // Send translated response to the HTLC interceptor for submission
+            // to the cln rpc
+            match outcome.send(htlca_res) {
+                Ok(_) => {}
+                Err(e) => {
+                    error!(
+                        "Failed to send htlc_accepted response to interceptor: {:?}",
+                        e
+                    );
+                    return Err(Status::internal(
+                        "Failed to send htlc_accepted response to interceptor",
+                    ));
+                }
+            };
+        } else {
+            error!(
+                ?incoming_chan_id,
+                ?htlc_id,
+                "No interceptor reference found for this processed htlc",
+            );
+            return Err(Status::internal("No interceptor reference found for htlc"));
+        }
+        Ok(tonic::Response::new(EmptyResponse {}))
     }
 }
 

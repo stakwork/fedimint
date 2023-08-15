@@ -7,17 +7,17 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use bitcoincore_rpc::RpcApi;
-use federation::{run_config_gen, Federation};
+use federation::Federation;
 use fedimint_client::module::gen::{ClientModuleGenRegistry, DynClientModuleGen};
 use fedimint_client_legacy::modules::mint::MintClientGen;
 use fedimint_client_legacy::{module_decode_stubs, UserClient, UserClientConfig};
+use fedimint_core::admin_client::WsAdminClient;
 use fedimint_core::config::load_from_file;
 use fedimint_core::db::Database;
 use fedimint_ln_client::LightningClientGen;
 use fedimint_logging::LOG_DEVIMINT;
 use fedimint_wallet_client::WalletClientGen;
-use tokio::fs;
-use tracing::info;
+use tracing::{debug, info};
 
 pub mod util;
 pub mod vars;
@@ -103,8 +103,8 @@ impl Gatewayd {
 
     pub async fn stop_lightning_node(&mut self) -> Result<()> {
         match self.ln.take() {
-            Some(LightningNode::Lnd(lnd)) => lnd.kill().await,
-            Some(LightningNode::Cln(cln)) => cln.kill().await,
+            Some(LightningNode::Lnd(lnd)) => lnd.terminate().await,
+            Some(LightningNode::Cln(cln)) => cln.terminate().await,
             None => Err(anyhow::anyhow!(
                 "Cannot stop an already stopped Lightning Node"
             )),
@@ -130,33 +130,25 @@ impl Gatewayd {
         }
     }
 
-    pub async fn gateway_pub_key(&self) -> Result<String> {
+    pub async fn gateway_id(&self) -> Result<String> {
         let info = cmd!(self, "info").out_json().await?;
-        let gateway_pub_key = info["federations"][0]["registration"]["gateway_pub_key"]
+        let gateway_id = info["gateway_id"]
             .as_str()
-            .context("gateway_pub_key must be a string")?
+            .context("gateway_id must be a string")?
             .to_owned();
-        Ok(gateway_pub_key)
+        Ok(gateway_id)
     }
 
     pub async fn connect_fed(&self, fed: &Federation) -> Result<()> {
-        let connect_str = poll_value("connect info", || async {
-            match cmd!(fed, "dev", "connect-info").out_json().await {
-                Ok(info) => Ok(Some(
-                    info["connect_info"]
-                        .as_str()
-                        .context("connect_info must be string")?
-                        .to_owned(),
-                )),
-                Err(_) => Ok(None),
+        let invite_code = fed.invite_code()?;
+        poll_max_retries("gateway connect-fed", 10, || async {
+            match cmd!(self, "connect-fed", invite_code.clone()).run().await {
+                Ok(_) => Ok(true),
+                Err(e) => {
+                    debug!("gateway-cli connect-fed failed {:?}", e);
+                    Ok(false)
+                }
             }
-        })
-        .await?;
-        poll("gateway connect-fed", || async {
-            Ok(cmd!(self, "connect-fed", connect_str.clone())
-                .run()
-                .await
-                .is_ok())
         })
         .await?;
         Ok(())
@@ -170,16 +162,8 @@ pub struct Faucet {
 
 impl Faucet {
     pub async fn new(process_mgr: &ProcessManager) -> Result<Self> {
-        let connect_string =
-            fs::read_to_string(process_mgr.globals.FM_DATA_DIR.join("client-connect")).await?;
-
         Ok(Self {
-            _process: process_mgr
-                .spawn_daemon(
-                    "faucet",
-                    cmd!("faucet", "--connect-string={connect_string}"),
-                )
-                .await?,
+            _process: process_mgr.spawn_daemon("faucet", cmd!("faucet")).await?,
         })
     }
 }
@@ -207,13 +191,15 @@ pub async fn dev_fed(process_mgr: &ProcessManager) -> Result<DevFed> {
         Esplora::new(process_mgr, bitcoind.clone()),
         async {
             let fed_size = process_mgr.globals.FM_FED_SIZE;
-            let members = run_config_gen(process_mgr, fed_size, true).await?;
-            info!(LOG_DEVIMINT, "config gen done");
-            Federation::new(process_mgr, bitcoind.clone(), members).await
+            Federation::new(process_mgr, bitcoind.clone(), fed_size).await
         },
     )?;
     info!(LOG_DEVIMINT, "federation and gateways started");
     tokio::try_join!(gw_cln.connect_fed(&fed), gw_lnd.connect_fed(&fed))?;
+    // Initialize fedimint-cli
+    cmd!(fed, "join-federation", fed.invite_code()?)
+        .run()
+        .await?;
     fed.await_gateways_registered().await?;
     info!(LOG_DEVIMINT, "gateways registered");
     fed.use_gateway(&gw_cln).await?;

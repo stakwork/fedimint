@@ -72,7 +72,7 @@ async fn mkdir(dir: PathBuf) -> anyhow::Result<PathBuf> {
     Ok(dir)
 }
 
-use fedimint_server::config::ServerConfig;
+use fedimint_server::config::ConfigGenParams;
 use format as f;
 
 pub fn utf8(path: &Path) -> &str {
@@ -118,7 +118,7 @@ declare_vars! {
         FM_MINT_RPC_CLIENT: String = f!("mint-rpc-client");
         FM_GWCLI_CLN: String = f!("gateway-cli --rpcpassword=theresnosecondbest");
         FM_GWCLI_LND: String = f!("gateway-cli --rpcpassword=theresnosecondbest -a http://127.0.0.1:28175/");
-        FM_DB_TOOL: String = f!("dbtool");
+        FM_DB_TOOL: String = f!("fedimint-dbtool");
 
         // fedimint config variables
         FM_TEST_BITCOIND_RPC: String = "http://bitcoin:bitcoin@127.0.0.1:18443";
@@ -162,12 +162,12 @@ impl Global {
 //
 // * `id` - ID of the server. Used to calculate port numbers.
 declare_vars! {
-    Fedimintd = (globals: &Global, cfg: &ServerConfig, bind_metrics_api: String) => {
-        FM_BIND_P2P: String = cfg.local.fed_bind.to_string();
-        FM_P2P_URL: String = cfg.local.p2p_endpoints[&cfg.local.identity].url.to_string();
-        FM_BIND_API: String = cfg.local.api_bind.to_string();
-        FM_BIND_METRICS_API: String = bind_metrics_api;
-        FM_API_URL: String = cfg.consensus.api_endpoints[&cfg.local.identity].url.to_string();
-        FM_DATA_DIR: PathBuf = mkdir(globals.FM_DATA_DIR.join(format!("server-{}", cfg.local.identity.to_usize()))).await?;
+    Fedimintd = (globals: &Global, params: ConfigGenParams) => {
+        FM_BIND_P2P: String = params.local.p2p_bind.to_string();
+        FM_BIND_API: String = params.local.api_bind.to_string();
+        FM_P2P_URL: String = params.consensus.peers[&params.local.our_id].p2p_url.to_string();
+        FM_API_URL: String = params.consensus.peers[&params.local.our_id].api_url.to_string();
+        FM_BIND_METRICS_API: String = format!("127.0.0.1:{}", 3510 + params.local.our_id.to_usize());
+        FM_DATA_DIR: PathBuf = mkdir(globals.FM_DATA_DIR.join(format!("server-{}", params.local.our_id.to_usize()))).await?;
     }
 }

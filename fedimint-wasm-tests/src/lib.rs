@@ -1,26 +1,24 @@
 use anyhow::Result;
 use fedimint_client::secret::PlainRootSecretStrategy;
-use fedimint_core::api::{GlobalFederationApi, WsClientConnectInfo, WsFederationApi};
+use fedimint_core::api::InviteCode;
 use fedimint_core::db::mem_impl::MemDatabase;
 use fedimint_ln_client::LightningClientGen;
 use fedimint_mint_client::MintClientGen;
 use fedimint_wallet_client::WalletClientGen;
 
-async fn client(connect_info: &WsClientConnectInfo) -> Result<fedimint_client::Client> {
-    let client = WsFederationApi::from_connect_info(&[connect_info.clone()]);
-    let cfg = client.download_client_config(connect_info).await?;
+async fn client(invite_code: &InviteCode) -> Result<fedimint_client::Client> {
     let mut builder = fedimint_client::ClientBuilder::default();
     builder.with_module(LightningClientGen);
     builder.with_module(MintClientGen);
     builder.with_module(WalletClientGen::default());
     builder.with_primary_module(1);
-    builder.with_config(cfg);
+    builder.with_invite_code(invite_code.clone());
     builder.with_database(MemDatabase::default());
     builder.build_stopped::<PlainRootSecretStrategy>().await
 }
 
 mod faucet {
-    pub async fn connect_string() -> anyhow::Result<String> {
+    pub async fn invite_code() -> anyhow::Result<String> {
         let resp = gloo_net::http::Request::get("http://localhost:15243/connect-string")
             .send()
             .await?;
@@ -54,7 +52,7 @@ mod faucet {
 
 wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 mod tests {
-    use fedimint_core::task::TaskGroup;
+    use fedimint_client::derivable_secret::DerivableSecret;
     use fedimint_core::Amount;
     use fedimint_ln_client::{LightningClientExt, LnPayState, LnReceiveState, PayType};
     use futures::StreamExt;
@@ -64,22 +62,21 @@ mod tests {
 
     #[wasm_bindgen_test]
     async fn build_client() -> Result<()> {
-        let _client = client(&faucet::connect_string().await?.parse()?).await?;
+        let _client = client(&faucet::invite_code().await?.parse()?).await?;
         Ok(())
     }
 
     #[wasm_bindgen_test]
     async fn receive() -> Result<()> {
-        let client = client(&faucet::connect_string().await?.parse()?).await?;
-        let mut tg = TaskGroup::new();
-        client.start_executor(&mut tg).await;
+        let client = client(&faucet::invite_code().await?.parse()?).await?;
+        client.start_executor().await;
         let gws = client.fetch_registered_gateways().await?;
         let lnd_gw = gws
             .into_iter()
             .find(|x| x.api.to_string() == "http://127.0.0.1:28175/")
             .expect("no gateway with api http://127.0.0.1:28175");
 
-        client.set_active_gateway(&lnd_gw.gateway_pub_key).await?;
+        client.set_active_gateway(&lnd_gw.gateway_id).await?;
         let (opid, invoice) = client
             .create_bolt11_invoice(Amount::from_sats(21), "test".to_string(), None)
             .await?;
@@ -98,18 +95,29 @@ mod tests {
         Err(anyhow::anyhow!("Lightning receive failed"))
     }
 
+    // Tests that ChaCha20 crypto functions used for backup and recovery are
+    // available in WASM at runtime. Related issue: https://github.com/fedimint/fedimint/issues/2843
+    #[wasm_bindgen_test]
+    async fn derive_chacha_key() {
+        let root_secret = DerivableSecret::new_root(&[0x42; 32], &[0x2a; 32]);
+        let key = root_secret.to_chacha20_poly1305_key();
+
+        // Prevent optimization
+        // FIXME: replace with `std::hint::black_box` once stabilized
+        assert!(format!("key: {key:?}").len() > 8);
+    }
+
     #[wasm_bindgen_test]
     async fn receive_and_pay() -> Result<()> {
-        let client = client(&faucet::connect_string().await?.parse()?).await?;
-        let mut tg = TaskGroup::new();
-        client.start_executor(&mut tg).await;
+        let client = client(&faucet::invite_code().await?.parse()?).await?;
+        client.start_executor().await;
         let gws = client.fetch_registered_gateways().await?;
         let lnd_gw = gws
             .into_iter()
             .find(|x| x.api.to_string() == "http://127.0.0.1:28175/")
             .expect("no gateway with api http://127.0.0.1:28175");
 
-        client.set_active_gateway(&lnd_gw.gateway_pub_key).await?;
+        client.set_active_gateway(&lnd_gw.gateway_id).await?;
         let (opid, invoice) = client
             .create_bolt11_invoice(Amount::from_sats(21), "test".to_string(), None)
             .await?;

@@ -2,8 +2,9 @@ pub mod audit;
 pub mod registry;
 pub mod version;
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::fmt::Debug;
+use std::collections::BTreeMap;
+use std::fmt::{Debug, Formatter};
+use std::io::Read;
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -21,8 +22,8 @@ use crate::config::{
     ServerModuleConsensusConfig,
 };
 use crate::core::{
-    Decoder, DecoderBuilder, Input, ModuleConsensusItem, ModuleInstanceId, ModuleKind, Output,
-    OutputOutcome,
+    ClientConfig, Decoder, DecoderBuilder, Input, ModuleConsensusItem, ModuleInstanceId,
+    ModuleKind, Output, OutputOutcome,
 };
 use crate::db::{
     Database, DatabaseKey, DatabaseKeyWithNotify, DatabaseRecord, DatabaseTransaction,
@@ -38,6 +39,7 @@ use crate::{
     OutPoint, PeerId,
 };
 
+#[derive(Debug)]
 pub struct InputMeta {
     pub amount: TransactionItemAmount,
     pub pub_keys: Vec<XOnlyPublicKey>,
@@ -94,9 +96,9 @@ impl ApiRequestErased {
         serde_json::to_value(self).expect("parameter serialization error - this should not happen")
     }
 
-    pub fn with_auth(self, auth: &ApiAuth) -> Self {
+    pub fn with_auth(self, auth: ApiAuth) -> Self {
         Self {
-            auth: Some(auth.clone()),
+            auth: Some(auth),
             params: self.params,
         }
     }
@@ -112,8 +114,14 @@ impl ApiRequestErased {
 }
 
 /// Authentication uses the hashed user password in PHC format
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApiAuth(pub String);
+
+impl Debug for ApiAuth {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ApiAuth(****)")
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ApiError {
@@ -135,7 +143,7 @@ impl ApiError {
     }
 
     pub fn unauthorized() -> Self {
-        Self::new(401, "Request missing required authorization".to_string())
+        Self::new(401, "Invalid authorization".to_string())
     }
 
     pub fn server_error(message: String) -> Self {
@@ -480,6 +488,7 @@ pub trait IServerModuleGen: IDynCommonModuleGen {
 
     fn get_client_config(
         &self,
+        module_instance_id: ModuleInstanceId,
         config: &ServerModuleConsensusConfig,
     ) -> anyhow::Result<ClientModuleConfig>;
 
@@ -520,6 +529,8 @@ impl AsRef<dyn IDynCommonModuleGen + Send + Sync + 'static> for DynServerModuleG
 pub trait CommonModuleGen: Debug + Sized {
     const CONSENSUS_VERSION: ModuleConsensusVersion;
     const KIND: ModuleKind;
+
+    type ClientConfig: ClientConfig;
 
     fn decoder() -> Decoder;
 }
@@ -599,7 +610,7 @@ pub trait ServerModuleGen: ExtendsCommonModuleGen + Sized {
     fn get_client_config(
         &self,
         config: &ServerModuleConsensusConfig,
-    ) -> anyhow::Result<ClientModuleConfig>;
+    ) -> anyhow::Result<<<Self as ExtendsCommonModuleGen>::Common as CommonModuleGen>::ClientConfig>;
 
     async fn dump_database(
         &self,
@@ -665,9 +676,15 @@ where
 
     fn get_client_config(
         &self,
+        module_instance_id: ModuleInstanceId,
         config: &ServerModuleConsensusConfig,
     ) -> anyhow::Result<ClientModuleConfig> {
-        <Self as ServerModuleGen>::get_client_config(self, config)
+        ClientModuleConfig::from_typed(
+            module_instance_id,
+            <Self as ServerModuleGen>::kind(),
+            config.version,
+            <Self as ServerModuleGen>::get_client_config(self, config)?,
+        )
     }
 
     async fn dump_database(
@@ -742,6 +759,7 @@ impl<CI> ConsensusProposal<CI> {
 
 /// Module associated types required by both client and server
 pub trait ModuleCommon {
+    type ClientConfig: ClientConfig;
     type Input: Input;
     type Output: Output;
     type OutputOutcome: OutputOutcome;
@@ -749,6 +767,7 @@ pub trait ModuleCommon {
 
     fn decoder_builder() -> DecoderBuilder {
         let mut decoder_builder = Decoder::builder();
+        decoder_builder.with_decodable_type::<Self::ClientConfig>();
         decoder_builder.with_decodable_type::<Self::Input>();
         decoder_builder.with_decodable_type::<Self::Output>();
         decoder_builder.with_decodable_type::<Self::OutputOutcome>();
@@ -792,19 +811,15 @@ pub trait ServerModule: Debug + Sized {
         dbtx: &mut ModuleDatabaseTransaction<'_>,
     ) -> ConsensusProposal<<Self::Common as ModuleCommon>::ConsensusItem>;
 
-    /// This function is called once before transaction processing starts.
-    ///
-    /// All module consensus items of this round are supplied as
-    /// `consensus_items`. The database transaction will be committed to the
-    /// database after all other modules ran `begin_consensus_epoch`, so the
-    /// results are available when processing transactions. Returns any
-    /// peers that need to be dropped.
-    async fn begin_consensus_epoch<'a, 'b>(
+    /// This function is called once for every consensus item. The function
+    /// returns an error if any only if the consensus item does not change
+    /// our state and therefore may be safely discarded by the atomic broadcast.
+    async fn process_consensus_item<'a, 'b>(
         &'a self,
         dbtx: &mut ModuleDatabaseTransaction<'b>,
-        consensus_items: Vec<(PeerId, <Self::Common as ModuleCommon>::ConsensusItem)>,
-        consensus_peers: &BTreeSet<PeerId>,
-    ) -> Vec<PeerId>;
+        consensus_item: <Self::Common as ModuleCommon>::ConsensusItem,
+        peer_id: PeerId,
+    ) -> anyhow::Result<()>;
 
     /// Some modules may have slow to verify inputs that would block transaction
     /// processing. If the slow part of verification can be modeled as a
@@ -816,43 +831,16 @@ pub trait ServerModule: Debug + Sized {
         inputs: impl Iterator<Item = &'a <Self::Common as ModuleCommon>::Input> + MaybeSend,
     ) -> Self::VerificationCache;
 
-    /// Validate a transaction input before submitting it to the unconfirmed
-    /// transaction pool. This function has no side effects and may be
-    /// called at any time. False positives due to outdated database state
-    /// are ok since they get filtered out after consensus has been reached on
-    /// them and merely generate a warning.
-    async fn validate_input<'a, 'b>(
-        &self,
-        dbtx: &mut ModuleDatabaseTransaction<'b>,
-        verification_cache: &Self::VerificationCache,
-        input: &'a <Self::Common as ModuleCommon>::Input,
-    ) -> Result<InputMeta, ModuleError>;
-
     /// Try to spend a transaction input. On success all necessary updates will
     /// be part of the database transaction. On failure (e.g. double spend)
     /// the database transaction is rolled back and the operation will take
     /// no effect.
-    ///
-    /// This function may only be called after `begin_consensus_epoch` and
-    /// before `end_consensus_epoch`. Data is only written to the database
-    /// once all transactions have been processed.
-    async fn apply_input<'a, 'b, 'c>(
+    async fn process_input<'a, 'b, 'c>(
         &'a self,
         dbtx: &mut ModuleDatabaseTransaction<'c>,
         input: &'b <Self::Common as ModuleCommon>::Input,
         verification_cache: &Self::VerificationCache,
     ) -> Result<InputMeta, ModuleError>;
-
-    /// Validate a transaction output before submitting it to the unconfirmed
-    /// transaction pool. This function has no side effects and may be
-    /// called at any time. False positives due to outdated database state
-    /// are ok since they get filtered out after consensus has been reached on
-    /// them and merely generate a warning.
-    async fn validate_output(
-        &self,
-        dbtx: &mut ModuleDatabaseTransaction<'_>,
-        output: &<Self::Common as ModuleCommon>::Output,
-    ) -> Result<TransactionItemAmount, ModuleError>;
 
     /// Try to create an output (e.g. issue notes, peg-out BTC, …). On success
     /// all necessary updates to the database will be part of the database
@@ -862,28 +850,12 @@ pub trait ServerModule: Debug + Sized {
     /// The supplied `out_point` identifies the operation (e.g. a peg-out or
     /// note issuance) and can be used to retrieve its outcome later using
     /// `output_status`.
-    ///
-    /// This function may only be called after `begin_consensus_epoch` and
-    /// before `end_consensus_epoch`. Data is only written to the database
-    /// once all transactions have been processed.
-    async fn apply_output<'a, 'b>(
+    async fn process_output<'a, 'b>(
         &'a self,
         dbtx: &mut ModuleDatabaseTransaction<'b>,
         output: &'a <Self::Common as ModuleCommon>::Output,
         out_point: OutPoint,
     ) -> Result<TransactionItemAmount, ModuleError>;
-
-    /// This function is called once all transactions have been processed and
-    /// changes were written to the database. This allows running
-    /// finalization code before the next epoch.
-    ///
-    /// Passes in the `consensus_peers` that contributed to this epoch and
-    /// returns a list of peers to drop if any are misbehaving.
-    async fn end_consensus_epoch<'a, 'b>(
-        &'a self,
-        consensus_peers: &BTreeSet<PeerId>,
-        dbtx: &mut ModuleDatabaseTransaction<'b>,
-    ) -> Vec<PeerId>;
 
     /// Retrieve the current status of the output. Depending on the module this
     /// might contain data needed by the client to access funds or give an
@@ -914,7 +886,10 @@ pub trait ServerModule: Debug + Sized {
 /// that holds the data as serialized
 // bytes internally.
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
-pub struct SerdeModuleEncoding<T: Encodable + Decodable>(Vec<u8>, #[serde(skip)] PhantomData<T>);
+pub struct SerdeModuleEncoding<T: Encodable + Decodable>(
+    #[serde(with = "::fedimint_core::encoding::as_hex")] Vec<u8>,
+    #[serde(skip)] PhantomData<T>,
+);
 
 impl<T: Encodable + Decodable> From<&T> for SerdeModuleEncoding<T> {
     fn from(value: &T) -> Self {
@@ -944,16 +919,25 @@ impl<T: Encodable + Decodable + 'static> SerdeModuleEncoding<T> {
         let module_instance =
             ModuleInstanceId::consensus_decode(&mut reader, &ModuleDecoderRegistry::default())?;
 
-        let _total_len =
-            u32::consensus_decode(&mut reader, &ModuleDecoderRegistry::default())? as usize;
+        let total_len = u64::consensus_decode(&mut reader, &ModuleDecoderRegistry::default())?;
+
+        let mut reader = reader.take(total_len);
 
         // No recursive module decoding is supported since we give an empty decoder
         // registry to the decode function
-        decoder.decode(
+        let val = decoder.decode(
             &mut reader,
             module_instance,
             &ModuleDecoderRegistry::default(),
-        )
+        )?;
+
+        if reader.limit() != 0 {
+            return Err(fedimint_core::encoding::DecodeError::new_custom(
+                anyhow::anyhow!("Dyn type did not consume all bytes during decoding"),
+            ));
+        }
+
+        Ok(val)
     }
 }
 

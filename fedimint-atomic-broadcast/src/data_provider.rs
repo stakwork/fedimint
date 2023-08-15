@@ -1,5 +1,7 @@
+use std::collections::BTreeSet;
+
 use aleph_bft::Keychain as KeychainTrait;
-use bitcoin_hashes::Hash;
+use bitcoin_hashes::{sha256, Hash};
 use tokio::sync::watch;
 
 use crate::consensus_hash_sha256;
@@ -39,6 +41,7 @@ pub struct DataProvider {
     keychain: Keychain,
     mempool_item_receiver: async_channel::Receiver<ConsensusItem>,
     signature_receiver: watch::Receiver<Option<[u8; 64]>>,
+    submitted_items: BTreeSet<sha256::Hash>,
     leftover_item: Option<Vec<u8>>,
 }
 
@@ -52,6 +55,7 @@ impl DataProvider {
             keychain,
             mempool_item_receiver,
             signature_receiver,
+            submitted_items: BTreeSet::new(),
             leftover_item: None,
         }
     }
@@ -72,20 +76,24 @@ impl aleph_bft::DataProvider<UnitData> for DataProvider {
 
         if let Some(item) = self.leftover_item.take() {
             if item.len() <= BYTE_LIMIT {
-                items.push(item);
+                if self.submitted_items.insert(consensus_hash_sha256(&item)) {
+                    items.push(item);
+                }
             } else {
                 tracing::error!("Consensus item length is over BYTE_LIMIT");
             }
         }
 
-        // if the channel is empty we want to return the batch immediatly in order to
+        // if the channel is empty we want to return the batch immediately in order to
         // not delay the creation of our next unit, even if the batch is empty
         while let Ok(item) = self.mempool_item_receiver.try_recv() {
             let n_bytes = items.iter().map(Vec::len).sum::<usize>();
 
             #[allow(clippy::int_plus_one)]
             if items.len() + 1 <= ITEM_LIMIT && n_bytes + item.len() <= BYTE_LIMIT {
-                items.push(item);
+                if self.submitted_items.insert(consensus_hash_sha256(&item)) {
+                    items.push(item);
+                }
             } else {
                 self.leftover_item = Some(item);
                 break;

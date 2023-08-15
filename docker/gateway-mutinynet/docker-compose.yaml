@@ -11,7 +11,7 @@ services:
       # Gateway webserver listen address
       - FM_GATEWAY_LISTEN_ADDR=0.0.0.0:8175
       # Public URL from which the webserver API is reachable
-      - FM_GATEWAY_API_ADDR=ws://gatewayd:8175
+      - FM_GATEWAY_API_ADDR=http://127.0.0.1:8175
       # Gateway webserver authentication password
       - FM_GATEWAY_PASSWORD=thereisnosecondbest
       # Configured gateway routing fees Format: <base_msat>,<proportional_millionths>
@@ -34,7 +34,7 @@ services:
     platform: linux/amd64
 
   gateway-ui:
-    image: fedimintui/gateway-ui:latest
+    image: fedimintui/gateway-ui:master
     # image: gateway-ui
     ports:
       - "0.0.0.0:3001:3001"
@@ -84,7 +84,7 @@ services:
     restart: always
 
   thunderhub:
-    image: apotdevin/thunderhub:base-v0.13.19
+    image: apotdevin/thunderhub:base-v0.13.20
     environment:
       - ACCOUNT_CONFIG_PATH=/thconfig/accounts.yaml
       - HOST=0.0.0.0
@@ -154,7 +154,7 @@ services:
     restart: always
 
   bitcoind:
-    image: fedimint/mutinynet-bitcoind:latest
+    image: fedimint/mutinynet-bitcoind:master
     command: --rpcuser=bitcoin --rpcpassword=bitcoin -zmqpubrawblock=tcp://[::]:48332 -zmqpubrawtx=tcp://[::]:48333
     ports:
       - 0.0.0.0:38333:38333

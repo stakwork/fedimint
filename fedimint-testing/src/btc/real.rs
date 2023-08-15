@@ -39,7 +39,7 @@ impl RealBitcoinTestNoLock {
 
 #[async_trait]
 impl BitcoinTest for RealBitcoinTestNoLock {
-    async fn lock_exclusive(&self) -> Box<dyn BitcoinTest + Send> {
+    async fn lock_exclusive(&self) -> Box<dyn BitcoinTest + Send + Sync> {
         unimplemented!(
             "You should never try to lock `RealBitcoinTestNoLock`. Lock `RealBitcoinTest` instead"
         )
@@ -52,18 +52,14 @@ impl BitcoinTest for RealBitcoinTestNoLock {
             .expect(Self::ERROR)
             .last()
         {
-            let block = self
+            let last_mined_block = self
                 .client
                 .get_block_header_info(block_hash)
                 .expect("rpc failed");
             // waits for the rpc client to catch up to bitcoind
-            loop {
-                let height = self.rpc.get_block_height().await.expect("rpc failed");
-
-                if height >= block.height as u64 {
-                    break;
-                }
-            }
+            while self.rpc.get_block_count().await.expect("rpc failed")
+                < last_mined_block.height as u64
+            {}
         };
     }
 
@@ -165,7 +161,7 @@ pub struct RealBitcoinTestLocked {
 
 #[async_trait]
 impl BitcoinTest for RealBitcoinTest {
-    async fn lock_exclusive(&self) -> Box<dyn BitcoinTest + Send> {
+    async fn lock_exclusive(&self) -> Box<dyn BitcoinTest + Send + Sync> {
         Box::new(RealBitcoinTestLocked {
             inner: self.inner.clone(),
             _guard: REAL_BITCOIN_LOCK.lock().await,
@@ -209,7 +205,7 @@ impl BitcoinTest for RealBitcoinTest {
 
 #[async_trait]
 impl BitcoinTest for RealBitcoinTestLocked {
-    async fn lock_exclusive(&self) -> Box<dyn BitcoinTest + Send> {
+    async fn lock_exclusive(&self) -> Box<dyn BitcoinTest + Send + Sync> {
         panic!("Double-locking would lead to a hang");
     }
 

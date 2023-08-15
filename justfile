@@ -11,7 +11,7 @@ check:
 
 # run `cargo clippy` on everything
 clippy:
-  cargo clippy --all --all-targets
+  cargo clippy --all --all-targets --deny warnings --allow deprecated
 
 # run `cargo clippy --fix` on everything
 clippy-fix:
@@ -62,19 +62,35 @@ final-check: lint
   just test
 
 check-wasm:
-  nix develop .#crossWasm -c cargo check --target wasm32-unknown-unknown --package fedimint-client-legacy
+  nix develop .#crossWasm -c cargo check --target wasm32-unknown-unknown --package fedimint-client
 
 [no-exit-message]
 typos:
   #!/usr/bin/env bash
-  >&2 echo '💡 Valid new words can be added to `_typos.toml`'
-  typos
+  set -eo pipefail
+
+  git_ls_files="$(git ls-files)"
+  git_ls_nonbinary_files="$(echo "$git_ls_files" | xargs file --mime | grep -v "; charset=binary" | cut -d: -f1)"
+
+  if ! echo "$git_ls_nonbinary_files" | parallel typos {} ; then
+    >&2 echo "Typos found: Valid new words can be added to '_typos.toml'"
+    return 1
+  fi
+
 
 [no-exit-message]
 typos-fix-all:
   #!/usr/bin/env bash
-  >&2 echo '💡 Valid new words can be added to `_typos.toml`'
-  typos --write-changes
+  set -eo pipefail
+
+  git_ls_files="$(git ls-files)"
+  git_ls_nonbinary_files="$(echo "$git_ls_files" | xargs file --mime | grep -v "; charset=binary" | cut -d: -f1)"
+
+  if ! echo "$git_ls_nonbinary_files" | parallel typos -w {} ; then
+    >&2 echo "Typos found: Valid new words can be added to '_typos.toml'"
+    # TODO: not enforcing anything right, just being annoying in the CLI
+    # return 1
+  fi
 
 # run code formatters
 format:

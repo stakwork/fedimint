@@ -8,9 +8,7 @@ use fedimint_core::core::{
     LEGACY_HARDCODED_INSTANCE_ID_WALLET,
 };
 use fedimint_core::module::ApiRequestErased;
-use fedimint_core::query::{
-    CurrentConsensus, EventuallyConsistent, UnionResponses, UnionResponsesSingle,
-};
+use fedimint_core::query::{ThresholdConsensus, UnionResponses, UnionResponsesSingle};
 use fedimint_core::task::{MaybeSend, MaybeSync};
 use fedimint_core::{apply, async_trait_maybe_send, NumPeers};
 use fedimint_mint_client::common::db::ECashUserBackupSnapshot;
@@ -57,7 +55,7 @@ where
     async fn fetch_gateways(&self) -> FederationResult<Vec<LightningGateway>> {
         self.with_module(LEGACY_HARDCODED_INSTANCE_ID_LN)
             .request_with_strategy(
-                UnionResponses::new(self.all_members().threshold()),
+                UnionResponses::new(self.all_peers().total()),
                 "list_gateways".to_string(),
                 ApiRequestErased::default(),
             )
@@ -67,7 +65,7 @@ where
     async fn register_gateway(&self, gateway: &LightningGateway) -> FederationResult<()> {
         self.with_module(LEGACY_HARDCODED_INSTANCE_ID_LN)
             .request_with_strategy(
-                CurrentConsensus::new(self.all_members().threshold()),
+                ThresholdConsensus::new(self.all_peers().total()),
                 "register_gateway".to_string(),
                 ApiRequestErased::new(gateway),
             )
@@ -109,7 +107,7 @@ where
     ) -> FederationResult<()> {
         self.with_module(LEGACY_HARDCODED_INSTANCE_ID_MINT)
             .request_with_strategy(
-                CurrentConsensus::new(self.all_members().threshold()),
+                ThresholdConsensus::new(self.all_peers().total()),
                 "backup".to_string(),
                 ApiRequestErased::new(request),
             )
@@ -123,7 +121,7 @@ where
             .with_module(LEGACY_HARDCODED_INSTANCE_ID_MINT)
             .request_with_strategy(
                 UnionResponsesSingle::<Option<ECashUserBackupSnapshot>>::new(
-                    self.all_members().threshold(),
+                    self.all_peers().total(),
                 ),
                 "recover".to_string(),
                 ApiRequestErased::new(id),
@@ -137,7 +135,7 @@ where
 
 #[apply(async_trait_maybe_send!)]
 pub trait WalletFederationApi {
-    async fn fetch_consensus_block_height(&self) -> FederationResult<u64>;
+    async fn fetch_consensus_block_count(&self) -> FederationResult<u64>;
     async fn fetch_peg_out_fees(
         &self,
         address: &Address,
@@ -150,11 +148,11 @@ impl<T: ?Sized> WalletFederationApi for T
 where
     T: IFederationApi + MaybeSend + MaybeSync + 'static,
 {
-    async fn fetch_consensus_block_height(&self) -> FederationResult<u64> {
+    async fn fetch_consensus_block_count(&self) -> FederationResult<u64> {
         self.with_module(LEGACY_HARDCODED_INSTANCE_ID_WALLET)
             .request_with_strategy(
-                EventuallyConsistent::new(self.all_members().one_honest()),
-                "block_height".to_string(),
+                ThresholdConsensus::new(self.all_peers().total()),
+                "block_count".to_string(),
                 ApiRequestErased::default(),
             )
             .await
@@ -166,7 +164,7 @@ where
         amount: bitcoin::Amount,
     ) -> FederationResult<Option<PegOutFees>> {
         self.with_module(LEGACY_HARDCODED_INSTANCE_ID_WALLET)
-            .request_eventually_consistent(
+            .request_current_consensus(
                 "peg_out_fees".to_string(),
                 ApiRequestErased::new((address, amount.to_sat())),
             )

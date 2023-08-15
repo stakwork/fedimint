@@ -1,8 +1,8 @@
 use std::fmt;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, Context};
 use async_trait::async_trait;
 use fedimint_core::task::{sleep, TaskGroup};
 use secp256k1::PublicKey;
@@ -18,16 +18,17 @@ use tonic_lnd::routerrpc::{
 };
 use tonic_lnd::tonic::Code;
 use tonic_lnd::{connect, Client as LndClient};
-use tracing::{error, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::gatewaylnrpc::get_route_hints_response::{RouteHint, RouteHintHop};
 use crate::gatewaylnrpc::intercept_htlc_response::{Action, Cancel, Forward, Settle};
 use crate::gatewaylnrpc::{
-    GetNodeInfoResponse, GetRouteHintsResponse, InterceptHtlcRequest, InterceptHtlcResponse,
-    PayInvoiceRequest, PayInvoiceResponse,
+    EmptyResponse, GetNodeInfoResponse, GetRouteHintsResponse, InterceptHtlcRequest,
+    InterceptHtlcResponse, PayInvoiceRequest, PayInvoiceResponse,
 };
-use crate::lnrpc_client::{ILnRpcClient, RouteHtlcStream, MAX_LIGHTNING_RETRIES};
-use crate::GatewayError;
+use crate::lnrpc_client::{
+    ILnRpcClient, LightningRpcError, RouteHtlcStream, MAX_LIGHTNING_RETRIES,
+};
 
 type HtlcSubscriptionSender = mpsc::Sender<Result<InterceptHtlcRequest, Status>>;
 
@@ -38,10 +39,16 @@ pub struct GatewayLndClient {
     address: String,
     tls_cert: String,
     macaroon: String,
+    lnd_sender: Option<mpsc::Sender<ForwardHtlcInterceptResponse>>,
 }
 
 impl GatewayLndClient {
-    pub async fn new(address: String, tls_cert: String, macaroon: String) -> Self {
+    pub async fn new(
+        address: String,
+        tls_cert: String,
+        macaroon: String,
+        lnd_sender: Option<mpsc::Sender<ForwardHtlcInterceptResponse>>,
+    ) -> Self {
         info!(
             "Gateway configured to connect to LND LnRpcClient at \n address: {},\n tls cert path: {},\n macaroon path: {} ",
             address, tls_cert, macaroon
@@ -50,6 +57,7 @@ impl GatewayLndClient {
             address,
             tls_cert,
             macaroon,
+            lnd_sender,
         }
     }
 
@@ -57,13 +65,11 @@ impl GatewayLndClient {
         address: String,
         tls_cert: String,
         macaroon: String,
-    ) -> crate::Result<LndClient> {
+    ) -> Result<LndClient, LightningRpcError> {
         let mut retries = 0;
         let client = loop {
             if retries >= MAX_LIGHTNING_RETRIES {
-                return Err(GatewayError::Other(anyhow::anyhow!(
-                    "Failed to connect to LND"
-                )));
+                return Err(LightningRpcError::FailedToConnect);
             }
 
             retries += 1;
@@ -71,7 +77,7 @@ impl GatewayLndClient {
             match connect(address.clone(), tls_cert.clone(), macaroon.clone()).await {
                 Ok(client) => break client,
                 Err(e) => {
-                    tracing::warn!("Couldn't connect to LND, retrying in 1 second... {e:?}");
+                    tracing::debug!("Couldn't connect to LND, retrying in 1 second... {e:?}");
                     sleep(Duration::from_secs(1)).await;
                 }
             }
@@ -85,27 +91,38 @@ impl GatewayLndClient {
         task_group: &mut TaskGroup,
         lnd_sender: mpsc::Sender<ForwardHtlcInterceptResponse>,
         lnd_rx: mpsc::Receiver<ForwardHtlcInterceptResponse>,
-        actor_sender: HtlcSubscriptionSender,
-    ) -> crate::Result<()> {
+        gateway_sender: HtlcSubscriptionSender,
+    ) -> Result<(), LightningRpcError> {
         let mut client = Self::connect(
             self.address.clone(),
             self.tls_cert.clone(),
             self.macaroon.clone(),
         )
         .await?;
+
+        // Verify that LND is reachable via RPC before attempting to spawn a new thread
+        // that will intercept HTLCs.
+        client
+            .lightning()
+            .get_info(GetInfoRequest {})
+            .await
+            .map_err(|status| LightningRpcError::FailedToGetNodeInfo {
+                failure_reason: format!("Failed to get node info {status:?}"),
+            })?;
+
         task_group
             .spawn("LND HTLC Subscription", move |_handle| async move {
                 let mut htlc_stream = match client
                     .router()
                     .htlc_interceptor(ReceiverStream::new(lnd_rx))
                     .await
-                    .map_err(|e| {
-                        error!("Failed to connect to lnrpc server: {:?}", e);
-                        GatewayError::Other(anyhow!("Failed to subscribe to LND htlc stream"))
+                    .map_err(|e| LightningRpcError::FailedToGetRouteHints {
+                        failure_reason: format!("Failed to subscribe to LND htlc stream {e:?}"),
                     }) {
                     Ok(stream) => stream.into_inner(),
                     Err(e) => {
-                        error!("Failed to establish htlc stream: {:?}", e);
+                        error!("Failed to establish htlc stream");
+                        debug!("Error: {:?}", e);
                         return;
                     }
                 };
@@ -113,7 +130,7 @@ impl GatewayLndClient {
                 while let Some(htlc) = match htlc_stream.message().await {
                     Ok(htlc) => htlc,
                     Err(e) => {
-                        error!("Error received over HTLC subscription: {:?}", e);
+                        error!("Error received over HTLC stream: {:?}", e);
                         None
                     }
                 } {
@@ -138,7 +155,7 @@ impl GatewayLndClient {
                         next_onion: htlc.onion_blob,
                     };
 
-                    match actor_sender.send(Ok(intercept)).await {
+                    match gateway_sender.send(Ok(intercept)).await {
                         Ok(_) => {}
                         Err(e) => {
                             error!("Failed to send HTLC to gatewayd for processing: {:?}", e);
@@ -156,39 +173,10 @@ impl GatewayLndClient {
         Ok(())
     }
 
-    async fn forward_htlc(
-        incoming_circuit_key: CircuitKey,
-        lnd_sender: mpsc::Sender<ForwardHtlcInterceptResponse>,
-    ) -> crate::Result<()> {
-        let response = ForwardHtlcInterceptResponse {
-            incoming_circuit_key: Some(incoming_circuit_key),
-            action: ResolveHoldForwardAction::Resume.into(),
-            preimage: vec![],
-            failure_message: vec![],
-            failure_code: FailureCode::TemporaryChannelFailure.into(),
-        };
-        Self::send_lnd_response(lnd_sender, response).await
-    }
-
-    async fn settle_htlc(
-        key: CircuitKey,
-        preimage: Vec<u8>,
-        lnd_sender: mpsc::Sender<ForwardHtlcInterceptResponse>,
-    ) -> crate::Result<()> {
-        let response = ForwardHtlcInterceptResponse {
-            incoming_circuit_key: Some(key),
-            action: ResolveHoldForwardAction::Settle.into(),
-            preimage,
-            failure_message: vec![],
-            failure_code: FailureCode::TemporaryChannelFailure.into(),
-        };
-        Self::send_lnd_response(lnd_sender, response).await
-    }
-
     async fn cancel_htlc(
         key: CircuitKey,
         lnd_sender: mpsc::Sender<ForwardHtlcInterceptResponse>,
-    ) -> crate::Result<()> {
+    ) -> Result<(), LightningRpcError> {
         // TODO: Specify a failure code and message
         let response = ForwardHtlcInterceptResponse {
             incoming_circuit_key: Some(key),
@@ -203,12 +191,14 @@ impl GatewayLndClient {
     async fn send_lnd_response(
         lnd_sender: mpsc::Sender<ForwardHtlcInterceptResponse>,
         response: ForwardHtlcInterceptResponse,
-    ) -> crate::Result<()> {
+    ) -> Result<(), LightningRpcError> {
         // TODO: Consider retrying this if the send fails
-        lnd_sender.send(response).await.map_err(|_| {
-            GatewayError::Other(anyhow::anyhow!(
-                "Failed to send ForwardHtlcInterceptResponse to LND"
-            ))
+        lnd_sender.send(response).await.map_err(|send_error| {
+            LightningRpcError::FailedToCompleteHtlc {
+                failure_reason: format!(
+                    "Failed to send ForwardHtlcInterceptResponse to LND {send_error:?}"
+                ),
+            }
         })
     }
 
@@ -216,7 +206,7 @@ impl GatewayLndClient {
         &self,
         payment_hash: Vec<u8>,
         client: &mut LndClient,
-    ) -> Result<Option<String>, GatewayError> {
+    ) -> Result<Option<String>, LightningRpcError> {
         // Loop until we successfully get the status of the payment, or determine that
         // the payment has not been made yet.
         loop {
@@ -231,20 +221,21 @@ impl GatewayLndClient {
             match payments {
                 Ok(payments) => {
                     // Block until LND returns the completed payment
-                    if let Some(payment) = payments
-                        .into_inner()
-                        .message()
-                        .await
-                        .map_err(|_| GatewayError::ClientNgError)?
+                    if let Some(payment) =
+                        payments.into_inner().message().await.map_err(|status| {
+                            LightningRpcError::FailedPayment {
+                                failure_reason: status.message().to_string(),
+                            }
+                        })?
                     {
                         if payment.status() == PaymentStatus::Succeeded {
                             return Ok(Some(payment.payment_preimage));
                         }
 
                         let failure_reason = payment.failure_reason();
-                        return Err(GatewayError::Other(anyhow!(
-                            "LND payment failed. Failure Reason: {failure_reason:?}"
-                        )));
+                        return Err(LightningRpcError::FailedPayment {
+                            failure_reason: format!("{failure_reason:?}"),
+                        });
                     }
                 }
                 Err(e) => {
@@ -270,7 +261,7 @@ impl fmt::Debug for GatewayLndClient {
 
 #[async_trait]
 impl ILnRpcClient for GatewayLndClient {
-    async fn info(&self) -> crate::Result<GetNodeInfoResponse> {
+    async fn info(&self) -> Result<GetNodeInfoResponse, LightningRpcError> {
         let mut client = Self::connect(
             self.address.clone(),
             self.tls_cert.clone(),
@@ -281,20 +272,17 @@ impl ILnRpcClient for GatewayLndClient {
             .lightning()
             .get_info(GetInfoRequest {})
             .await
-            .map_err(|e| {
-                GatewayError::LnRpcError(tonic::Status::new(
-                    tonic::Code::Internal,
-                    format!("LND error: {e:?}"),
-                ))
+            .map_err(|status| LightningRpcError::FailedToGetNodeInfo {
+                failure_reason: format!("Failed to get node info {status:?}"),
             })?
             .into_inner();
 
-        let pub_key: PublicKey = info.identity_pubkey.parse().map_err(|e| {
-            GatewayError::LnRpcError(tonic::Status::new(
-                tonic::Code::Internal,
-                format!("LND error: {e:?}"),
-            ))
-        })?;
+        let pub_key: PublicKey =
+            info.identity_pubkey
+                .parse()
+                .map_err(|e| LightningRpcError::FailedToGetNodeInfo {
+                    failure_reason: format!("Failed to parse public key {e:?}"),
+                })?;
 
         return Ok(GetNodeInfoResponse {
             pub_key: pub_key.serialize().to_vec(),
@@ -302,7 +290,7 @@ impl ILnRpcClient for GatewayLndClient {
         });
     }
 
-    async fn routehints(&self) -> crate::Result<GetRouteHintsResponse> {
+    async fn routehints(&self) -> Result<GetRouteHintsResponse, LightningRpcError> {
         let mut client = Self::connect(
             self.address.clone(),
             self.tls_cert.clone(),
@@ -319,11 +307,8 @@ impl ILnRpcClient for GatewayLndClient {
                 peer: vec![],
             })
             .await
-            .map_err(|e| {
-                GatewayError::LnRpcError(tonic::Status::new(
-                    tonic::Code::Internal,
-                    format!("LND error: {e:?}"),
-                ))
+            .map_err(|status| LightningRpcError::FailedToGetRouteHints {
+                failure_reason: format!("Failed to list channels {status:?}"),
             })?
             .into_inner();
 
@@ -335,11 +320,8 @@ impl ILnRpcClient for GatewayLndClient {
                     chan_id: chan.chan_id,
                 })
                 .await
-                .map_err(|e| {
-                    GatewayError::LnRpcError(tonic::Status::new(
-                        tonic::Code::Internal,
-                        format!("LND error: {e:?}"),
-                    ))
+                .map_err(|status| LightningRpcError::FailedToGetRouteHints {
+                    failure_reason: format!("Failed to get channel info {status:?}"),
                 })?
                 .into_inner();
 
@@ -375,7 +357,10 @@ impl ILnRpcClient for GatewayLndClient {
         Ok(GetRouteHintsResponse { route_hints })
     }
 
-    async fn pay(&self, request: PayInvoiceRequest) -> crate::Result<PayInvoiceResponse> {
+    async fn pay(
+        &self,
+        request: PayInvoiceRequest,
+    ) -> Result<PayInvoiceResponse, LightningRpcError> {
         let PayInvoiceRequest {
             invoice,
             max_fee_msat,
@@ -395,15 +380,23 @@ impl ILnRpcClient for GatewayLndClient {
             .lookup_payment(payment_hash.clone(), &mut client)
             .await?
         {
-            bitcoin_hashes::hex::FromHex::from_hex(preimage.as_str())
-                .map_err(|_| anyhow::anyhow!("Failed to convert preimage"))?
+            bitcoin_hashes::hex::FromHex::from_hex(preimage.as_str()).map_err(|error| {
+                LightningRpcError::FailedPayment {
+                    failure_reason: format!("Failed to convert preimage {error:?}"),
+                }
+            })?
         } else {
             // LND API allows fee limits in the `i64` range, but we use `u64` for
             // max_fee_msat. This means we can only set an enforceable fee limit
             // between 0 and i64::MAX
-            let fee_limit_msat: i64 = max_fee_msat
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("max_fee_msat exceeds valid LND fee limit ranges"))?;
+            let fee_limit_msat: i64 =
+                max_fee_msat
+                    .try_into()
+                    .map_err(|error| LightningRpcError::FailedPayment {
+                        failure_reason: format!(
+                            "max_fee_msat exceeds valid LND fee limit ranges {error:?}"
+                        ),
+                    })?;
 
             let payments = client
                 .router()
@@ -416,29 +409,33 @@ impl ILnRpcClient for GatewayLndClient {
                     ..Default::default()
                 })
                 .await
-                .map_err(|e| {
-                    GatewayError::Other(anyhow!("Failed to make outgoing payment: {e:?}"))
+                .map_err(|status| LightningRpcError::FailedPayment {
+                    failure_reason: format!("Failed to make outgoing payment {status:?}"),
                 })?;
 
-            match payments
-                .into_inner()
-                .message()
-                .await
-                .context("Failed to get payment status")?
-            {
+            match payments.into_inner().message().await.map_err(|error| {
+                LightningRpcError::FailedPayment {
+                    failure_reason: format!("Failed to get payment status {error:?}"),
+                }
+            })? {
                 Some(payment) if payment.status() == PaymentStatus::Succeeded => {
                     bitcoin_hashes::hex::FromHex::from_hex(payment.payment_preimage.as_str())
-                        .context("Failed to convert preimage")?
+                        .map_err(|error| LightningRpcError::FailedPayment {
+                            failure_reason: format!("Failed to convert preimage {error:?}"),
+                        })?
                 }
                 Some(payment) => {
-                    return Err(GatewayError::Other(anyhow!(
-                        "LND failed to complete payment: {payment:?}"
-                    )));
+                    let failure_reason = payment.failure_reason();
+                    return Err(LightningRpcError::FailedPayment {
+                        failure_reason: format!("{failure_reason:?}"),
+                    });
                 }
                 None => {
-                    return Err(GatewayError::Other(anyhow!(
-                        "Failed to get payment status for payment_hash {payment_hash:?}"
-                    )));
+                    return Err(LightningRpcError::FailedPayment {
+                        failure_reason: format!(
+                            "Failed to get payment status for payment hash {payment_hash:?}"
+                        ),
+                    });
                 }
             }
         };
@@ -447,59 +444,77 @@ impl ILnRpcClient for GatewayLndClient {
     }
 
     async fn route_htlcs<'a>(
-        &mut self,
-        events: ReceiverStream<InterceptHtlcResponse>,
+        self: Box<Self>,
         task_group: &mut TaskGroup,
-    ) -> Result<RouteHtlcStream<'a>, GatewayError> {
+    ) -> Result<(RouteHtlcStream<'a>, Arc<dyn ILnRpcClient>), LightningRpcError> {
         const CHANNEL_SIZE: usize = 100;
 
-        // Channel to send intercepted htlc to actor for processing
-        // actor_sender needs to be saved when the scid is received
-        let (actor_sender, actor_receiver) =
+        // Channel to send intercepted htlc to the gateway for processing
+        let (gateway_sender, gateway_receiver) =
             mpsc::channel::<Result<InterceptHtlcRequest, tonic::Status>>(CHANNEL_SIZE);
 
         let (lnd_sender, lnd_rx) = mpsc::channel::<ForwardHtlcInterceptResponse>(CHANNEL_SIZE);
-        self.spawn_interceptor(task_group, lnd_sender.clone(), lnd_rx, actor_sender.clone())
-            .await?;
 
-        let mut stream = events.into_inner();
-        task_group.spawn("LND Route HTLCs", |_handle| async move {
-            while let Some(request) = stream.recv().await {
-                let InterceptHtlcResponse {
-                    action,
-                    incoming_chan_id,
+        self.spawn_interceptor(
+            task_group,
+            lnd_sender.clone(),
+            lnd_rx,
+            gateway_sender.clone(),
+        )
+        .await?;
+        let new_client = Arc::new(
+            Self::new(
+                self.address.clone(),
+                self.tls_cert.clone(),
+                self.macaroon.clone(),
+                Some(lnd_sender.clone()),
+            )
+            .await,
+        );
+        Ok((Box::pin(ReceiverStream::new(gateway_receiver)), new_client))
+    }
+
+    async fn complete_htlc(
+        &self,
+        htlc: InterceptHtlcResponse,
+    ) -> Result<EmptyResponse, LightningRpcError> {
+        if let Some(lnd_sender) = self.lnd_sender.clone() {
+            let InterceptHtlcResponse {
+                action,
+                incoming_chan_id,
+                htlc_id,
+            } = htlc;
+
+            let (action, preimage) = match action {
+                Some(Action::Settle(Settle { preimage })) => {
+                    (ResolveHoldForwardAction::Settle.into(), preimage)
+                }
+                Some(Action::Cancel(Cancel { reason: _ })) => {
+                    (ResolveHoldForwardAction::Fail.into(), vec![])
+                }
+                Some(Action::Forward(Forward {})) => {
+                    (ResolveHoldForwardAction::Resume.into(), vec![])
+                }
+                None => (ResolveHoldForwardAction::Fail.into(), vec![]),
+            };
+
+            let response = ForwardHtlcInterceptResponse {
+                incoming_circuit_key: Some(CircuitKey {
+                    chan_id: incoming_chan_id,
                     htlc_id,
-                } = request;
+                }),
+                action,
+                preimage,
+                failure_message: vec![],
+                failure_code: FailureCode::TemporaryChannelFailure.into(),
+            };
 
-                match action {
-                    Some(Action::Settle(Settle { preimage })) => {
-                        let _ = Self::settle_htlc(CircuitKey { chan_id: incoming_chan_id, htlc_id }, preimage, lnd_sender.clone()).await.map_err(|e| {
-                            error!("Failed to settle HTLC: {:?}", e);
-                        });
-                    },
-                    Some(Action::Cancel(Cancel { reason: _ })) => {
-                        let _ = Self::cancel_htlc(CircuitKey { chan_id: incoming_chan_id, htlc_id }, lnd_sender.clone()).await.map_err(|e| {
-                            error!("Failed to cancel HTLC: {:?}", e);
-                        });
-                    },
-                    Some(Action::Forward(Forward { })) => {
-                        let _ = Self::forward_htlc(CircuitKey { chan_id: incoming_chan_id, htlc_id }, lnd_sender.clone())
-                            .await
-                            .map_err(|e| {
-                                error!("Failed to forward HTLC: {:?}", e);
-                            });
-                    }
-                    None => {
-                        error!("No action specified for intercepted htlc. This should not happen. ChanId: {} HTLC ID: {}", incoming_chan_id, htlc_id);
-                        let _ = Self::cancel_htlc(CircuitKey { chan_id: incoming_chan_id, htlc_id }, lnd_sender.clone()).await.map_err(|e| {
-                            error!("Failed to cancel HTLC: {:?}", e);
-                        });
-                    }
-                };
-            }
+            Self::send_lnd_response(lnd_sender, response).await?;
+            return Ok(EmptyResponse {});
+        }
+
+        Err(LightningRpcError::FailedToCompleteHtlc {
+            failure_reason: "Gatewayd has not started to route HTLCs".to_string(),
         })
-        .await;
-
-        Ok(Box::pin(ReceiverStream::new(actor_receiver)))
     }
 }

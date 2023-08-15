@@ -1,4 +1,3 @@
-use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -27,7 +26,10 @@ pub trait LightningTest: ILnRpcClient {
     ) -> ln_gateway::Result<Invoice>;
 
     /// Creates an invoice that is not payable
-    fn invalid_invoice(
+    ///
+    /// * Mocks use hard-coded invoice description to fail the payment
+    /// * Real fixtures won't be able to route to randomly generated node pubkey
+    fn unpayable_invoice(
         &self,
         amount: Amount,
         expiry_time: Option<u64>,
@@ -39,6 +41,7 @@ pub trait LightningTest: ILnRpcClient {
         // `FakeLightningTest` will fail to pay any invoice with
         // `INVALID_INVOICE_DESCRIPTION` in the description of the invoice.
         Ok(InvoiceBuilder::new(Currency::Regtest)
+            .payee_pub_key(kp.public_key())
             .description(INVALID_INVOICE_DESCRIPTION.to_string())
             .payment_hash(sha256::Hash::hash(&Preimage([0; 32]).0))
             .current_timestamp()
@@ -52,11 +55,8 @@ pub trait LightningTest: ILnRpcClient {
             .unwrap())
     }
 
-    /// Returns the amount that the gateway LN node has sent
-    async fn amount_sent(&self) -> Amount;
-
     /// Is this a LN instance shared with other tests
     fn is_shared(&self) -> bool;
 
-    fn as_rpc(&self) -> Arc<dyn ILnRpcClient>;
+    fn listening_address(&self) -> String;
 }

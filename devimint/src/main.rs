@@ -9,9 +9,10 @@ use bitcoincore_rpc::bitcoin::Txid;
 use clap::{Parser, Subcommand};
 use cln_rpc::primitives::{Amount as ClnRpcAmount, AmountOrAny};
 use devimint::federation::{Federation, Fedimintd};
-use devimint::util::{poll, poll_value, ProcessManager};
+use devimint::util::{poll, poll_max_retries, poll_value, ProcessManager};
 use devimint::{
-    cmd, dev_fed, external_daemons, vars, Bitcoind, DevFed, LightningNode, Lightningd, Lnd,
+    cmd, dev_fed, external_daemons, vars, Bitcoind, DevFed, Gatewayd, LightningNode, Lightningd,
+    Lnd,
 };
 use fedimint_cli::LnInvoiceResponse;
 use fedimint_core::task::TaskGroup;
@@ -19,7 +20,7 @@ use fedimint_core::util::write_overwrite_async;
 use fedimint_logging::LOG_DEVIMINT;
 use tokio::fs;
 use tokio::net::TcpStream;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 pub async fn latency_tests(dev_fed: DevFed) -> Result<()> {
     #[allow(unused_variables)]
@@ -151,7 +152,7 @@ async fn cli_tests(dev_fed: DevFed) -> Result<()> {
         "--in-file={data_dir}/server-0/private.encrypt",
         "--out-file={data_dir}/server-0/config-plaintext.json"
     )
-    .env("FM_PASSWORD", "pass0")
+    .env("FM_PASSWORD", "pass")
     .run()
     .await?;
 
@@ -180,13 +181,13 @@ async fn cli_tests(dev_fed: DevFed) -> Result<()> {
     // Test load last epoch with admin client
     info!("Testing load last epoch with admin client");
     let epoch_json = cmd!(fed, "admin", "last-epoch")
-        .env("FM_PASSWORD", "pass0")
+        .env("FM_PASSWORD", "pass")
         .env("FM_OUR_ID", "0")
         .out_json()
         .await?;
     let epoch_hex = epoch_json["hex_outcome"].as_str().unwrap();
     let _force_epoch = cmd!(fed, "admin", "force-epoch", epoch_hex)
-        .env("FM_PASSWORD", "pass0")
+        .env("FM_PASSWORD", "pass")
         .env("FM_OUR_ID", "0")
         .out_json()
         .await?;
@@ -202,34 +203,29 @@ async fn cli_tests(dev_fed: DevFed) -> Result<()> {
 
     fed.pegin_gateway(99_999, &gw_cln).await?;
 
-    let connect_string = fs::read_to_string(format!("{data_dir}/client-connect")).await?;
-    fs::remove_file(format!("{data_dir}/client.json")).await?;
-    cmd!(fed, "join-federation", connect_string.clone())
-        .run()
-        .await?;
-
     let fed_id = fed.federation_id().await;
-    let connect_info = cmd!(fed, "dev", "decode-connect-info", connect_string.clone())
+    let invite = fed.invite_code()?;
+    let invite_code = cmd!(fed, "dev", "decode-invite-code", invite.clone())
         .out_json()
         .await?;
     anyhow::ensure!(
         cmd!(
             fed,
             "dev",
-            "encode-connect-info",
-            format!("--url={}", connect_info["url"].as_str().unwrap()),
+            "encode-invite-code",
+            format!("--url={}", invite_code["url"].as_str().unwrap()),
             format!(
                 "--download-token={}",
-                connect_info["download_token"].as_str().unwrap()
+                invite_code["download_token"].as_str().unwrap()
             ),
             "--id={fed_id}"
         )
         .out_json()
-        .await?["connect_info"]
+        .await?["invite_code"]
             .as_str()
             .unwrap()
-            == connect_string,
-        "failed to decode and encode the client connection info string",
+            == invite,
+        "failed to decode and encode the client invite code",
     );
 
     // Test that LND and CLN can still send directly to each other
@@ -321,6 +317,20 @@ async fn cli_tests(dev_fed: DevFed) -> Result<()> {
     assert_eq!(initial_client_balance, 0);
 
     fed.pegin(CLIENT_START_AMOUNT / 1000).await?;
+
+    // Check log contains deposit
+    let operation = cmd!(fed, "list-operations")
+        .out_json()
+        .await?
+        .get("operations")
+        .expect("Output didn't contain operation log")
+        .as_array()
+        .unwrap()
+        .first()
+        .unwrap()
+        .to_owned();
+    assert_eq!(operation["operation_kind"].as_str().unwrap(), "wallet");
+    assert_eq!(operation["outcome"].as_str().unwrap(), "Claimed");
 
     info!("Testing backup&restore");
     // TODO: make sure there are no in-progress operations involved
@@ -668,6 +678,7 @@ async fn cli_load_test_tool_test(dev_fed: DevFed) -> Result<()> {
     let data_dir = env::var("FM_DATA_DIR")?;
     let load_test_temp = PathBuf::from(data_dir).join("load-test-temp");
     dev_fed.fed.pegin(10_000).await?;
+    let invite_code = dev_fed.fed.invite_code()?;
     let output = cmd!(
         "fedimint-load-test-tool",
         "--archive-dir",
@@ -678,7 +689,9 @@ async fn cli_load_test_tool_test(dev_fed: DevFed) -> Result<()> {
         "--notes-per-user",
         "1",
         "--generate-invoice-with",
-        "cln-lightning-cli"
+        "cln-lightning-cli",
+        "--invite-code",
+        invite_code.clone()
     )
     .out_string()
     .await?;
@@ -744,39 +757,41 @@ async fn cli_tests_backup_and_restore(fed_cli: &Federation) -> Result<()> {
     // once (at the very beginning) and we used a fixed operation id for it.
     // Testing restore in different setups would require multiple clients,
     // which is a larger refactor.
-    // {
-    //     let _ = cmd!(fed_cli, "wipe", "--force",).out_json().await?;
-
-    //     assert_eq!(
-    //         0,
-    //         cmd!(fed_cli, "info").out_json().await?["total_msat"]
-    //             .as_u64()
-    //             .unwrap()
-    //     );
-    //     let _ = cmd!(fed_cli, "restore", &secret,).out_json().await?;
-
-    //     let post_notes = cmd!(fed_cli, "info").out_json().await?;
-    //     let post_balance = post_notes["total_msat"].as_u64().unwrap();
-
-    //     debug!(%post_notes, post_balance, "State after backup");
-    //     assert_eq!(pre_balance, post_balance);
-    // }
-
-    // with a backup
     {
-        let _ = cmd!(fed_cli, "backup",).out_json().await?;
-
-        let _ = cmd!(fed_cli, "wipe", "--force",).out_json().await?;
+        let client = fed_cli.fork_client("restore-without-backup").await?;
+        let _ = cmd!(client, "wipe", "--force",).out_json().await?;
 
         assert_eq!(
             0,
-            cmd!(fed_cli, "info").out_json().await?["total_msat"]
+            cmd!(client, "info").out_json().await?["total_msat"]
                 .as_u64()
                 .unwrap()
         );
-        let _ = cmd!(fed_cli, "restore", &secret,).out_json().await?;
+        let _ = cmd!(client, "restore", &secret,).out_json().await?;
 
-        let post_notes = cmd!(fed_cli, "info").out_json().await?;
+        let post_notes = cmd!(client, "info").out_json().await?;
+        let post_balance = post_notes["total_msat"].as_u64().unwrap();
+
+        debug!(%post_notes, post_balance, "State after backup");
+        assert_eq!(pre_balance, post_balance);
+    }
+
+    // with a backup
+    {
+        let client = fed_cli.fork_client("restore-with-backup").await?;
+        let _ = cmd!(client, "backup",).out_json().await?;
+
+        let _ = cmd!(client, "wipe", "--force",).out_json().await?;
+
+        assert_eq!(
+            0,
+            cmd!(client, "info").out_json().await?["total_msat"]
+                .as_u64()
+                .unwrap()
+        );
+        let _ = cmd!(client, "restore", &secret,).out_json().await?;
+
+        let post_notes = cmd!(client, "info").out_json().await?;
         let post_balance = post_notes["total_msat"].as_u64().unwrap();
 
         debug!(%post_notes, post_balance, "State after backup");
@@ -837,88 +852,125 @@ async fn lightning_gw_reconnect_test(dev_fed: DevFed, process_mgr: &ProcessManag
     gateways[1].set_lightning_node(LightningNode::Lnd(new_lnd.clone()));
 
     tracing::info!("Retrying info...");
+    const MAX_RETRIES: usize = 10;
+    const RETRY_INTERVAL: Duration = Duration::from_secs(1);
     for gw in gateways {
-        // Verify that after the lightning node has restarted, the gateway
-        // automatically reconnects and can query the lightning node
-        // info again.
-        let mut info_cmd = cmd!(gw, "info");
-        assert!(info_cmd.run().await.is_ok());
-
-        fed.use_gateway(&gw).await?;
-        tracing::info!("Creating invoice....");
-        let ln_response_val = cmd!(
-            fed,
-            "ln-invoice",
-            "--amount=1000msat",
-            "--description='incoming-over-cln-gw'"
-        )
-        .out_json()
-        .await?;
-        let ln_invoice_response: LnInvoiceResponse = serde_json::from_value(ln_response_val)?;
-        let invoice = ln_invoice_response.invoice;
-
-        match gw.ln {
-            Some(LightningNode::Cln(_cln)) => {
-                // Pay the invoice using LND
-                let payment = new_lnd
-                    .client_lock()
-                    .await?
-                    .send_payment_sync(tonic_lnd::lnrpc::SendRequest {
-                        payment_request: invoice.clone(),
-                        ..Default::default()
-                    })
-                    .await?
-                    .into_inner();
-
-                let payment_status = new_lnd
-                    .client_lock()
-                    .await?
-                    .list_payments(tonic_lnd::lnrpc::ListPaymentsRequest {
-                        include_incomplete: true,
-                        ..Default::default()
-                    })
-                    .await?
-                    .into_inner()
-                    .payments
-                    .into_iter()
-                    .find(|p| p.payment_hash == payment.payment_hash.to_hex())
-                    .context("payment not in list")?
-                    .status();
-                anyhow::ensure!(
-                    payment_status == tonic_lnd::lnrpc::payment::PaymentStatus::Succeeded
-                );
-            }
-            Some(LightningNode::Lnd(_lnd)) => {
-                // Pay the invoice using CLN
-                let invoice_status = new_cln
-                    .request(cln_rpc::model::PayRequest {
-                        bolt11: invoice,
-                        amount_msat: None,
-                        label: None,
-                        riskfactor: None,
-                        maxfeepercent: None,
-                        retry_for: None,
-                        maxdelay: None,
-                        exemptfee: None,
-                        localinvreqid: None,
-                        exclude: None,
-                        maxfee: None,
-                        description: None,
-                    })
-                    .await?
-                    .status;
-                anyhow::ensure!(matches!(
-                    invoice_status,
-                    cln_rpc::model::PayStatus::COMPLETE
-                ));
-            }
-            None => {
-                panic!("Lightning node did not come back up correctly");
+        for i in 0..MAX_RETRIES {
+            match do_try_create_and_pay_invoice(&gw, &fed, &new_cln, &new_lnd).await {
+                Ok(_) => break,
+                Err(e) => {
+                    if i == MAX_RETRIES - 1 {
+                        return Err(e);
+                    } else {
+                        tracing::debug!(
+                            "Pay invoice for gateway {} failed with {e:?}, retrying in {} seconds (try {}/{MAX_RETRIES})",
+                            gw.ln
+                                .as_ref()
+                                .map(|ln| ln.name().to_string())
+                                .unwrap_or_default(),
+                            RETRY_INTERVAL.as_secs(),
+                            i + 1,
+                        );
+                        fedimint_core::task::sleep(RETRY_INTERVAL).await;
+                    }
+                }
             }
         }
     }
 
     info!(LOG_DEVIMINT, "lightning_reconnect_test: success");
+    Ok(())
+}
+
+async fn do_try_create_and_pay_invoice(
+    gw: &Gatewayd,
+    fed: &Federation,
+    new_cln: &Lightningd,
+    new_lnd: &Lnd,
+) -> anyhow::Result<()> {
+    // Verify that after the lightning node has restarted, the gateway
+    // automatically reconnects and can query the lightning node
+    // info again.
+    poll("Waiting for info to succeed after restart", || async {
+        let mut info_cmd = cmd!(gw, "info");
+        Ok(info_cmd
+            .run()
+            .await
+            .map_err(|e| warn!("Info command not ready yet, retrying: {e}"))
+            .is_ok())
+    })
+    .await?;
+
+    fed.use_gateway(gw).await?;
+    tracing::info!("Creating invoice....");
+    let ln_response_val = cmd!(
+        fed,
+        "ln-invoice",
+        "--amount=1000msat",
+        "--description='incoming-over-cln-gw'"
+    )
+    .out_json()
+    .await?;
+    let ln_invoice_response: LnInvoiceResponse = serde_json::from_value(ln_response_val)?;
+    let invoice = ln_invoice_response.invoice;
+
+    match gw.ln.as_ref() {
+        Some(LightningNode::Cln(_cln)) => {
+            // Pay the invoice using LND
+            let payment = new_lnd
+                .client_lock()
+                .await?
+                .send_payment_sync(tonic_lnd::lnrpc::SendRequest {
+                    payment_request: invoice.clone(),
+                    ..Default::default()
+                })
+                .await?
+                .into_inner();
+
+            let payment_status = new_lnd
+                .client_lock()
+                .await?
+                .list_payments(tonic_lnd::lnrpc::ListPaymentsRequest {
+                    include_incomplete: true,
+                    ..Default::default()
+                })
+                .await?
+                .into_inner()
+                .payments
+                .into_iter()
+                .find(|p| p.payment_hash == payment.payment_hash.to_hex())
+                .context("payment not in list")?
+                .status();
+            anyhow::ensure!(payment_status == tonic_lnd::lnrpc::payment::PaymentStatus::Succeeded);
+        }
+        Some(LightningNode::Lnd(_lnd)) => {
+            // Pay the invoice using CLN
+            let invoice_status = new_cln
+                .request(cln_rpc::model::PayRequest {
+                    bolt11: invoice,
+                    amount_msat: None,
+                    label: None,
+                    riskfactor: None,
+                    maxfeepercent: None,
+                    retry_for: None,
+                    maxdelay: None,
+                    exemptfee: None,
+                    localinvreqid: None,
+                    exclude: None,
+                    maxfee: None,
+                    description: None,
+                })
+                .await?
+                .status;
+            anyhow::ensure!(matches!(
+                invoice_status,
+                cln_rpc::model::PayStatus::COMPLETE
+            ));
+        }
+        None => {
+            panic!("Lightning node did not come back up correctly");
+        }
+    }
     Ok(())
 }
 
@@ -941,7 +993,7 @@ async fn reconnect_test(dev_fed: DevFed, process_mgr: &ProcessManager) -> Result
     fed.await_all_peers().await?;
 
     // test a peer missing out on epochs and needing to rejoin
-    fed.kill_server(0).await?;
+    fed.terminate_server(0).await?;
     fed.generate_epochs(10).await?;
 
     fed.start_server(process_mgr, 0).await?;
@@ -951,16 +1003,22 @@ async fn reconnect_test(dev_fed: DevFed, process_mgr: &ProcessManager) -> Result
     bitcoind.mine_blocks(100).await?;
 
     // now test what happens if consensus needs to be restarted
-    fed.kill_server(1).await?;
+    fed.terminate_server(1).await?;
     bitcoind.mine_blocks(100).await?;
     fed.await_block_sync().await?;
-    fed.kill_server(2).await?;
-    fed.kill_server(3).await?;
+    fed.terminate_server(2).await?;
+    fed.terminate_server(3).await?;
 
     fed.start_server(process_mgr, 1).await?;
     fed.start_server(process_mgr, 2).await?;
     fed.start_server(process_mgr, 3).await?;
-    fed.await_all_peers().await?;
+
+    poll_max_retries("federation back online", 15, || async {
+        fed.await_all_peers().await?;
+        Ok(true)
+    })
+    .await?;
+
     info!(LOG_DEVIMINT, "fm success: reconnect-test");
     Ok(())
 }
@@ -1011,11 +1069,10 @@ async fn write_ready_file<T>(global: &vars::Global, result: Result<T>) -> Result
     result
 }
 
-async fn run_ui(process_mgr: &ProcessManager, task_group: &TaskGroup) -> Result<()> {
+async fn run_ui(process_mgr: &ProcessManager) -> Result<Vec<Fedimintd>> {
     let bitcoind = Bitcoind::new(process_mgr).await?;
     let fed_size = process_mgr.globals.FM_FED_SIZE;
-    // don't drop fedimintds
-    let _fedimintds = futures::future::try_join_all((0..fed_size).into_iter().map(|peer| {
+    let fedimintds = futures::future::try_join_all((0..fed_size).into_iter().map(|peer| {
         let bitcoind = bitcoind.clone();
         async move {
             let peer_port = 10000 + 8137 + peer * 2;
@@ -1046,8 +1103,7 @@ async fn run_ui(process_mgr: &ProcessManager, task_group: &TaskGroup) -> Result<
     }))
     .await?;
 
-    task_group.make_handle().make_shutdown_rx().await.await?;
-    Ok(())
+    Ok(fedimintds)
 }
 
 use std::fmt::Write;
@@ -1083,8 +1139,36 @@ async fn setup(arg: CommonArgs) -> Result<(ProcessManager, TaskGroup)> {
     Ok((process_mgr, task_group))
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+async fn cleanup_on_exit<T>(
+    main_process: impl futures::Future<Output = Result<T>>,
+    task_group: TaskGroup,
+) -> anyhow::Result<()> {
+    // This select makes it possible to exit earlier if a signal is received before
+    // the main process is finished
+    tokio::select! {
+        _ = task_group.make_handle().make_shutdown_rx().await => {
+            info!("Received shutdown signal before finishing main process, exiting early");
+            Ok(())
+        }
+        result = main_process => {
+            match result {
+                Ok(v) => {
+                    info!("Main process finished successfully, will wait for shutdown signal");
+                    task_group.make_handle().make_shutdown_rx().await.await;
+                    info!("Received shutdown signal, shutting down");
+                    drop(v); // execute destructors
+                    Ok(())
+                },
+                Err(e) => {
+                    warn!("Main process failed with {e:?}, will shutdown");
+                    Err(e)
+                }
+            }
+        }
+    }
+}
+
+async fn handle_command() -> Result<()> {
     let args = Args::parse();
     match args.command {
         Cmd::ExternalDaemons => {
@@ -1092,20 +1176,28 @@ async fn main() -> Result<()> {
             let _daemons =
                 write_ready_file(&process_mgr.globals, external_daemons(&process_mgr).await)
                     .await?;
-            task_group.make_handle().make_shutdown_rx().await.await?;
+            task_group.make_handle().make_shutdown_rx().await.await;
         }
         Cmd::DevFed => {
             let (process_mgr, task_group) = setup(args.common).await?;
-            let dev_fed = dev_fed(&process_mgr).await?;
-            dev_fed.fed.pegin(10_000).await?;
-            dev_fed.fed.pegin_gateway(20_000, &dev_fed.gw_cln).await?;
-            dev_fed.fed.pegin_gateway(20_000, &dev_fed.gw_lnd).await?;
-            let _daemons = write_ready_file(&process_mgr.globals, Ok(dev_fed)).await?;
-            task_group.make_handle().make_shutdown_rx().await.await?;
+            let main = async move {
+                let dev_fed = dev_fed(&process_mgr).await?;
+                dev_fed.fed.pegin(10_000).await?;
+                dev_fed.fed.pegin_gateway(20_000, &dev_fed.gw_cln).await?;
+                dev_fed.fed.pegin_gateway(20_000, &dev_fed.gw_lnd).await?;
+                let daemons = write_ready_file(&process_mgr.globals, Ok(dev_fed)).await?;
+                Ok::<_, anyhow::Error>(daemons)
+            };
+            cleanup_on_exit(main, task_group).await?;
         }
         Cmd::RunUi => {
             let (process_mgr, task_group) = setup(args.common).await?;
-            run_ui(&process_mgr, &task_group).await?
+            let main = async move {
+                let fedimintds = run_ui(&process_mgr).await?;
+                let daemons = write_ready_file(&process_mgr.globals, Ok(fedimintds)).await?;
+                Ok::<_, anyhow::Error>(daemons)
+            };
+            cleanup_on_exit(main, task_group).await?;
         }
         Cmd::LatencyTests => {
             let (process_mgr, _) = setup(args.common).await?;
@@ -1135,6 +1227,18 @@ async fn main() -> Result<()> {
         Cmd::Rpc(rpc) => rpc_command(rpc, args.common).await?,
     }
     Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let ready_file = PathBuf::from(env::var("FM_TEST_DIR")?).join("ready");
+    match handle_command().await {
+        Ok(r) => Ok(r),
+        Err(e) => {
+            write_overwrite_async(ready_file, "ERROR").await?;
+            Err(e)
+        }
+    }
 }
 
 async fn rpc_command(rpc: RpcCmd, common: CommonArgs) -> Result<()> {

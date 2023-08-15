@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use anyhow::{bail, format_err};
 use fedimint_core::admin_client::ConfigGenParamsConsensus;
-use fedimint_core::api::{ClientConfigDownloadToken, WsClientConnectInfo};
+use fedimint_core::api::{ClientConfigDownloadToken, InviteCode};
 use fedimint_core::cancellable::Cancelled;
 pub use fedimint_core::config::*;
 use fedimint_core::config::{
@@ -26,13 +26,14 @@ use hbbft::crypto::serde_impl::SerdeSecret;
 use hbbft::NetworkInfo;
 use rand::rngs::OsRng;
 use rand::Rng;
+use secp256k1_zkp::{PublicKey, Secp256k1, SecretKey};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio_rustls::rustls;
 use tracing::{error, info};
 
 use crate::config::api::ConfigGenParamsLocal;
-use crate::config::distributedgen::{DkgRunner, ThresholdKeys};
+use crate::config::distributedgen::{DkgRunner, PeerHandleOps, ThresholdKeys};
 use crate::config::io::CODE_VERSION;
 use crate::fedimint_core::encoding::Encodable;
 use crate::fedimint_core::NumPeers;
@@ -99,6 +100,8 @@ pub struct ServerConfigPrivate {
     /// Secret key for TLS communication, required for peer authentication
     #[serde(with = "serde_tls_key")]
     pub tls_key: rustls::PrivateKey,
+    /// Secret key for the atomic broadcast to sign messages
+    pub broadcast_secret_key: SecretKey,
     /// Secret key for contributing to threshold auth key
     #[serde(with = "serde_binary_human_readable")]
     pub auth_sks: SerdeSecret<hbbft::crypto::SecretKeyShare>,
@@ -118,6 +121,8 @@ pub struct ServerConfigConsensus {
     pub code_version: String,
     /// Agreed on core consensus version
     pub version: CoreConsensusVersion,
+    /// Public keys for the atomic broadcast to authenticate messages
+    pub broadcast_public_keys: BTreeMap<PeerId, PublicKey>,
     /// Public keys authenticating members of the federation and the configs
     #[serde(with = "serde_binary_human_readable")]
     pub auth_pk_set: hbbft::crypto::PublicKeySet,
@@ -195,7 +200,7 @@ impl ServerConfigConsensus {
                     let gen = module_config_gens
                         .get(&v.kind)
                         .ok_or_else(|| format_err!("Module gen kind={} not found", v.kind))?;
-                    Ok((*k, gen.get_client_config(v)?))
+                    Ok((*k, gen.get_client_config(*k, v)?))
                 })
                 .collect::<anyhow::Result<BTreeMap<_, _>>>()?,
             meta: self.meta.clone(),
@@ -217,9 +222,12 @@ impl ServerConfig {
     }
     /// Creates a new config from the results of a trusted or distributed key
     /// setup
+    #[allow(clippy::too_many_arguments)]
     pub fn from(
         params: ConfigGenParams,
         identity: PeerId,
+        broadcast_public_keys: BTreeMap<PeerId, PublicKey>,
+        broadcast_secret_key: SecretKey,
         auth_keys: ThresholdKeys,
         epoch_keys: ThresholdKeys,
         hbbft_keys: ThresholdKeys,
@@ -228,6 +236,7 @@ impl ServerConfig {
         let private = ServerConfigPrivate {
             api_auth: params.local.api_auth.clone(),
             tls_key: params.local.our_private_key.clone(),
+            broadcast_secret_key,
             auth_sks: auth_keys.secret_key_share,
             hbbft_sks: hbbft_keys.secret_key_share,
             epoch_sks: epoch_keys.secret_key_share,
@@ -246,6 +255,7 @@ impl ServerConfig {
         let consensus = ServerConfigConsensus {
             code_version: CODE_VERSION.to_string(),
             version: CORE_CONSENSUS_VERSION,
+            broadcast_public_keys,
             auth_pk_set: auth_keys.public_key_set,
             hbbft_pk_set: hbbft_keys.public_key_set,
             epoch_pk_set: epoch_keys.public_key_set,
@@ -264,14 +274,14 @@ impl ServerConfig {
         cfg
     }
 
-    pub fn get_connect_info(&self) -> WsClientConnectInfo {
+    pub fn get_invite_code(&self) -> InviteCode {
         let id = FederationId(self.consensus.auth_pk_set.public_key());
         let url = self.consensus.api_endpoints[&self.local.identity]
             .url
             .clone();
         let download_token = self.local.download_token.clone();
 
-        WsClientConnectInfo {
+        InviteCode {
             url,
             download_token,
             id,
@@ -366,6 +376,11 @@ impl ServerConfig {
         let private = self.private.clone();
         let id = identity.to_usize();
 
+        let my_public_key = private.broadcast_secret_key.public_key(&Secp256k1::new());
+
+        if Some(&my_public_key) != consensus.broadcast_public_keys.get(identity) {
+            bail!("Broadcast secret key doesn't match corresponding public key");
+        }
         if private.epoch_sks.public_key_share() != consensus.epoch_pk_set.public_key_share(id) {
             bail!("Epoch private key doesn't match pubkey share");
         }
@@ -403,6 +418,14 @@ impl ServerConfig {
         let mut rng = OsRng;
         let peer0 = &params[&PeerId::from(0)];
 
+        let mut broadcast_pks = BTreeMap::new();
+        let mut broadcast_sks = BTreeMap::new();
+        for peer_id in peer0.peer_ids() {
+            let (broadcast_sk, broadcast_pk) = secp256k1_zkp::generate_keypair(&mut OsRng);
+            broadcast_pks.insert(peer_id, broadcast_pk);
+            broadcast_sks.insert(peer_id, broadcast_sk);
+        }
+
         let netinfo = NetworkInfo::generate_map(peer0.peer_ids(), &mut rng)
             .expect("Could not generate HBBFT netinfo");
         let epochinfo = NetworkInfo::generate_map(peer0.peer_ids(), &mut rng)
@@ -429,6 +452,8 @@ impl ServerConfig {
                 let config = ServerConfig::from(
                     params[&id].clone(),
                     id,
+                    broadcast_pks.clone(),
+                    *broadcast_sks.get(&id).expect("We created this entry"),
                     Self::extract_keys(authinfo.get(&id).expect("peer exists")),
                     Self::extract_keys(epochinfo.get(&id).expect("peer exists")),
                     Self::extract_keys(netinfo.get(&id).expect("peer exists")),
@@ -470,6 +495,20 @@ impl ServerConfig {
 
         let peers = &params.peer_ids();
         let our_id = &params.local.our_id;
+
+        let broadcast_keys_exchange = PeerHandle::new(
+            &connections,
+            MODULE_INSTANCE_ID_GLOBAL,
+            *our_id,
+            peers.clone(),
+        );
+
+        let (broadcast_sk, broadcast_pk) = secp256k1_zkp::generate_keypair(&mut OsRng);
+
+        let broadcast_public_keys = broadcast_keys_exchange
+            .exchange_pubkeys("broadcast".to_string(), broadcast_pk)
+            .await?;
+
         // in case we are running by ourselves, avoid DKG
         if peers.len() == 1 {
             let server =
@@ -562,6 +601,8 @@ impl ServerConfig {
         let server = ServerConfig::from(
             params.clone(),
             *our_id,
+            broadcast_public_keys,
+            broadcast_sk,
             auth_keys,
             epoch_keys,
             hbbft_keys,

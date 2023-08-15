@@ -5,9 +5,9 @@
 //! Fedimint federations are expected to last and serve over time diverse set of
 //! clients running on various devices and platforms with different
 //! versions of the client software. To ensure broad interoperability core
-//! Fedimint logic and modules use consensus and API versiong scheme.
+//! Fedimint logic and modules use consensus and API version scheme.
 //!
-//! ## Definions
+//! ## Definitions
 //!
 //! * Fedimint *component* - either a core Fedimint logic or one of the modules
 //!
@@ -20,7 +20,7 @@
 //! The set of all consensus versions of each component is a part of consensus
 //! config that is identical for all peers.
 //!
-//! The code implementing given component can however suport multiple consensus
+//! The code implementing given component can however support multiple consensus
 //! versions at the same time, making it possible to use the same code for
 //! diverse set of Federations created at different times. The consensus
 //! version to run with is passed to the code during initialization.
@@ -33,14 +33,14 @@
 //!
 //! ## API versions
 //!
-//! Unlike consensus version which has to be single and identical accross
-//! Federation, both server and client side components can advertise simultanous
-//! support for multiple API versions. This is the main mechanism to ensure
-//! interoperability in the face of hard to control and predict software changes
-//! accross all the involved software.
+//! Unlike consensus version which has to be single and identical across
+//! Federation, both server and client side components can advertise
+//! simultaneous support for multiple API versions. This is the main mechanism
+//! to ensure interoperability in the face of hard to control and predict
+//! software changes across all the involved software.
 //!
 //! Each peer in the Federation and each client can update the Fedimint software
-//! at their own pace without cordinating API changes.
+//! at their own pace without coordinating API changes.
 //!
 //! Each client is expected to survey Federation API support and discover the
 //! API version to use for each component.

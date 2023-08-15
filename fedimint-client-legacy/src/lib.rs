@@ -26,7 +26,7 @@ use bitcoin::{secp256k1, Address, Transaction as BitcoinTransaction};
 use bitcoin_hashes::{sha256, Hash};
 use fedimint_client::module::gen::ClientModuleGenRegistry;
 use fedimint_core::api::{
-    DynGlobalApi, FederationError, GlobalFederationApi, MemberError, OutputOutcomeError,
+    DynGlobalApi, FederationError, GlobalFederationApi, OutputOutcomeError, PeerError,
     WsFederationApi,
 };
 use fedimint_core::config::ClientConfig;
@@ -40,7 +40,7 @@ use fedimint_core::epoch::SignedEpochOutcome;
 use fedimint_core::module::registry::ModuleDecoderRegistry;
 use fedimint_core::module::{CommonModuleGen, ModuleCommon};
 use fedimint_core::outcome::TransactionStatus;
-use fedimint_core::task::{self, sleep};
+use fedimint_core::task::{self, sleep, MaybeSend};
 use fedimint_core::tiered::InvalidAmountTierError;
 use fedimint_core::txoproof::TxOutProof;
 use fedimint_core::{Amount, OutPoint, TieredMulti, TieredSummary, TransactionId};
@@ -147,15 +147,17 @@ impl GatewayClientConfig {
         &self,
         route_hints: Vec<modules::ln::route_hints::RouteHint>,
         time_to_live: Duration,
+        gateway_id: secp256k1::PublicKey,
     ) -> LightningGateway {
         LightningGateway {
             mint_channel_id: self.mint_channel_id,
-            gateway_pub_key: self.redeem_key.x_only_public_key().0,
+            gateway_redeem_key: self.redeem_key.x_only_public_key().0,
             node_pub_key: self.node_pub_key,
             api: self.api.clone(),
             route_hints,
             valid_until: fedimint_core::time::now() + time_to_live,
             fees: self.fees,
+            gateway_id,
         }
     }
 }
@@ -233,7 +235,7 @@ impl<T> Client<T> {
 
 // TODO: `get_module` is parsing `serde_json::Value` every time, which is not
 // best for performance
-impl<T: AsRef<ClientConfig> + Clone + Send> Client<T> {
+impl<T: AsRef<ClientConfig> + Clone + MaybeSend> Client<T> {
     pub fn db(&self) -> &Database {
         &self.context.db
     }
@@ -245,7 +247,8 @@ impl<T: AsRef<ClientConfig> + Clone + Send> Client<T> {
                 .as_ref()
                 .get_first_module_by_kind::<LightningClientConfig>("ln")
                 .expect("needs lightning module client config")
-                .1,
+                .1
+                .clone(),
             context: self.context.clone(),
         }
     }
@@ -257,7 +260,8 @@ impl<T: AsRef<ClientConfig> + Clone + Send> Client<T> {
                 .as_ref()
                 .get_first_module_by_kind::<MintClientConfig>("mint")
                 .expect("needs mint module client config")
-                .1,
+                .1
+                .clone(),
             epoch_pk: self.config.as_ref().epoch_pk,
             context: self.context.clone(),
             secret: Self::mint_secret_static(&self.root_secret),
@@ -271,7 +275,8 @@ impl<T: AsRef<ClientConfig> + Clone + Send> Client<T> {
                 .as_ref()
                 .get_first_module_by_kind::<WalletClientConfig>("wallet")
                 .expect("needs wallet module client config")
-                .1,
+                .1
+                .clone(),
 
             context: self.context.clone(),
         }
@@ -279,6 +284,10 @@ impl<T: AsRef<ClientConfig> + Clone + Send> Client<T> {
 
     pub fn config(&self) -> T {
         self.config.clone()
+    }
+
+    pub fn config_ref(&self) -> &T {
+        &self.config
     }
 
     pub async fn new(
@@ -718,20 +727,20 @@ impl<T: AsRef<ClientConfig> + Clone + Send> Client<T> {
         self.reissue(notes_to_reissue, rng).await
     }
 
-    pub async fn await_consensus_block_height(
+    pub async fn await_consensus_block_count(
         &self,
-        block_height: u64,
+        block_count: u64,
     ) -> std::result::Result<u64, task::Elapsed> {
         task::timeout(Duration::from_secs(30), async {
-            self.await_consensus_block_height_inner(block_height).await
+            self.await_consensus_block_count_inner(block_count).await
         })
         .await
     }
 
-    async fn await_consensus_block_height_inner(&self, block_height: u64) -> u64 {
+    async fn await_consensus_block_count_inner(&self, requested_count: u64) -> u64 {
         loop {
-            match self.context.api.fetch_consensus_block_height().await {
-                Ok(height) if height >= block_height => return height,
+            match self.context.api.fetch_consensus_block_count().await {
+                Ok(current_count) if requested_count <= current_count => return current_count,
                 _ => sleep(Duration::from_millis(100)).await,
             }
         }
@@ -811,22 +820,22 @@ impl Client<UserClientConfig> {
     /// advance.
     pub async fn switch_active_gateway(
         &self,
-        gateway_pub_key: Option<secp256k1::XOnlyPublicKey>,
+        gateway_id: Option<secp256k1::PublicKey>,
     ) -> Result<LightningGateway> {
         let gateways = self.fetch_registered_gateways().await?;
         if gateways.is_empty() {
             debug!("Could not find any gateways");
             return Err(ClientError::NoGateways);
         };
-        let gateway = match gateway_pub_key {
+        let gateway = match gateway_id {
             // If a pubkey was provided, try to select and activate a gateway with that pubkey.
             Some(pub_key) => gateways
                 .into_iter()
-                .find(|g| g.gateway_pub_key == pub_key)
+                .find(|g| g.gateway_id == pub_key)
                 .ok_or_else(|| {
                     debug!(
                         "Could not find gateway with gateway public key {:?}",
-                        gateway_pub_key
+                        gateway_id
                     );
                     ClientError::GatewayNotFound
                 })?,
@@ -851,8 +860,8 @@ impl Client<UserClientConfig> {
         let mut dbtx = self.context.db.begin_transaction().await;
         let mut tx = TransactionBuilder::default();
 
-        let consensus_height = self.context.api.fetch_consensus_block_height().await?;
-        let absolute_timelock = consensus_height + OUTGOING_LN_CONTRACT_TIMELOCK;
+        let consensus_count = self.context.api.fetch_consensus_block_count().await?;
+        let absolute_timelock = consensus_count + OUTGOING_LN_CONTRACT_TIMELOCK - 1;
 
         let contract = self
             .ln_client()
@@ -1231,11 +1240,11 @@ impl Client<GatewayClientConfig> {
             return Err(ClientError::Underfunded(invoice_amount, account.amount));
         }
 
-        let consensus_block_height = self.context.api.fetch_consensus_block_height().await?;
-        // Calculate max delay taking into account current consensus block height and
+        let consensus_block_count = self.context.api.fetch_consensus_block_count().await?;
+        // Calculate max delay taking into account current consensus block count and
         // our safety margin.
         let max_delay = (account.contract.timelock as u64)
-            .checked_sub(consensus_block_height)
+            .checked_sub(consensus_block_count.saturating_sub(1))
             .and_then(|delta| delta.checked_sub(self.config.timelock_delta))
             .ok_or(ClientError::TimeoutTooClose)?;
 

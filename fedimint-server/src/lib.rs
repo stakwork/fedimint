@@ -101,7 +101,7 @@ impl FedimintServer {
         handler.stop().await;
 
         info!(target: LOG_CONSENSUS, "Shutting down tasks");
-        task_group.shutdown().await;
+        task_group.shutdown();
 
         Ok(())
     }
@@ -291,5 +291,15 @@ impl FedimintApiHandler {
             runtime.shutdown_background();
         }
         self.handle.stopped().await;
+    }
+}
+
+pub type ApiResult<T> = std::result::Result<T, ApiError>;
+
+pub fn check_auth(context: &mut ApiEndpointContext) -> ApiResult<()> {
+    if !context.has_auth() {
+        Err(ApiError::unauthorized())
+    } else {
+        Ok(())
     }
 }

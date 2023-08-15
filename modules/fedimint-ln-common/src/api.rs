@@ -1,7 +1,7 @@
 use bitcoin_hashes::sha256::Hash as Sha256Hash;
 use fedimint_core::api::{FederationApiExt, FederationResult, IModuleFederationApi};
 use fedimint_core::module::ApiRequestErased;
-use fedimint_core::query::{CurrentConsensus, UnionResponses};
+use fedimint_core::query::{ThresholdConsensus, UnionResponses};
 use fedimint_core::task::{MaybeSend, MaybeSync};
 use fedimint_core::{apply, async_trait_maybe_send, NumPeers};
 
@@ -12,7 +12,7 @@ use crate::{ContractAccount, LightningGateway};
 
 #[apply(async_trait_maybe_send!)]
 pub trait LnFederationApi {
-    async fn fetch_consensus_block_height(&self) -> FederationResult<Option<u64>>;
+    async fn fetch_consensus_block_count(&self) -> FederationResult<Option<u64>>;
     async fn fetch_contract(&self, contract: ContractId) -> FederationResult<ContractAccount>;
     async fn fetch_offer(
         &self,
@@ -38,8 +38,8 @@ impl<T: ?Sized> LnFederationApi for T
 where
     T: IModuleFederationApi + MaybeSend + MaybeSync + 'static,
 {
-    async fn fetch_consensus_block_height(&self) -> FederationResult<Option<u64>> {
-        self.request_current_consensus("block_height".to_string(), ApiRequestErased::default())
+    async fn fetch_consensus_block_count(&self) -> FederationResult<Option<u64>> {
+        self.request_current_consensus("block_count".to_string(), ApiRequestErased::default())
             .await
     }
 
@@ -61,7 +61,7 @@ where
 
     async fn fetch_gateways(&self) -> FederationResult<Vec<LightningGateway>> {
         self.request_with_strategy(
-            UnionResponses::new(self.all_members().threshold()),
+            UnionResponses::new(self.all_peers().total()),
             "list_gateways".to_string(),
             ApiRequestErased::default(),
         )
@@ -70,7 +70,7 @@ where
 
     async fn register_gateway(&self, gateway: &LightningGateway) -> FederationResult<()> {
         self.request_with_strategy(
-            CurrentConsensus::new(self.all_members().threshold()),
+            ThresholdConsensus::new(self.all_peers().total()),
             "register_gateway".to_string(),
             ApiRequestErased::new(gateway),
         )

@@ -157,7 +157,6 @@
             fedimint-pkgs = craneLib.fedimint-pkgs;
             gateway-pkgs = craneLib.gateway-pkgs;
             client-pkgs = craneLib.client-pkgs { };
-            fedimint-dbtool-pkgs = craneLib.fedimint-dbtool-pkgs;
             devimint = craneLib.devimint;
             fedimint-load-test-tool = craneLib.fedimint-load-test-tool;
           };
@@ -197,6 +196,11 @@
               {
                 pkg = (rustPackageOutputsFinal craneLib).fedimint-pkgs;
                 bin = "fedimint-cli";
+              };
+            fedimint-dbtool = pickBinary
+              {
+                pkg = (rustPackageOutputsFinal craneLib).fedimint-pkgs;
+                bin = "fedimint-dbtool";
               };
             gatewayd = pickBinary
               {
@@ -357,6 +361,7 @@
                     }))
                     docker-compose
                     pkgs.tokio-console
+                    pkgs.git
                     moreutils-ts
 
                     # Nix
@@ -368,7 +373,7 @@
                     pkgs.nodePackages.bash-language-server
                   ] ++ lib.optionals (!stdenv.isAarch64 && !stdenv.isDarwin) [
                     pkgs.semgrep
-                  ] ++ lib.optionals (!stdenv.isAarch64) [
+                  ] ++ lib.optionals (stdenv.isLinux) [
                     xclip
                     wl-clipboard
                   ];
@@ -454,8 +459,9 @@
                   toolchain.fenixToolchainCrossWasm
                   pkgs.wasm-pack
                   pkgs.wasm-bindgen-cli
-                  pkgs.firefox
                   pkgs.geckodriver
+                ] ++ lib.optionals (stdenv.isLinux) [
+                  pkgs.firefox
                 ];
 
                 shellHook = shellCommonCross.shellHook + toolchain.wasm32CrossEnvVars;
@@ -471,6 +477,7 @@
                   git
                   parallel
                   semgrep
+                  typos
                   moreutils-ts
                   nix
                 ];

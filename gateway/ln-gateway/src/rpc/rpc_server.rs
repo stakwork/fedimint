@@ -5,11 +5,11 @@ use axum::routing::post;
 use axum::{Extension, Json, Router};
 use axum_macros::debug_handler;
 use bitcoin_hashes::hex::ToHex;
+use fedimint_core::task::TaskGroup;
 use fedimint_ln_client::pay::PayInvoicePayload;
 use serde_json::json;
-use tokio::sync::oneshot;
-use tower_http::auth::RequireAuthorizationLayer;
 use tower_http::cors::CorsLayer;
+use tower_http::validate_request::ValidateRequestHeaderLayer;
 use tracing::{error, instrument};
 
 use super::{
@@ -22,7 +22,7 @@ pub async fn run_webserver(
     authkey: String,
     bind_addr: SocketAddr,
     mut gateway: Gateway,
-) -> axum::response::Result<oneshot::Receiver<()>> {
+) -> axum::response::Result<TaskGroup> {
     // Public routes on gateway webserver
     let routes = Router::new().route("/pay_invoice", post(pay_invoice));
 
@@ -35,7 +35,7 @@ pub async fn run_webserver(
         .route("/connect-fed", post(connect_fed))
         .route("/backup", post(backup))
         .route("/restore", post(restore))
-        .layer(RequireAuthorizationLayer::bearer(&authkey));
+        .layer(ValidateRequestHeaderLayer::bearer(&authkey));
 
     let app = Router::new()
         .merge(routes)
@@ -43,13 +43,15 @@ pub async fn run_webserver(
         .layer(Extension(gateway.clone()))
         .layer(CorsLayer::permissive());
 
-    let (tx, rx) = oneshot::channel::<()>();
+    let task_group = gateway.task_group.make_subgroup().await;
+    let handle = task_group.make_handle();
+    let shutdown_rx = handle.make_shutdown_rx().await;
     let server = axum::Server::bind(&bind_addr).serve(app.into_make_service());
     gateway
         .task_group
         .spawn("Gateway Webserver", move |_| async move {
             let graceful = server.with_graceful_shutdown(async {
-                rx.await.ok();
+                shutdown_rx.await;
             });
 
             if let Err(e) = graceful.await {
@@ -58,21 +60,7 @@ pub async fn run_webserver(
         })
         .await;
 
-    let handle = gateway.task_group.make_handle();
-    handle
-        .on_shutdown(Box::new(|| {
-            Box::pin(async move {
-                // Send shutdown signal to the webserver
-                let res = tx.send(());
-                if res.is_err() {
-                    error!("Error shutting down gatewayd webserver: {res:?}");
-                }
-            })
-        }))
-        .await;
-    let shutdown_receiver = handle.make_shutdown_rx().await;
-
-    Ok(shutdown_receiver)
+    Ok(task_group)
 }
 
 /// Display high-level information about the Gateway

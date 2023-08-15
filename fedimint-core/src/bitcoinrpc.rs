@@ -10,9 +10,12 @@ use url::Url;
 pub const FM_BITCOIN_RPC_KIND: &str = "FM_BITCOIN_RPC_KIND";
 /// Env var for bitcoin URL
 pub const FM_BITCOIN_RPC_URL: &str = "FM_BITCOIN_RPC_URL";
+/// Env var that can be set to point at the bitcoind's cookie file to use for
+/// auth
+pub const FM_BITCOIND_COOKIE_FILE_VAR_NAME: &str = "FM_BITCOIND_COOKIE_FILE";
 
 /// Configuration for the bitcoin RPC
-#[derive(Debug, Clone, Serialize, Deserialize, Decodable, Encodable)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize, Encodable, Decodable)]
 pub struct BitcoinRpcConfig {
     pub kind: String,
     pub url: Url,

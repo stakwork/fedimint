@@ -15,7 +15,7 @@ use fedimint_client::module::gen::{ClientModuleGenRegistry, DynClientModuleGen};
 use fedimint_client_legacy::mint::SpendableNote;
 use fedimint_client_legacy::{module_decode_stubs, UserClientConfig};
 use fedimint_core::admin_client::{ConfigGenParamsConsensus, PeerServerParams};
-use fedimint_core::api::WsClientConnectInfo;
+use fedimint_core::api::InviteCode;
 use fedimint_core::bitcoinrpc::BitcoinRpcConfig;
 use fedimint_core::cancellable::Cancellable;
 use fedimint_core::config::{
@@ -45,9 +45,7 @@ use fedimint_mint_server::MintGen;
 use fedimint_server::config::api::{ConfigGenParamsLocal, ConfigGenSettings};
 use fedimint_server::config::{gen_cert_and_key, max_connections, ConfigGenParams, ServerConfig};
 use fedimint_server::consensus::server::{ConsensusServer, EpochMessage};
-use fedimint_server::consensus::{
-    ConsensusProposal, HbbftConsensusOutcome, TransactionSubmissionError,
-};
+use fedimint_server::consensus::{ConsensusProposal, HbbftConsensusOutcome};
 use fedimint_server::net::connect::mock::{MockNetwork, StreamReliability};
 use fedimint_server::net::connect::{parse_host_port, Connector, TlsTcpConnector};
 use fedimint_server::net::peers::{DelayCalculator, PeerConnector};
@@ -210,12 +208,7 @@ pub async fn fixtures(num_peers: u16) -> anyhow::Result<Fixtures> {
             let handles = fed.run_consensus_apis().await;
 
             // user
-            let user_db = if env::var("FM_CLIENT_SQLITE") == Ok(s.clone()) {
-                let db_name = format!("client-{}", rng().next_u64());
-                Database::new(sqlite(dir.clone(), db_name).await, decoders.clone())
-            } else {
-                Database::new(rocks(dir.clone()), decoders.clone())
-            };
+            let user_db = Database::new(rocks(dir.clone()), decoders.clone());
             let user_cfg = UserClientConfig(client_config.clone());
             let user = Box::new(LegacyTestUser::new(
                 user_cfg,
@@ -224,7 +217,8 @@ pub async fn fixtures(num_peers: u16) -> anyhow::Result<Fixtures> {
                 peers,
                 user_db,
             ));
-            user.client.await_consensus_block_height(0).await?;
+            // just for readiness
+            user.client.await_consensus_block_count(0).await?;
 
             Fixtures {
                 fed,
@@ -283,7 +277,8 @@ pub async fn fixtures(num_peers: u16) -> anyhow::Result<Fixtures> {
                 peers,
                 user_db,
             ));
-            user.client.await_consensus_block_height(0).await?;
+            // just for readiness
+            user.client.await_consensus_block_count(0).await?;
 
             // Always be prepared to fund bitcoin wallet
             factory.bitcoin.prepare_funding_wallet().await;
@@ -412,13 +407,6 @@ fn rocks(dir: String) -> fedimint_rocksdb::RocksDb {
     fedimint_rocksdb::RocksDb::open(db_dir).unwrap()
 }
 
-async fn sqlite(dir: String, db_name: String) -> fedimint_sqlite::SqliteDb {
-    let connection_string = format!("sqlite://{dir}/{db_name}.db");
-    fedimint_sqlite::SqliteDb::open(connection_string.as_str())
-        .await
-        .unwrap()
-}
-
 pub struct FederationTest {
     servers: Vec<Arc<Mutex<ServerTest>>>,
     last_consensus: Arc<Mutex<HbbftConsensusOutcome>>,
@@ -429,7 +417,7 @@ pub struct FederationTest {
     pub mint_id: ModuleInstanceId,
     pub ln_id: ModuleInstanceId,
     pub wallet_id: ModuleInstanceId,
-    pub connect_info: WsClientConnectInfo,
+    pub invite_code: InviteCode,
 }
 
 struct ServerTest {
@@ -480,7 +468,7 @@ impl FederationTest {
                     ConsensusItem::Module(module) if module.module_instance_id() == LEGACY_HARDCODED_INSTANCE_ID_WALLET => {
                         let wallet_item = module.as_any().downcast_ref::<<<Wallet as ServerModule>::Common as ModuleCommon>::ConsensusItem>().expect("test should use fixed module instances");
                         match wallet_item {
-                            WalletConsensusItem::BlockHeight(_) => true,
+                            WalletConsensusItem::BlockCount(_) => true,
                             WalletConsensusItem::Feerate(_) => true,
                             WalletConsensusItem::PegOutSignature(_) => false
                         }
@@ -508,7 +496,7 @@ impl FederationTest {
     pub async fn submit_transaction(
         &self,
         transaction: fedimint_server::transaction::Transaction,
-    ) -> Result<(), TransactionSubmissionError> {
+    ) -> anyhow::Result<()> {
         for server in &self.servers {
             server
                 .lock()
@@ -519,6 +507,7 @@ impl FederationTest {
                 .submit_transaction(transaction.clone())
                 .await?;
         }
+
         Ok(())
     }
 
@@ -562,7 +551,7 @@ impl FederationTest {
             mint_id: self.mint_id,
             ln_id: self.ln_id,
             wallet_id: self.wallet_id,
-            connect_info: self.connect_info.clone(),
+            invite_code: self.invite_code.clone(),
         }
     }
 
@@ -693,12 +682,15 @@ impl FederationTest {
                 signature: None,
             };
 
+            let module_ids = transaction
+                .outputs
+                .iter()
+                .map(|output| output.module_instance_id())
+                .collect::<Vec<_>>();
+
             dbtx.insert_entry(
                 &fedimint_server::db::AcceptedTransactionKey(out_point.txid),
-                &fedimint_server::consensus::AcceptedTransaction {
-                    epoch: 0,
-                    transaction,
-                },
+                &module_ids,
             )
             .await;
 
@@ -706,7 +698,7 @@ impl FederationTest {
                 .consensus
                 .modules
                 .get_expect(self.mint_id)
-                .apply_output(
+                .process_output(
                     &mut dbtx.with_module_prefix(self.mint_id),
                     &core::DynOutput::from_typed(self.mint_id, MintOutput(notes.clone())),
                     out_point,
@@ -1050,7 +1042,7 @@ impl FederationTest {
             mint_id: LEGACY_HARDCODED_INSTANCE_ID_MINT,
             ln_id: LEGACY_HARDCODED_INSTANCE_ID_LN,
             wallet_id: LEGACY_HARDCODED_INSTANCE_ID_WALLET,
-            connect_info: cfg.get_connect_info(),
+            invite_code: cfg.get_invite_code(),
         }
     }
 }

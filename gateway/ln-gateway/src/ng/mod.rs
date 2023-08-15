@@ -1,3 +1,4 @@
+pub mod complete;
 pub mod pay;
 
 use std::sync::Arc;
@@ -42,10 +43,15 @@ use thiserror::Error;
 use tracing::info;
 use url::Url;
 
-use self::pay::{GatewayPayCommon, GatewayPayInvoice, GatewayPayStateMachine, GatewayPayStates};
+use self::complete::GatewayCompleteStateMachine;
+use self::pay::{
+    GatewayPayCommon, GatewayPayInvoice, GatewayPayStateMachine, GatewayPayStates,
+    OutgoingPaymentError,
+};
 use crate::db::FederationRegistrationKey;
-use crate::gatewaylnrpc::{GetNodeInfoResponse, InterceptHtlcRequest};
+use crate::gatewaylnrpc::InterceptHtlcRequest;
 use crate::lnrpc_client::ILnRpcClient;
+use crate::ng::complete::{GatewayCompleteCommon, GatewayCompleteStates, WaitForPreimageState};
 
 pub const GW_ANNOUNCEMENT_TTL: Duration = Duration::from_secs(600);
 pub const INITIAL_REGISTER_BACKOFF_DURATION: Duration = Duration::from_secs(15);
@@ -62,8 +68,13 @@ pub enum GatewayExtPayStates {
         preimage: Preimage,
         outpoint: OutPoint,
     },
-    Canceled,
-    Fail,
+    Canceled {
+        error: OutgoingPaymentError,
+    },
+    Fail {
+        error: OutgoingPaymentError,
+        error_message: String,
+    },
     OfferDoesNotExist {
         contract_id: ContractId,
     },
@@ -75,9 +86,17 @@ pub enum GatewayExtPayStates {
 pub enum GatewayExtReceiveStates {
     Funding,
     Preimage(Preimage),
-    RefundSuccess(OutPoint),
-    RefundError(String),
-    FundingFailed(String),
+    RefundSuccess {
+        outpoint: OutPoint,
+        error: IncomingSmError,
+    },
+    RefundError {
+        error_message: String,
+        error: IncomingSmError,
+    },
+    FundingFailed {
+        error: IncomingSmError,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,6 +125,7 @@ pub trait GatewayClientExt {
         gateway_api: Url,
         route_hints: Vec<RouteHint>,
         time_to_live: Duration,
+        gateway_id: secp256k1::PublicKey,
     ) -> anyhow::Result<()>;
 
     /// Attempt fulfill HTLC by buying preimage from the federation
@@ -181,33 +201,36 @@ impl GatewayClientExt for Client {
             stream! {
                 yield GatewayExtPayStates::Created;
 
-                match gateway.await_paid_invoice(operation_id).await {
-                    Ok((outpoint, preimage)) => {
-                        yield GatewayExtPayStates::Preimage{ preimage: preimage.clone() };
+                let mut stream = gateway.notifier.subscribe(operation_id).await;
+                loop {
+                    if let Some(GatewayClientStateMachines::Pay(state)) = stream.next().await {
+                        match state.state {
+                            GatewayPayStates::Preimage(outpoint, preimage) => {
+                                yield GatewayExtPayStates::Preimage{ preimage: preimage.clone() };
 
-                        if self.await_primary_module_output(operation_id, outpoint).await.is_ok() {
-                            yield GatewayExtPayStates::Success{ preimage: preimage.clone(), outpoint };
-                            return;
-                        }
-
-                        yield GatewayExtPayStates::Fail;
-                    }
-                    Err(error) => {
-                        match error {
-                            GatewayError::Canceled(cancel_txid) => {
-                                if self.transaction_updates(operation_id).await.await_tx_accepted(cancel_txid).await.is_ok() {
-                                    yield GatewayExtPayStates::Canceled;
+                                if self.await_primary_module_output(operation_id, outpoint).await.is_ok() {
+                                    yield GatewayExtPayStates::Success{ preimage: preimage.clone(), outpoint };
                                     return;
                                 }
-
-                                yield GatewayExtPayStates::Fail;
                             }
-                            GatewayError::OfferDoesNotExist(contract_id) => {
+                            GatewayPayStates::Canceled { txid, contract_id: _, error } => {
+                                match self.transaction_updates(operation_id).await.await_tx_accepted(txid).await {
+                                    Ok(()) => {
+                                        yield GatewayExtPayStates::Canceled{ error };
+                                        return;
+                                    }
+                                    Err(e) => {
+                                        yield GatewayExtPayStates::Fail { error, error_message: format!("Refund transaction {txid} was not accepted by the federation. OperationId: {operation_id} Error: {e:?}") };
+                                    }
+                                }
+                            }
+                            GatewayPayStates::OfferDoesNotExist(contract_id) => {
                                 yield GatewayExtPayStates::OfferDoesNotExist { contract_id };
                             }
-                            _ => {
-                                yield GatewayExtPayStates::Fail;
-                            }
+                            GatewayPayStates::Failed{ error, error_message } => {
+                                yield GatewayExtPayStates::Fail{ error, error_message };
+                            },
+                            _ => {}
                         }
                     }
                 }
@@ -221,10 +244,15 @@ impl GatewayClientExt for Client {
         gateway_api: Url,
         route_hints: Vec<RouteHint>,
         time_to_live: Duration,
+        gateway_id: secp256k1::PublicKey,
     ) -> anyhow::Result<()> {
         let (gateway, _) = self.get_first_module::<GatewayClientModule>(&KIND);
-        let registration_info =
-            gateway.to_gateway_registration_info(route_hints, time_to_live, gateway_api);
+        let registration_info = gateway.to_gateway_registration_info(
+            route_hints,
+            time_to_live,
+            gateway_api,
+            gateway_id,
+        );
 
         let federation_id = self.get_config().federation_id;
         let mut dbtx = self.db().begin_transaction().await;
@@ -264,14 +292,14 @@ impl GatewayClientExt for Client {
                     if let Some(GatewayClientStateMachines::Receive(state)) = stream.next().await {
                         match state.state {
                             IncomingSmStates::Preimage(preimage) => break GatewayExtReceiveStates::Preimage(preimage),
-                            IncomingSmStates::RefundSubmitted(txid) => {
+                            IncomingSmStates::RefundSubmitted{ txid, error } => {
                                 let out_point = OutPoint { txid, out_idx: 0};
                                 match self.await_primary_module_output(operation_id, out_point).await {
-                                    Ok(_) => break GatewayExtReceiveStates::RefundSuccess(out_point),
-                                    Err(e) => break GatewayExtReceiveStates::RefundError(e.to_string()),
+                                    Ok(_) => break GatewayExtReceiveStates::RefundSuccess{ outpoint: out_point, error },
+                                    Err(e) => break GatewayExtReceiveStates::RefundError{ error_message: e.to_string(), error },
                                 }
                             },
-                            IncomingSmStates::FundingFailed(e) => break GatewayExtReceiveStates::FundingFailed(e),
+                            IncomingSmStates::FundingFailed{ error } => break GatewayExtReceiveStates::FundingFailed{ error },
                             _ => {}
                         }
                     }
@@ -284,7 +312,8 @@ impl GatewayClientExt for Client {
 
 #[derive(Debug, Clone)]
 pub struct GatewayClientGen {
-    pub lightning_client: Arc<dyn ILnRpcClient>,
+    pub lnrpc: Arc<dyn ILnRpcClient>,
+    pub node_pub_key: secp256k1::PublicKey,
     pub timelock_delta: u64,
     pub mint_channel_id: u64,
     pub fees: RoutingFees,
@@ -297,16 +326,15 @@ impl ExtendsCommonModuleGen for GatewayClientGen {
 #[apply(async_trait_maybe_send!)]
 impl ClientModuleGen for GatewayClientGen {
     type Module = GatewayClientModule;
-    type Config = LightningClientConfig;
 
     fn supported_api_versions(&self) -> MultiApiVersion {
         MultiApiVersion::try_from_iter([ApiVersion { major: 0, minor: 0 }])
-            .expect("no version conficts")
+            .expect("no version conflicts")
     }
 
     async fn init(
         &self,
-        cfg: Self::Config,
+        cfg: LightningClientConfig,
         _db: Database,
         _api_version: ApiVersion,
         module_root_secret: DerivableSecret,
@@ -314,17 +342,14 @@ impl ClientModuleGen for GatewayClientGen {
         _api: DynGlobalApi,
         module_api: DynModuleApi,
     ) -> anyhow::Result<Self::Module> {
-        let GetNodeInfoResponse { pub_key, alias: _ } = self.lightning_client.info().await?;
-        let node_pub_key = PublicKey::from_slice(&pub_key)
-            .map_err(|e| anyhow::anyhow!("Invalid node pubkey {}", e))?;
         Ok(GatewayClientModule {
+            lnrpc: self.lnrpc.clone(),
             cfg,
             notifier,
             redeem_key: module_root_secret
                 .child_key(ChildId(0))
                 .to_secp_key(&Secp256k1::new()),
-            node_pub_key,
-            lightning_client: self.lightning_client.clone(),
+            node_pub_key: self.node_pub_key,
             timelock_delta: self.timelock_delta,
             mint_channel_id: self.mint_channel_id,
             fees: self.fees,
@@ -340,6 +365,7 @@ pub struct GatewayClientContext {
     timelock_delta: u64,
     secp: secp256k1_zkp::Secp256k1<secp256k1_zkp::All>,
     pub ln_decoder: Decoder,
+    notifier: ModuleNotifier<DynGlobalClientContext, GatewayClientStateMachines>,
 }
 
 impl Context for GatewayClientContext {}
@@ -353,18 +379,9 @@ impl From<&GatewayClientContext> for LightningClientContext {
     }
 }
 
-#[derive(Error, Debug, Serialize, Deserialize)]
-pub enum GatewayError {
-    #[error("Gateway canceled the contract")]
-    Canceled(TransactionId),
-    #[error("Offer does not exist")]
-    OfferDoesNotExist(ContractId),
-    #[error("Unrecoverable error occurred in the gateway")]
-    Failed,
-}
-
 #[derive(Debug)]
 pub struct GatewayClientModule {
+    lnrpc: Arc<dyn ILnRpcClient>,
     cfg: LightningClientConfig,
     pub notifier: ModuleNotifier<DynGlobalClientContext, GatewayClientStateMachines>,
     pub redeem_key: KeyPair,
@@ -372,7 +389,6 @@ pub struct GatewayClientModule {
     timelock_delta: u64,
     mint_channel_id: u64,
     fees: RoutingFees,
-    lightning_client: Arc<dyn ILnRpcClient>,
     module_api: DynModuleApi,
 }
 
@@ -383,11 +399,12 @@ impl ClientModule for GatewayClientModule {
 
     fn context(&self) -> Self::ModuleStateMachineContext {
         Self::ModuleStateMachineContext {
-            lnrpc: self.lightning_client.clone(),
+            lnrpc: self.lnrpc.clone(),
             redeem_key: self.redeem_key,
             timelock_delta: self.timelock_delta,
             secp: secp256k1_zkp::Secp256k1::new(),
             ln_decoder: self.decoder(),
+            notifier: self.notifier.clone(),
         }
     }
 
@@ -426,15 +443,17 @@ impl GatewayClientModule {
         route_hints: Vec<RouteHint>,
         time_to_live: Duration,
         api: Url,
+        gateway_id: secp256k1::PublicKey,
     ) -> LightningGateway {
         LightningGateway {
             mint_channel_id: self.mint_channel_id,
-            gateway_pub_key: self.redeem_key.x_only_public_key().0,
+            gateway_redeem_key: self.redeem_key.x_only_public_key().0,
             node_pub_key: self.node_pub_key,
             api,
             route_hints,
             valid_until: fedimint_core::time::now() + time_to_live,
             fees: self.fees,
+            gateway_id,
         }
     }
 
@@ -449,33 +468,9 @@ impl GatewayClientModule {
             .await;
         info!(
             "Successfully registered gateway {} with federation {}",
-            registration.gateway_pub_key, id
+            registration.gateway_id, id
         );
         Ok(())
-    }
-
-    async fn await_paid_invoice(
-        &self,
-        operation_id: OperationId,
-    ) -> Result<(OutPoint, Preimage), GatewayError> {
-        let mut stream = self.notifier.subscribe(operation_id).await;
-        loop {
-            if let Some(GatewayClientStateMachines::Pay(state)) = stream.next().await {
-                match state.state {
-                    GatewayPayStates::Preimage(outpoint, preimage) => {
-                        return Ok((outpoint, preimage))
-                    }
-                    GatewayPayStates::Canceled(cancel_outpoint, _) => {
-                        return Err(GatewayError::Canceled(cancel_outpoint))
-                    }
-                    GatewayPayStates::OfferDoesNotExist(contract_id) => {
-                        return Err(GatewayError::OfferDoesNotExist(contract_id))
-                    }
-                    GatewayPayStates::Failed => return Err(GatewayError::Failed),
-                    _ => {}
-                }
-            }
-        }
     }
 
     async fn create_funding_incoming_contract_output(
@@ -500,13 +495,23 @@ impl GatewayClientModule {
         let client_output = ClientOutput::<LightningOutput, GatewayClientStateMachines> {
             output: incoming_output,
             state_machines: Arc::new(move |txid, _| {
-                vec![GatewayClientStateMachines::Receive(IncomingStateMachine {
-                    common: IncomingSmCommon {
-                        operation_id,
-                        contract_id,
-                    },
-                    state: IncomingSmStates::FundingOffer(FundingOfferState { txid }),
-                })]
+                vec![
+                    GatewayClientStateMachines::Receive(IncomingStateMachine {
+                        common: IncomingSmCommon {
+                            operation_id,
+                            contract_id,
+                        },
+                        state: IncomingSmStates::FundingOffer(FundingOfferState { txid }),
+                    }),
+                    GatewayClientStateMachines::Complete(GatewayCompleteStateMachine {
+                        common: GatewayCompleteCommon {
+                            operation_id,
+                            incoming_chan_id: htlc.incoming_chan_id,
+                            htlc_id: htlc.htlc_id,
+                        },
+                        state: GatewayCompleteStates::WaitForPreimage(WaitForPreimageState),
+                    }),
+                ]
             }),
         };
         Ok((operation_id, client_output))
@@ -518,6 +523,7 @@ impl GatewayClientModule {
 pub enum GatewayClientStateMachines {
     Pay(GatewayPayStateMachine),
     Receive(IncomingStateMachine),
+    Complete(GatewayCompleteStateMachine),
 }
 
 impl IntoDynInstance for GatewayClientStateMachines {
@@ -550,6 +556,12 @@ impl State for GatewayClientStateMachines {
                     GatewayClientStateMachines::Receive
                 )
             }
+            GatewayClientStateMachines::Complete(complete_state) => {
+                sm_enum_variant_translation!(
+                    complete_state.transitions(context, global_context),
+                    GatewayClientStateMachines::Complete
+                )
+            }
         }
     }
 
@@ -557,6 +569,7 @@ impl State for GatewayClientStateMachines {
         match self {
             GatewayClientStateMachines::Pay(pay_state) => pay_state.operation_id(),
             GatewayClientStateMachines::Receive(receive_state) => receive_state.operation_id(),
+            GatewayClientStateMachines::Complete(complete_state) => complete_state.operation_id(),
         }
     }
 }

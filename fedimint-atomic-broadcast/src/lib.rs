@@ -12,28 +12,6 @@
 //! refer as Fedimint Consensus going forward. To the broadcast a consensus item
 //! is merely a vector of bytes without any further structure.
 //!
-//! # Example Setup
-//!
-//! ```ignore
-//! let block_index = 0;
-//! let (mempool_item_sender, mempool_item_receiver) = async_channel::bounded(256);
-//! let (incoming_message_sender, incoming_message_receiver) = async_channel::bounded(256);
-//! let (outgoing_message_sender, outgoing_message_receiver) = async_channel::bounded(256);
-//! let (ordered_item_sender, ordered_item_receiver) = mpsc::channel(32);
-//! let (shutdown_sender, shutdown_receiver) = watch::channel(None);
-//!
-//! let broadcast_handle = tokio::spawn(fedimint_atomic_broadcast::run(
-//!    keychain,
-//!    db,
-//!    block_index,
-//!    mempool_item_receiver,
-//!    incoming_message_receiver,
-//!    outgoing_message_sender,
-//!    ordered_item_sender,
-//!    shutdown_receiver,
-//! ));
-//! ```
-//!
 //! # The journey of a ConsensusItem
 //!
 //! Let us sketch the journey of an [fedimint_core::epoch::ConsensusItem] into a
@@ -90,7 +68,7 @@
 //! item if it changes the machines state and should discard it otherwise. Let
 //! us consider the case of an ecash note being double spend by the items
 //! A and B while one peer is offline. First, item A is ordered and all correct
-//! peers include the note as spent in their state. Therfore they also accept
+//! peers include the note as spent in their state. Therefore they also accept
 //! the item A. Then, item B is ordered and all correct nodes notice the double
 //! spend and make no changes to their state. Now they can safely discard the
 //! item B as it did not cause a state transition. When the session completes
@@ -98,24 +76,7 @@
 //! back online it downloads the block. Therefore the recovering peer will only
 //! see Item A but arrives at the same state as its peers at the end of the
 //! session regardless. However, it did so by processing one less ordered item
-//! and without realizing that a double spend had occured.
-//!
-//! Since a state machine may process only a subsequence of a sessions items we
-//! can not simply rely on the last processed items index when recovering from a
-//! crash mid session in order to know how many items from the session have
-//! already been applied to our state. Furthermore, the broadcast instance does
-//! not save the decisions for items processed before the crash to disk so
-//! Fedimint Consensus either has to keep track of the decisions on disk or
-//! recompute them. I think the simplest solution to this is to use a single
-//! database transaction for the entire session for all consensus critical state
-//! and maintain the index of the current session as part of the state machine.
-//! If we crash mid session all intermediate state changes are lost and we
-//! simply process the returned ordered items again without any recovery
-//! specific logic. At the end of a session all state machines will arrive at
-//! the same state regardless of the exact number of ordered items they
-//! processed to arrive there. Hence, when we receive the first ordered item of
-//! the next session which indicates that the current session is complete we can
-//! bump the index of current session and finally commit the transaction.
+//! and without realizing that a double spend had occurred.
 
 mod broadcast;
 mod conversion;
@@ -129,9 +90,8 @@ mod spawner;
 
 use bitcoin::merkle_tree;
 use bitcoin_hashes::{sha256, Hash};
-/// This function runs the broadcast until a shutdown is intiated either via the
-/// shutdown sender or the [OrderedItem] receiver is dropped.
-pub use broadcast::run;
+/// The atomic broadcast instance run once by every peer.
+pub use broadcast::AtomicBroadcast;
 use fedimint_core::encoding::{Decodable, Encodable};
 use fedimint_core::PeerId;
 /// This keychain implements naive threshold schnorr signatures over secp256k1.
@@ -143,7 +103,7 @@ pub use keychain::Keychain;
 /// [Recipient] in order for the broadcast to make progress. However, the
 /// broadcast does not assume a reliable network layer and implements all
 /// necessary retry logic. Therefore, the caller can discard a message
-/// immediatly if its intended recipient is offline.
+/// immediately if its intended recipient is offline.
 #[derive(Clone, Debug, Encodable, Decodable)]
 pub enum Message {
     NetworkData(Vec<u8>),
@@ -151,14 +111,14 @@ pub enum Message {
     Block(SignedBlock),
 }
 
-/// This enum defines the intented destination of a [Message].
+/// This enum defines the intended destination of a [Message].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Recipient {
     Everyone,
     Peer(PeerId),
 }
 
-/// This enum specifies wether an [OrderedItem] has been accepted or discarded
+/// This enum specifies whether an [OrderedItem] has been accepted or discarded
 /// by Fedimint Consensus.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Decision {
@@ -173,6 +133,7 @@ pub enum Decision {
 #[derive(Clone, Debug, PartialEq, Eq, Encodable, Decodable)]
 pub struct OrderedItem {
     pub item: Vec<u8>,
+    pub index: u64,
     pub peer_id: PeerId,
 }
 
@@ -216,17 +177,6 @@ impl Block {
 pub struct SignedBlock {
     pub block: Block,
     pub signatures: std::collections::BTreeMap<PeerId, [u8; 64]>,
-}
-
-/// A clean shutdown can be initiated at the end of every session via the
-/// shutdown sender passed to [run]. This can be used for a coordinated shutdown
-/// of a federation in order to upgrade. A mid session shutdown is triggered if
-/// the receiver for the [OrderedItem]s is dropped. This mechanism can be used
-/// if one wants to shut down a single guardian immediatly.
-#[derive(Debug, PartialEq, Eq)]
-pub enum Shutdown {
-    Clean(u64),
-    MidSession(u64),
 }
 
 // TODO: remove this as soon as we bump bitcoin_hashes in fedimint_core to

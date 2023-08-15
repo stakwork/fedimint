@@ -1,6 +1,6 @@
 use std::str::FromStr;
 
-use bitcoin::Network;
+pub use bitcoin::Network;
 use fedimint_core::bitcoinrpc::BitcoinRpcConfig;
 use fedimint_core::core::ModuleKind;
 use fedimint_core::encoding::{Decodable, Encodable};
@@ -79,6 +79,16 @@ pub struct LightningClientConfig {
     pub threshold_pub_key: threshold_crypto::PublicKey,
     pub fee_consensus: FeeConsensus,
     pub network: Network,
+}
+
+impl std::fmt::Display for LightningClientConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "LightningClientConfig {}",
+            serde_json::to_string(self).map_err(|_e| std::fmt::Error)?
+        )
+    }
 }
 
 // Wire together the configs for this module
