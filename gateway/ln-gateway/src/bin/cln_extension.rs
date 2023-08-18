@@ -136,7 +136,7 @@ impl ClnRpcService {
                     let handle = tokio::spawn(async move {
                         // Handle core-lightning "htlc_accepted" events
                         // by passing the HTLC to the interceptor in the plugin state
-                        let value_string = format!("{:?}", &value);
+                        let value_string = format!("{}", &value.to_string());
                         let payload: HtlcAccepted = serde_json::from_value(value).map_err(|e| {
                             ClnExtensionError::Error(anyhow!("Invalid HtlcAccepted {:?} {}", e, value_string)
                         )})?;
