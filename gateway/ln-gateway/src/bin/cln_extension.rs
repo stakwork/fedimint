@@ -134,7 +134,10 @@ impl ClnRpcService {
             .hook(
                 "htlc_accepted",
                 |plugin: Plugin<Arc<ClnHtlcInterceptor>>, value: serde_json::Value| async move {
-                    let payload: HtlcAccepted = serde_json::from_value(value)?;
+                    let value_string = format!("{}", &value.to_string());
+                    let payload: HtlcAccepted = serde_json::from_value(value).map_err(|e| {
+                        ClnExtensionError::Error(anyhow!("Invalid HtlcAccepted {:?} {}", e, value_string)
+                    )})?;
                     Ok(plugin.state().intercept_htlc(payload).await)
                 },
             )
