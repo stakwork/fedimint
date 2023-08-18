@@ -97,7 +97,7 @@ pub struct Htlc {
 pub struct Onion {
     #[serde(default)]
     pub short_channel_id: Option<String>,
-    pub forward_msat: Amount,
+    pub forward_msat: Option<Amount>,
     #[serde(default)]
     pub next_onion: String,
 }
@@ -597,11 +597,15 @@ impl ClnHtlcInterceptor {
                 };
 
             let next_onion = hex::decode(payload.onion.next_onion).unwrap_or(Vec::new());
+            let forward_amount = payload
+                .onion
+                .forward_msat
+                .unwrap_or(payload.htlc.amount_msat);
             let htlc_ret = match sender
                 .send(Ok(InterceptHtlcRequest {
                     payment_hash: payment_hash.clone(),
                     incoming_amount_msat: payload.htlc.amount_msat.msats,
-                    outgoing_amount_msat: payload.onion.forward_msat.msats,
+                    outgoing_amount_msat: forward_amount.msats,
                     incoming_expiry: htlc_expiry,
                     short_channel_id,
                     incoming_chan_id,

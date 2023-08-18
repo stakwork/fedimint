@@ -1758,6 +1758,7 @@ dependencies = [
  "fedimint-tonic-lnd",
  "fedimint-wallet-client",
  "futures",
+ "hex",
  "lightning 0.0.118",
  "lightning-invoice 0.26.0",
  "prost 0.12.3",

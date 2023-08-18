@@ -100,7 +100,7 @@ aleph-bft-types = { opt-level = 3 }
 
 [profile.ci]
 inherits = "dev"
-debug = "line-tables-only"
+# debug = "line-tables-only"
 incremental = false
 
 [profile.release]
