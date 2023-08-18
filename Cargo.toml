@@ -61,7 +61,6 @@ keywords = ["bitcoin", "lightning", "chaumian", "e-cash", "federated"]
 
 
 [profile.dev]
-split-debuginfo = "packed"
 
 # in dev mode optimize crates that are perf-critical (usually just crypto crates)
 [profile.dev.package]
@@ -84,8 +83,7 @@ threshold_crypto = { opt-level = 3 }
 
 [profile.ci]
 inherits = "dev"
-split-debuginfo = "packed"
-debug = 1
+debug = "line-tables-only"
 
 [patch.crates-io]
 secp256k1-zkp = { git = "https://github.com/dpc/rust-secp256k1-zkp/", branch = "sanket-pr" }

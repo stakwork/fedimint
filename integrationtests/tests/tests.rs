@@ -33,26 +33,6 @@ use serde::{Deserialize, Serialize};
 use crate::fixtures::{peers, test};
 
 #[tokio::test(flavor = "multi_thread")]
-async fn wallet_peg_outs_are_rejected_if_fees_are_too_low() -> Result<()> {
-    test(2, |fed, user, bitcoin| async move {
-        let peg_out_amount = Amount::from_sat(1000);
-        let peg_out_address = bitcoin.get_new_address().await;
-
-        fed.mine_and_mint(&*user, &*bitcoin, sats(3000)).await;
-        let mut peg_out = user
-            .fetch_peg_out_fees(peg_out_amount, peg_out_address.clone())
-            .await
-            .unwrap();
-
-        // Lower rate below FeeConsensus
-        peg_out.fees.fee_rate.sats_per_kvb = 10;
-        // TODO: return a better error message to clients
-        assert!(user.submit_peg_out(peg_out).await.is_err());
-    })
-    .await
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn wallet_peg_outs_support_rbf() -> Result<()> {
     test(2, |fed, user, bitcoin| async move {
         // Need lock to keep tx in mempool from getting mined
@@ -94,21 +74,6 @@ async fn wallet_peg_outs_support_rbf() -> Result<()> {
             .await;
         fed.run_consensus_epochs(1).await;
         assert_eq!(fed.max_balance_sheet(), 0);
-    })
-    .await
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn wallet_peg_ins_that_are_unconfirmed_are_rejected() -> Result<()> {
-    test(2, |_fed, user, bitcoin| async move {
-        let peg_in_address = user.get_new_peg_in_address().await;
-        let (proof, tx) = bitcoin
-            .send_and_mine_block(&peg_in_address, Amount::from_sat(10000))
-            .await;
-        let result = user.submit_peg_in(proof, tx).await;
-
-        // TODO make return error more useful
-        assert!(result.is_err());
     })
     .await
 }

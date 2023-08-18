@@ -425,8 +425,7 @@ async fn do_user_task(
             .await
             .map_err(|e| anyhow::anyhow!("while reissuing initial {amount}: {e}"))?;
     }
-    let mut generated_invoices_per_user_iterator =
-        (0..generated_invoices_per_user).into_iter().peekable();
+    let mut generated_invoices_per_user_iterator = (0..generated_invoices_per_user).peekable();
     while let Some(_) = generated_invoices_per_user_iterator.next() {
         let total_amount = get_note_summary(&client).await?.total_amount();
         if invoice_amount > total_amount {
@@ -528,7 +527,7 @@ async fn test_connect_raw_client(
     info!("Connecting to {users} clients");
     let clients = (0..users)
         .flat_map(|_| {
-            let clients = cfg.api_endpoints.values().into_iter().map(|url| async {
+            let clients = cfg.api_endpoints.values().map(|url| async {
                 let ws_client = WsClientBuilder::default()
                     .use_webpki_rustls()
                     .request_timeout(timeout)
@@ -646,7 +645,11 @@ async fn handle_metrics_summary(
     }
     if let Some(metrics_json_output) = opts.metrics_json_output {
         metrics_json_output_files.push(BufWriter::new(
-            tokio::fs::File::create(metrics_json_output).await?,
+            tokio::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .open(metrics_json_output)
+                .await?,
         ))
     }
 

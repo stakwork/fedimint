@@ -61,7 +61,7 @@ use fedimint_wallet_common::tweakable::Tweakable;
 use fedimint_wallet_common::Rbf;
 use futures::StreamExt;
 use miniscript::psbt::PsbtExt;
-use miniscript::{Descriptor, TranslatePk};
+use miniscript::{translate_hash_fail, Descriptor, TranslatePk};
 use rand::rngs::OsRng;
 use secp256k1::{Message, Scalar};
 use serde::{Deserialize, Serialize};
@@ -370,9 +370,7 @@ impl ServerModule for Wallet {
                 let new_consensus_block_count = self.consensus_block_count(dbtx).await;
 
                 // only sync from the first non-default consensus block count
-                if new_consensus_block_count > old_consensus_block_count
-                    && old_consensus_block_count > 0
-                {
+                if new_consensus_block_count > old_consensus_block_count {
                     self.sync_up_to_consensus_height(
                         dbtx,
                         old_consensus_block_count,
@@ -941,8 +939,7 @@ impl Wallet {
 
         // We need to search and remove all `PendingTransactions` invalidated by RBF
         let mut pending_to_remove = vec![pending_tx.clone()];
-        while !pending_to_remove.is_empty() {
-            let removed = pending_to_remove.pop().expect("exists");
+        while let Some(removed) = pending_to_remove.pop() {
             all_transactions.remove(&removed.tx.txid());
             dbtx.remove_entry(&PendingTransactionKey(removed.tx.txid()))
                 .await;
@@ -1378,7 +1375,7 @@ impl<'a> StatelessWallet<'a> {
         }
 
         impl<'t, 's, Ctx: Verification>
-            miniscript::PkTranslator<CompressedPublicKey, CompressedPublicKey, Infallible>
+            miniscript::Translator<CompressedPublicKey, CompressedPublicKey, Infallible>
             for CompressedPublicKeyTranslator<'t, 's, Ctx>
         {
             fn pk(&mut self, pk: &CompressedPublicKey) -> Result<CompressedPublicKey, Infallible> {
@@ -1398,13 +1395,7 @@ impl<'a> StatelessWallet<'a> {
                         .expect("tweaking failed"),
                 })
             }
-
-            fn pkh(
-                &mut self,
-                pkh: &CompressedPublicKey,
-            ) -> Result<CompressedPublicKey, Infallible> {
-                self.pk(pkh)
-            }
+            translate_hash_fail!(CompressedPublicKey, CompressedPublicKey, Infallible);
         }
 
         let descriptor = self
@@ -1539,6 +1530,7 @@ mod tests {
 
 #[cfg(test)]
 mod fedimint_migration_tests {
+    use anyhow::{ensure, Context};
     use bitcoin::psbt::{Input, PartiallySignedTransaction};
     use bitcoin::{
         Amount, BlockHash, PackedLockTime, Script, Sequence, Transaction, TxIn, TxOut, Txid,
@@ -1742,7 +1734,7 @@ mod fedimint_migration_tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_migrations() {
+    async fn test_migrations() -> anyhow::Result<()> {
         validate_migrations(
             "wallet",
             |db| async move {
@@ -1754,7 +1746,7 @@ mod fedimint_migration_tests {
                     module.get_database_migrations(),
                 )
                 .await
-                .expect("Error applying migrations to temp database");
+                .context("Error applying migrations to temp database")?;
 
                 // Verify that all of the data from the wallet namespace can be read. If a
                 // database migration failed or was not properly supplied,
@@ -1770,7 +1762,7 @@ mod fedimint_migration_tests {
                                 .collect::<Vec<_>>()
                                 .await;
                             let num_blocks = blocks.len();
-                            assert!(
+                            ensure!(
                                 num_blocks > 0,
                                 "validate_migrations was not able to read any BlockHashes"
                             );
@@ -1782,7 +1774,7 @@ mod fedimint_migration_tests {
                                 .collect::<Vec<_>>()
                                 .await;
                             let num_outpoints = outpoints.len();
-                            assert!(
+                            ensure!(
                                 num_outpoints > 0,
                                 "validate_migrations was not able to read any PegOutBitcoinTransactions"
                             );
@@ -1794,7 +1786,7 @@ mod fedimint_migration_tests {
                                 .collect::<Vec<_>>()
                                 .await;
                             let num_sigs = sigs.len();
-                            assert!(
+                            ensure!(
                                 num_sigs > 0,
                                 "validate_migrations was not able to read any PegOutTxSigCi"
                             );
@@ -1806,13 +1798,13 @@ mod fedimint_migration_tests {
                                 .collect::<Vec<_>>()
                                 .await;
                             let num_txs = pending_txs.len();
-                            assert!(
+                            ensure!(
                                 num_txs > 0,
                                 "validate_migrations was not able to read any PendingTransactions"
                             );
                         }
                         DbKeyPrefix::PegOutNonce => {
-                            assert!(dbtx
+                            ensure!(dbtx
                                 .get_value(&PegOutNonceKey)
                                 .await
                                 .is_some());
@@ -1824,7 +1816,7 @@ mod fedimint_migration_tests {
                                 .collect::<Vec<_>>()
                                 .await;
                             let num_txs = unsigned_txs.len();
-                            assert!(
+                            ensure!(
                                 num_txs > 0,
                                 "validate_migrations was not able to read any UnsignedTransactions"
                             );
@@ -1836,7 +1828,7 @@ mod fedimint_migration_tests {
                                 .collect::<Vec<_>>()
                                 .await;
                             let num_utxos = utxos.len();
-                            assert!(
+                            ensure!(
                                 num_utxos > 0,
                                 "validate_migrations was not able to read any UTXOs"
                             );
@@ -1848,7 +1840,7 @@ mod fedimint_migration_tests {
                                 .collect::<Vec<_>>()
                                 .await;
                             let num_heights = heights.len();
-                            assert!(
+                            ensure!(
                                 num_heights > 0,
                                 "validate_migrations was not able to read any block height votes"
                             );
@@ -1860,13 +1852,14 @@ mod fedimint_migration_tests {
                                 .collect::<Vec<_>>()
                                 .await;
                             let num_rates = rates.len();
-                            assert!(
+                            ensure!(
                                 num_rates > 0,
                                 "validate_migrations was not able to read any fee rate votes"
                             );
                         }
                     }
                 }
+                Ok(())
             },
             ModuleDecoderRegistry::from_iter([(
                 LEGACY_HARDCODED_INSTANCE_ID_WALLET,
@@ -1874,6 +1867,6 @@ mod fedimint_migration_tests {
                 <Wallet as ServerModule>::decoder(),
             )]),
         )
-        .await;
+        .await
     }
 }

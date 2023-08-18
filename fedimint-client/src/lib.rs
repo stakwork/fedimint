@@ -106,6 +106,7 @@ use rand::thread_rng;
 use secp256k1_zkp::{PublicKey, Secp256k1};
 use secret::DeriveableSecretClientExt;
 use serde::Serialize;
+use tokio::runtime::{Handle as RuntimeHandle, RuntimeFlavor};
 use tracing::{debug, error, info, warn};
 
 use crate::backup::Metadata;
@@ -485,9 +486,20 @@ impl Drop for Client {
             let maybe_shutdown_confirmation = self.inner.executor.stop_executor();
 
             // Just in case the shutdown does not take immediate effect we block here if
-            // possible
+            // possible. If running as WASM we are running in single-threaded mode and
+            // cannot use block_on.
             #[cfg(not(target_family = "wasm"))]
-            if let Some(shutdown_confirmation) = maybe_shutdown_confirmation {
+            {
+                if RuntimeHandle::current().runtime_flavor() == RuntimeFlavor::CurrentThread {
+                    // We can't use block_on in single-threaded mode
+                    return;
+                }
+
+                let Some(shutdown_confirmation) = maybe_shutdown_confirmation else {
+                    // Already shut down
+                    return;
+                };
+
                 tokio::task::block_in_place(move || {
                     futures::executor::block_on(async {
                         if shutdown_confirmation.await.is_err() {
@@ -756,17 +768,20 @@ impl Client {
 
     /// Returns a stream that yields the current client balance every time it
     /// changes.
-    pub async fn subscribe_balance_changes(&self) -> BoxStream<'_, Amount> {
+    pub async fn subscribe_balance_changes(&self) -> BoxStream<'static, Amount> {
         let mut balance_changes = self.primary_module().subscribe_balance_changes().await;
         let initial_balance = self.get_balance().await;
+        let db = self.db().clone();
+        let primary_module = self.primary_module().clone();
+        let primary_module_instance = self.inner.primary_module_instance;
+
         Box::pin(stream! {
             yield initial_balance;
             let mut prev_balance = initial_balance;
             while let Some(()) = balance_changes.next().await {
-                let mut dbtx = self.db().begin_transaction().await;
-                let balance = self
-                    .primary_module()
-                    .get_balance(self.inner.primary_module_instance, &mut dbtx)
+                let mut dbtx = db.begin_transaction().await;
+                let balance = primary_module
+                    .get_balance(primary_module_instance, &mut dbtx)
                     .await;
 
                 // Deduplicate in case modules cannot always tell if the balance actually changed
@@ -1520,6 +1535,8 @@ async fn get_config(
         }
     };
 
+    // some borrowck lifetime limitation thing
+    #[allow(clippy::let_and_return)]
     config_res
 }
 
@@ -1668,7 +1685,7 @@ pub fn client_decoders<'a>(
     for (id, kind) in module_kinds {
         let Some(init) = registry.get(kind) else {
             info!("Detected configuration for unsupported module id: {id}, kind: {kind}");
-            continue
+            continue;
         };
 
         modules.insert(

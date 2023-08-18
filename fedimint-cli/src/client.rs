@@ -63,6 +63,12 @@ pub enum ClientCmd {
         #[clap(value_parser = parse_fedimint_amount)]
         amount: Amount,
     },
+    /// Verifies the signatures of e-cash notes, but *not* if they have been
+    /// spent already
+    Validate {
+        #[clap(value_parser = parse_ecash)]
+        notes: TieredMulti<SpendableNote>,
+    },
     /// Create a lightning invoice to receive payment via gateway
     LnInvoice {
         #[clap(long, value_parser = parse_fedimint_amount)]
@@ -140,9 +146,7 @@ pub async fn handle_ng_command(
     client: Client,
 ) -> anyhow::Result<serde_json::Value> {
     match command {
-        ClientCmd::Info => {
-            return get_note_summary(&client).await;
-        }
+        ClientCmd::Info => get_note_summary(&client).await,
         ClientCmd::Reissue { notes } => {
             let amount = notes.total_amount();
 
@@ -171,6 +175,13 @@ pub async fn handle_ng_command(
 
             Ok(json!({
                 "notes": serialize_ecash(&notes),
+            }))
+        }
+        ClientCmd::Validate { notes } => {
+            let amount = client.validate_notes(notes).await?;
+
+            Ok(json!({
+                "amount_msat": amount,
             }))
         }
         ClientCmd::LnInvoice {
@@ -208,9 +219,9 @@ pub async fn handle_ng_command(
                 info!("Update: {:?}", update);
             }
 
-            return Err(anyhow::anyhow!(
+            Err(anyhow::anyhow!(
                 "Unexpected end of update stream. Lightning receive failed"
-            ));
+            ))
         }
         ClientCmd::LnPay { bolt11 } => {
             client.select_active_gateway().await?;
@@ -274,7 +285,7 @@ pub async fn handle_ng_command(
                 }
             };
 
-            return Err(anyhow::anyhow!("Lightning Payment failed"));
+            Err(anyhow::anyhow!("Lightning Payment failed"))
         }
         ClientCmd::ListGateways => {
             let gateways = client.fetch_registered_gateways().await?;

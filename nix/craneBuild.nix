@@ -6,7 +6,8 @@ craneLib.overrideScope' (self: prev: {
 
   workspaceDeps = self.buildDepsOnly (prev.commonArgsDepsOnly // {
     version = "0.0.1";
-    buildPhaseCargoCommand = "cargo doc --workspace --locked --profile $CARGO_PROFILE ; cargo check --workspace  --locked --profile $CARGO_PROFILE --all-targets ; cargo build --locked --profile $CARGO_PROFILE --workspace --all-targets";
+    # note: cargo doc does not have --all-targets
+    buildPhaseCargoCommand = "cargo doc --workspace --locked --profile $CARGO_PROFILE ; cargo check --workspace --all-targets --locked --profile $CARGO_PROFILE ; cargo build --locked --profile $CARGO_PROFILE --workspace --all-targets";
     doCheck = false;
   });
 
@@ -73,7 +74,7 @@ craneLib.overrideScope' (self: prev: {
     nativeBuildInputs = self.commonArgs.nativeBuildInputs ++ [ pkgs.cargo-udeps ];
     # since we filtered all the actual project source, everything will definitely fail
     # but we only run this step to cache the build artifacts, so we ignore failure with `|| true`
-    buildPhaseCargoCommand = "cargo udeps --all-targets --workspace --profile $CARGO_PROFILE || true";
+    buildPhaseCargoCommand = "cargo udeps --workspace --all-targets --profile $CARGO_PROFILE || true";
     doCheck = false;
   });
 
@@ -84,7 +85,7 @@ craneLib.overrideScope' (self: prev: {
     # about the docs
     cargoArtifacts = self.workspaceCargoUdepsDeps;
     nativeBuildInputs = self.commonArgs.nativeBuildInputs ++ [ pkgs.cargo-udeps ];
-    buildPhaseCargoCommand = "cargo udeps --all-targets --workspace --profile $CARGO_PROFILE";
+    buildPhaseCargoCommand = "cargo udeps --workspace --all-targets --profile $CARGO_PROFILE";
     doInstallCargoArtifacts = false;
     doCheck = false;
   });
@@ -99,7 +100,7 @@ craneLib.overrideScope' (self: prev: {
   workspaceDepsCov = self.buildDepsOnly (self.commonArgsDepsOnly // {
     pnameSuffix = "-lcov-deps";
     version = "0.0.1";
-    buildPhaseCargoCommand = "cargo llvm-cov --locked --workspace --profile $CARGO_PROFILE --no-report";
+    buildPhaseCargoCommand = "cargo llvm-cov --locked --workspace --all-targets --profile $CARGO_PROFILE --no-report";
     cargoBuildCommand = "dontuse";
     cargoCheckCommand = "dontuse";
     nativeBuildInputs = self.commonArgs.nativeBuildInputs ++ [ self.cargo-llvm-cov ];
@@ -110,7 +111,7 @@ craneLib.overrideScope' (self: prev: {
     pnameSuffix = "-lcov";
     version = "0.0.1";
     cargoArtifacts = self.workspaceDepsCov;
-    buildPhaseCargoCommand = "mkdir -p $out ; env RUST_BACKTRACE=1 RUST_LOG=info,timing=debug cargo llvm-cov --locked --workspace --profile $CARGO_PROFILE --lcov --all-targets --tests --output-path $out/lcov.info --  --test-threads=$(($(nproc) * 2))";
+    buildPhaseCargoCommand = "mkdir -p $out ; env RUST_BACKTRACE=1 RUST_LOG=info,timing=debug cargo llvm-cov --locked --workspace --all-targets --profile $CARGO_PROFILE --lcov --tests --output-path $out/lcov.info --  --test-threads=$(($(nproc) * 2))";
     installPhaseCommand = "true";
     nativeBuildInputs = self.commonArgs.nativeBuildInputs ++ [ self.cargo-llvm-cov ];
     doCheck = false;
@@ -120,35 +121,35 @@ craneLib.overrideScope' (self: prev: {
     pname = "${self.commonCliTestArgs.pname}-reconnect";
     version = "0.0.1";
     cargoArtifacts = self.workspaceBuild;
-    buildPhaseCargoCommand = "patchShebangs ./scripts ; ./scripts/reconnect-test.sh";
+    buildPhaseCargoCommand = "patchShebangs ./scripts ; ./scripts/tests/reconnect-test.sh";
   });
 
   cliTestLatency = self.mkCargoDerivation (self.commonCliTestArgs // {
     pname = "${self.commonCliTestArgs.pname}-latency";
     version = "0.0.1";
     cargoArtifacts = self.workspaceBuild;
-    buildPhaseCargoCommand = "patchShebangs ./scripts ; ./scripts/latency-test.sh";
+    buildPhaseCargoCommand = "patchShebangs ./scripts ; ./scripts/tests/latency-test.sh";
   });
 
   cliTestCli = self.mkCargoDerivation (self.commonCliTestArgs // {
     pname = "${self.commonCliTestArgs.pname}-cli";
     version = "0.0.1";
     cargoArtifacts = self.workspaceBuild;
-    buildPhaseCargoCommand = "patchShebangs ./scripts ; ./scripts/cli-test.sh";
+    buildPhaseCargoCommand = "patchShebangs ./scripts ; ./scripts/tests/cli-test.sh";
   });
 
   cliLoadTestToolTest = self.mkCargoDerivation (self.commonCliTestArgs // {
     pname = "${self.commonCliTestArgs.pname}-cli";
     version = "0.0.1";
     cargoArtifacts = self.workspaceBuild;
-    buildPhaseCargoCommand = "patchShebangs ./scripts ; ./scripts/load-test-tool-test.sh";
+    buildPhaseCargoCommand = "patchShebangs ./scripts ; ./scripts/tests/load-test-tool-test.sh";
   });
 
   cliRustTests = self.mkCargoDerivation (self.commonCliTestArgs // {
     pname = "${self.commonCliTestArgs.pname}-rust-tests";
     version = "0.0.1";
     cargoArtifacts = self.workspaceBuild;
-    buildPhaseCargoCommand = "patchShebangs ./scripts ; ./scripts/rust-tests.sh";
+    buildPhaseCargoCommand = "patchShebangs ./scripts ; ./scripts/tests/rust-tests.sh";
   });
 
   cliTestsAll = self.mkCargoDerivation (self.commonCliTestArgs // {
@@ -161,10 +162,10 @@ craneLib.overrideScope' (self: prev: {
     # won't start other tests.
     buildPhaseCargoCommand = ''
       patchShebangs ./scripts
-      ./scripts/test-ci-all.sh || exit 1
-      sed -i -e 's/exit 0/exit 1/g' scripts/always-success-test.sh
+      ./scripts/tests/test-ci-all.sh || exit 1
+      sed -i -e 's/exit 0/exit 1/g' scripts/tests/always-success-test.sh
       echo "Verifying failure detection..."
-      ./scripts/test-ci-all.sh 1>/dev/null 2>/dev/null && exit 1
+      ./scripts/tests/test-ci-all.sh 1>/dev/null 2>/dev/null && exit 1
     '';
   });
 
@@ -172,7 +173,7 @@ craneLib.overrideScope' (self: prev: {
     pname = "${self.commonCliTestArgs.pname}-always-fail";
     version = "0.0.1";
     cargoArtifacts = self.workspaceBuild;
-    buildPhaseCargoCommand = "patchShebangs ./scripts ; ./scripts/always-fail-test.sh";
+    buildPhaseCargoCommand = "patchShebangs ./scripts ; ./scripts/tests/always-fail-test.sh";
   });
 
   wasmTests = { nativeWorkspaceBuild, wasmTarget }: self.mkCargoDerivation (self.commonCliTestArgs // {
@@ -180,7 +181,7 @@ craneLib.overrideScope' (self: prev: {
     version = "0.0.1";
     cargoArtifacts = nativeWorkspaceBuild;
     nativeBuildInputs = self.commonCliTestArgs.nativeBuildInputs ++ [ pkgs.firefox pkgs.wasm-bindgen-cli pkgs.geckodriver pkgs.wasm-pack ];
-    buildPhaseCargoCommand = "patchShebangs ./scripts; SKIP_CARGO_BUILD=1 ./scripts/wasm-tests.sh";
+    buildPhaseCargoCommand = "patchShebangs ./scripts; SKIP_CARGO_BUILD=1 ./scripts/tests/wasm-tests.sh";
     preBuild = wasmTarget.extraEnvs;
   });
 

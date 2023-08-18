@@ -3,19 +3,19 @@ default:
 
 # run `cargo build` on everything
 build:
-  cargo build --all --all-targets
+  cargo build --workspace --all-targets
 
 # run `cargo check` on everything
 check:
-  cargo check --all --all-targets
+  cargo check --workspace --all-targets
 
 # run `cargo clippy` on everything
 clippy:
-  cargo clippy --all --all-targets --deny warnings --allow deprecated
+  cargo clippy --workspace --all-targets -- --deny warnings --allow deprecated
 
 # run `cargo clippy --fix` on everything
 clippy-fix:
-  cargo clippy --all --all-targets --fix
+  cargo clippy --workspace --all-targets --fix
 
 # check if ulimit is set correctly
 check-ulimit:
@@ -30,15 +30,15 @@ test: build check-ulimit
 
 # run tests against real services (like bitcoind)
 test-real: check-ulimit
-  ./scripts/rust-tests.sh
+  ./scripts/tests/rust-tests.sh
 
 # run all tests in parallel like CI would
 test-ci-all:
-  ./scripts/test-ci-all.sh
+  ./scripts/tests/test-ci-all.sh
 
 # show number of tests per package
 test-count:
-  ./scripts/test-cov.sh
+  ./scripts/tests/test-cov.sh
 
 # run lints (quick)
 lint:
@@ -99,7 +99,7 @@ format:
 
 # start mprocs with a dev federation setup
 mprocs:
-  ./scripts/mprocs.sh
+  ./scripts/dev/mprocs/run.sh
 
 # exit mprocs session
 exit-mprocs:
@@ -107,7 +107,7 @@ exit-mprocs:
 
 # start tmuxinator with dev federation setup
 tmuxinator:
-  ./scripts/tmuxinator.sh
+  ./scripts/dev/tmuxinator/run.sh
 
 # exit tmuxinator session
 exit-tmuxinator:

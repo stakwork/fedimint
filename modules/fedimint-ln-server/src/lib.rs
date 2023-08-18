@@ -489,7 +489,7 @@ impl ServerModule for Lightning {
                     .get_value(&contract_db_key)
                     .await
                     .expect("checked before that it exists");
-                let mut incoming = match &mut contract_account.contract {
+                let incoming = match &mut contract_account.contract {
                     FundedContract::Incoming(incoming) => incoming,
                     _ => unreachable!("previously checked that it's an incoming contract"),
                 };
@@ -1123,8 +1123,8 @@ mod tests {
 #[cfg(test)]
 mod fedimint_migration_tests {
     use std::str::FromStr;
-    use std::time::SystemTime;
 
+    use anyhow::{ensure, Context};
     use bitcoin_hashes::Hash;
     use fedimint_core::core::LEGACY_HARDCODED_INSTANCE_ID_LN;
     use fedimint_core::db::{apply_migrations, DatabaseTransaction};
@@ -1251,7 +1251,7 @@ mod fedimint_migration_tests {
             api: Url::parse("http://example.com")
                 .expect("Could not parse URL to generate GatewayClientConfig API endpoint"),
             route_hints: vec![],
-            valid_until: SystemTime::now(),
+            valid_until: fedimint_core::time::now(),
             fees: RoutingFees {
                 base_msat: 0,
                 proportional_millionths: 0,
@@ -1286,7 +1286,7 @@ mod fedimint_migration_tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_migrations() {
+    async fn test_migrations() -> anyhow::Result<()> {
         validate_migrations(
             "lightning",
             |db| async move {
@@ -1298,7 +1298,7 @@ mod fedimint_migration_tests {
                     module.get_database_migrations(),
                 )
                 .await
-                .expect("Error applying migrations to temp database");
+                .context("Error applying migrations to temp database")?;
 
                 // Verify that all of the data from the lightning namespace can be read. If a
                 // database migration failed or was not properly supplied,
@@ -1314,7 +1314,7 @@ mod fedimint_migration_tests {
                                 .collect::<Vec<_>>()
                                 .await;
                             let num_contracts = contracts.len();
-                            assert!(
+                            ensure!(
                                 num_contracts > 0,
                                 "validate_migrations was not able to read any contracts"
                             );
@@ -1326,7 +1326,7 @@ mod fedimint_migration_tests {
                                 .collect::<Vec<_>>()
                                 .await;
                             let num_shares = agreed_decryption_shares.len();
-                            assert!(
+                            ensure!(
                             num_shares > 0,
                             "validate_migrations was not able to read any AgreedDecryptionShares"
                         );
@@ -1338,7 +1338,7 @@ mod fedimint_migration_tests {
                                 .collect::<Vec<_>>()
                                 .await;
                             let num_updates = contract_updates.len();
-                            assert!(
+                            ensure!(
                                 num_updates > 0,
                                 "validate_migrations was not able to read any ContractUpdates"
                             );
@@ -1350,7 +1350,7 @@ mod fedimint_migration_tests {
                                 .collect::<Vec<_>>()
                                 .await;
                             let num_gateways = gateways.len();
-                            assert!(
+                            ensure!(
                                 num_gateways > 0,
                                 "validate_migrations was not able to read any LightningGateways"
                             );
@@ -1362,7 +1362,7 @@ mod fedimint_migration_tests {
                                 .collect::<Vec<_>>()
                                 .await;
                             let num_offers = offers.len();
-                            assert!(
+                            ensure!(
                                 num_offers > 0,
                                 "validate_migrations was not able to read any Offers"
                             );
@@ -1374,7 +1374,7 @@ mod fedimint_migration_tests {
                                 .collect::<Vec<_>>()
                                 .await;
                             let num_shares = proposed_decryption_shares.len();
-                            assert!(
+                            ensure!(
                             num_shares > 0,
                             "validate_migrations was not able to read any ProposeDecryptionShares"
                         );
@@ -1387,13 +1387,14 @@ mod fedimint_migration_tests {
                                 .collect::<Vec<_>>()
                                 .await;
                             let num_shares = encrypted_preimage_index.len();
-                            assert!(
+                            ensure!(
                                 num_shares > 0,
                                 "validate_migrations was not able to read any EncryptedPreimageIndexKeys"
                             );
                         }
                     }
                 }
+                Ok(())
             },
             ModuleDecoderRegistry::from_iter([(
                 LEGACY_HARDCODED_INSTANCE_ID_LN,
@@ -1401,6 +1402,6 @@ mod fedimint_migration_tests {
                 <Lightning as ServerModule>::decoder(),
             )]),
         )
-        .await;
+        .await
     }
 }

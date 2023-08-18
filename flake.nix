@@ -1,9 +1,9 @@
 {
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-22.11";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-23.05";
     nixpkgs-unstable.url = "github:NixOS/nixpkgs/nixos-unstable";
     nixpkgs-kitman.url = "github:jkitman/nixpkgs/add-esplora-pkg";
-    crane.url = "github:ipetkov/crane?rev=116b32c30b5ff28e49f4fcbeeb1bbe3544593204";
+    crane.url = "github:ipetkov/crane?rev=6c25eff4edca8556df21f55c63e49f20efe4be95";
     crane.inputs.nixpkgs.follows = "nixpkgs";
     flake-utils.url = "github:numtide/flake-utils";
     fenix = {
@@ -28,14 +28,21 @@
     flake-utils.lib.eachDefaultSystem
       (system:
         let
-          pkgs = import nixpkgs {
-            inherit system;
-          };
-          pkgs-kitman = import nixpkgs-kitman {
+
+          pkgs-unstable = import nixpkgs-unstable {
             inherit system;
           };
 
-          pkgs-unstable = import nixpkgs-unstable {
+          pkgs = import nixpkgs {
+            inherit system;
+            overlays = [
+              (final: prev: {
+                cargo-udeps = pkgs-unstable.cargo-udeps;
+              })
+            ];
+          };
+
+          pkgs-kitman = import nixpkgs-kitman {
             inherit system;
           };
 
@@ -46,7 +53,7 @@
           clightning-dev = pkgs.clightning.overrideAttrs (oldAttrs: {
             configureFlags = [ "--enable-developer" "--disable-valgrind" ];
           } // pkgs.lib.optionalAttrs (!pkgs.stdenv.isDarwin) {
-            NIX_CFLAGS_COMPILE = "-Wno-stringop-truncation";
+            NIX_CFLAGS_COMPILE = "-Wno-stringop-truncation -w";
           });
 
           # `moreutils/bin/parallel` and `parallel/bin/parallel` conflict, so just use
@@ -338,7 +345,7 @@
                     pkgs.rust-analyzer
                     toolchain.fenixToolchainRustfmt
                     cargo-llvm-cov
-                    cargo-udeps
+                    pkgs.cargo-udeps
                     pkgs.parallel
                     pkgs.just
                     typos
@@ -369,7 +376,7 @@
                     pkgs.shellcheck
                     pkgs.rnix-lsp
                     pkgs.nil
-                    pkgs-unstable.convco
+                    pkgs.convco
                     pkgs.nodePackages.bash-language-server
                   ] ++ lib.optionals (!stdenv.isAarch64 && !stdenv.isDarwin) [
                     pkgs.semgrep
