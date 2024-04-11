@@ -1,6 +1,6 @@
 [package]
 name = "fedimint-ln-common"
-version = "0.3.0-alpha"
+version = "0.4.0-alpha"
 authors = ["The Fedimint Developers"]
 edition = "2021"
 description = "fedimint-ln is a lightning payment service module."
@@ -22,30 +22,30 @@ name = "fedimint_ln_common"
 path = "src/lib.rs"
 
 [dependencies]
-anyhow = "1.0.66"
-async-trait = "0.1.73"
-aquamarine = "0.3.0"
-bitcoin_hashes = "0.11.0"
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+aquamarine = "0.5.0"
+bitcoin_hashes = { workspace = true }
 bitcoin = { version = "0.29.2", features = [ "rand", "serde"] }
-erased-serde = "0.3"
-futures = "0.3.24"
-itertools = "0.10.5"
+erased-serde = { workspace = true }
+futures = { workspace = true }
+itertools = { workspace = true }
 lightning = { version = "0.0.118", default-features = false, features = ["no-std"] }
 lightning-invoice = { version = "0.26.0", features = [ "serde" ] }
-fedimint-client = { version = "0.3.0-alpha", path = "../../fedimint-client" }
-fedimint-core = { version = "0.3.0-alpha", path = "../../fedimint-core" }
-secp256k1 = { version="0.24.2", default-features=false }
-serde = {version = "1.0.149", features = [ "derive" ] }
-serde_json = "1.0.91"
-strum = "0.24"
-strum_macros = "0.24"
-thiserror = "1.0.39"
+fedimint-client = { version = "=0.4.0-alpha", path = "../../fedimint-client" }
+fedimint-core = { version = "=0.4.0-alpha", path = "../../fedimint-core" }
+secp256k1 = { version="0.24.3", default-features=false }
+serde = {version = "1.0.197", features = [ "derive" ] }
+serde_json = { workspace = true }
+strum = { workspace = true }
+strum_macros = { workspace = true }
+thiserror = { workspace = true }
 threshold_crypto = { workspace = true }
-tracing = "0.1.37"
-rand = "0.8"
-url = { version = "2.3.1", features = ["serde"] }
+tracing = { workspace = true }
+rand = { workspace = true }
+url = { version = "2.5.0", features = ["serde"] }
 serde-big-array = "0.5.1"
 
 [dev-dependencies]
-tokio = {version = "1.26.0", features = [ "full" ] }
-tracing-subscriber = { version = "0.3.16", features = [ "env-filter" ] }
+tokio = {version = "1.36.0", features = [ "full" ] }
+tracing-subscriber = { version = "0.3.18", features = [ "env-filter" ] }

@@ -16,6 +16,9 @@
   <a href="https://github.com/fedimint/fedimint/discussions">
     <img src="https://img.shields.io/badge/commmunity-discussion-blue" alt="github discussion">
   </a>
+  <a href="https://docs.fedimint.org">
+    <img src="https://img.shields.io/static/v1?label=Docs&message=master&color=007ec6&logo=GitBook&logoColor=ffffff" alt="docs built from master">
+  </a>
   <img alt="Lines of code" src="https://img.shields.io/tokei/lines/github/fedimint/fedimint">
 </p>
 
@@ -44,6 +47,7 @@ See the [Fedimint Mutinynet Setup Guide](./docs/setup-docs.md). You can modify t
 We are actively looking for developers to help build Fedimint and associated open-source Bitcoin projects. Fedimint touches many different areas of Bitcoin development, so there is something for everyone. The best places to get started are:
 
 - [The Fedimint Developer Discord](https://discord.gg/cEVEmqCgWG): the best place to get help and ask questions.
+- [Fedimint Technical Reference Documentation](https://docs.fedimint.org)
 - [Fedimint Contributor Calendar](https://calendar.google.com/calendar/u/0/embed?src=fedimintcalendar@gmail.com): This calendar contains all the developer calls and events.
 - [Fedimint Developer Calls](https://meet.jit.si/fedimintdevcall): We have developer calls every monday at 4PM UTC to review PRs and discuss current development priorities. As a new developer, this is a great place to find good first issues and mentorship from the core team on how to get started contributing to Fedimint.
 - [Weekly Deep Dive](https://meet.jit.si/fedimintdevcall): We have a deep dive every thursday at 4PM UTC to discuss technical topics relating to Fedimint in depth: cryptography, Rust programming, consensus, networking, etc. This is a great place to learn about the internals of Fedimint and Bitcoin. We normally plan these calls based off requests from contributors on aspects of Fedimint they want to learn more about, so please reach out if you have a topic you want to learn more about.
@@ -65,7 +69,7 @@ Fedimint is a Rust project and uses the [Nix package manager](https://nixos.org/
 Fedimint's developer environment and rust build pipeline is managed through Nix flakebox (https://github.com/rustshop/flakebox). To get started, install Nix.
 
 ```bash
-sh <(curl -L https://nixos.org/nix/install) --daemon
+curl --proto '=https' --tlsv1.2 -sSf -L https://install.determinate.systems/nix | sh -s -- install
 ```
 
 Then fork and clone the Fedimint repo.
@@ -89,3 +93,6 @@ just mprocs
 You can then interact with the guardians and lightning gateway through the mprocs cli.
 
 If you want to run with UIs, see the [UI](https://github.com/fedimint/ui) repo for developer environment instructions.
+
+# Contributing
+For contribution guidelines, Areas of contributions and how to get involved, please refer to the [Contributing Guidelines](CONTRIBUTING.md).

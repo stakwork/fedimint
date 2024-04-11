@@ -1,9 +1,6 @@
-use std::result::Result;
-
-use bitcoin::Address;
+use bitcoin29::Address;
 use fedimint_core::util::SafeUrl;
 use fedimint_core::{Amount, TransactionId};
-pub use reqwest::{Error, Response};
 use reqwest::{Method, StatusCode};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -83,7 +80,10 @@ impl GatewayRpcClient {
         self.call_post(url, payload).await
     }
 
-    pub async fn leave_federation(&self, payload: LeaveFedPayload) -> GatewayRpcResult<()> {
+    pub async fn leave_federation(
+        &self,
+        payload: LeaveFedPayload,
+    ) -> GatewayRpcResult<FederationInfo> {
         let url = self.base_url.join("/leave-fed").expect("invalid base url");
         self.call_post(url, payload).await
     }

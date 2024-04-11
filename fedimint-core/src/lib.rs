@@ -1,3 +1,21 @@
+//! Fedimint Core library
+//!
+//! `fedimint-core` contains are commonly used types, utilities and primitives,
+//! shared between both client and server code.
+//!
+//! Things that are server-side only typically live in `fedimint-server`, and
+//! client-side only in `fedimint-client`.
+//!
+//! ### Wasm support
+//!
+//! All code in `fedimint-core` needs to compile on Wasm, and `fedimint-core`
+//! includes helpers and wrappers around non-wasm-safe utitlies.
+//!
+//! In particular:
+//!
+//! * [`fedimint_core::task`] for task spawning and control
+//! * [`fedimint_core::time`] for time-related operations
+
 #![allow(where_clauses_object_safety)] // https://github.com/dtolnay/async-trait/issues/228
 extern crate self as fedimint_core;
 
@@ -24,32 +42,58 @@ pub use crate::core::server;
 use crate::encoding::{Decodable, DecodeError, Encodable};
 use crate::module::registry::ModuleDecoderRegistry;
 
-#[cfg(not(target_family = "wasm"))]
+/// Admin (guardian) client types
 pub mod admin_client;
+/// Client API request handling
 pub mod api;
+/// Federation-stored client backups
 pub mod backup;
-pub mod bitcoinrpc;
-pub mod cancellable;
+/// Gradual bitcoin dependency migration helpers
+pub mod bitcoin_migration;
+/// Legacy serde encoding for bls12_381
+pub mod bls12_381_serde;
+/// Federation configuration
 pub mod config;
+/// Fundamental types
 pub mod core;
+/// Database handling
 pub mod db;
+/// Consensus encoding
 pub mod encoding;
 pub mod endpoint_constants;
+/// Common environment variables
+pub mod envs;
 pub mod epoch;
+/// Formatting helpers
 pub mod fmt_utils;
+/// Hex encoding helpers
 pub mod hex;
+/// Common macros
 #[macro_use]
 pub mod macros;
+/// Extenable module sysystem
 pub mod module;
+/// Peer networking
 pub mod net;
+/// Client query system
 pub mod query;
+/// Runtime (wasm32 vs native) differences handling
+pub mod runtime;
+/// Task handling, including wasm safe logic
 pub mod task;
+/// Types handling per-denomination values
 pub mod tiered;
+/// Types handling multiple per-denomination values
 pub mod tiered_multi;
+/// Time handling, wasm safe functionality
 pub mod time;
+/// Timing helpers
 pub mod timing;
+/// Fedimint transaction (inpus + outputs + signature) types
 pub mod transaction;
+/// Peg-in txo proofs
 pub mod txoproof;
+/// General purpose utilities
 pub mod util;
 
 /// Atomic BFT unit containing consensus items
@@ -249,38 +293,58 @@ pub enum ParseAmountError {
     WrongBitcoinAmount(#[from] bitcoin::util::amount::ParseAmountError),
 }
 
-impl<T> NumPeers for BTreeMap<PeerId, T> {
+impl<T> NumPeersExt for BTreeMap<PeerId, T> {
     fn total(&self) -> usize {
         self.len()
     }
 }
 
-impl NumPeers for &[PeerId] {
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct NumPeers(usize);
+
+impl From<usize> for NumPeers {
+    fn from(value: usize) -> Self {
+        Self(value)
+    }
+}
+impl NumPeers {
+    pub fn as_usize(&self) -> usize {
+        self.0
+    }
+}
+
+impl NumPeersExt for NumPeers {
+    fn total(&self) -> usize {
+        self.0
+    }
+}
+
+impl NumPeersExt for &[PeerId] {
     fn total(&self) -> usize {
         self.len()
     }
 }
 
-impl NumPeers for Vec<PeerId> {
+impl NumPeersExt for Vec<PeerId> {
     fn total(&self) -> usize {
         self.len()
     }
 }
 
-impl NumPeers for Vec<PeerUrl> {
+impl NumPeersExt for Vec<PeerUrl> {
     fn total(&self) -> usize {
         self.len()
     }
 }
 
-impl NumPeers for BTreeSet<PeerId> {
+impl NumPeersExt for BTreeSet<PeerId> {
     fn total(&self) -> usize {
         self.len()
     }
 }
 
 /// for consensus-related calculations given the number of peers
-pub trait NumPeers {
+pub trait NumPeersExt {
     fn total(&self) -> usize;
 
     /// number of peers that can be evil without disrupting the federation

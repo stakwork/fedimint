@@ -6,15 +6,14 @@ use std::time::Duration;
 use anyhow::anyhow;
 use async_trait::async_trait;
 use fedimint_client::module::init::ClientModuleInitRegistry;
-use fedimint_client::ClientArc;
+use fedimint_client::ClientHandleArc;
 use fedimint_core::config::FederationId;
 use fedimint_core::db::mem_impl::MemDatabase;
 use fedimint_core::db::Database;
 use fedimint_core::module::registry::ModuleDecoderRegistry;
-use fedimint_core::task::{block_in_place, sleep, TaskGroup};
+use fedimint_core::task::{block_in_place, block_on, sleep_in_test, TaskGroup};
 use fedimint_core::util::SafeUrl;
 use fedimint_logging::LOG_TEST;
-use futures::executor::block_on;
 use lightning_invoice::RoutingFees;
 use ln_gateway::client::GatewayClientBuilder;
 use ln_gateway::lightning::{ILnRpcClient, LightningBuilder};
@@ -36,7 +35,7 @@ pub const DEFAULT_GATEWAY_PASSWORD: &str = "thereisnosecondbest";
 /// Fixture for creating a gateway
 pub struct GatewayTest {
     /// URL for the RPC
-    versioned_api: SafeUrl,
+    pub versioned_api: SafeUrl,
     /// Handle of the running gateway
     pub gateway: Gateway,
     /// Temporary dir that stores the gateway config
@@ -55,13 +54,25 @@ impl GatewayTest {
         GatewayRpcClient::new(self.versioned_api.clone(), None)
     }
 
-    /// Removes a client from the gateway
-    pub async fn remove_client(&self, fed: &FederationTest) -> ClientArc {
-        self.gateway.remove_client(fed.id()).await.unwrap()
+    /// Removes a client from the gateway and keeps it alive
+    ///
+    /// Note: this makes the database opened, which can lead to gateway
+    /// wanting to rejoin it. Better get your own client instead of being
+    /// lazy here.
+    pub async fn remove_client_hack(&self, fed: &FederationTest) -> ClientHandleArc {
+        self.gateway
+            .remove_client_hack(fed.id())
+            .await
+            .unwrap()
+            .into_value()
     }
 
-    pub async fn select_client(&self, federation_id: FederationId) -> ClientArc {
-        self.gateway.select_client(federation_id).await.unwrap()
+    pub async fn select_client(&self, federation_id: FederationId) -> ClientHandleArc {
+        self.gateway
+            .select_client(federation_id)
+            .await
+            .unwrap()
+            .into_value()
     }
 
     /// Connects to a new federation and stores the info
@@ -130,14 +141,12 @@ impl GatewayTest {
         let gateway_run = gateway.clone();
         let root_group = TaskGroup::new();
         let mut tg = root_group.clone();
-        root_group
-            .spawn("Gateway Run", |_handle| async move {
-                gateway_run
-                    .run(&mut tg)
-                    .await
-                    .expect("Failed to start gateway");
-            })
-            .await;
+        root_group.spawn("Gateway Run", |_handle| async move {
+            gateway_run
+                .run(&mut tg)
+                .await
+                .expect("Failed to start gateway");
+        });
 
         // Wait for the gateway web server to be available
         GatewayTest::wait_for_webserver(versioned_api.clone(), cli_password)
@@ -182,7 +191,7 @@ impl GatewayTest {
                 return Ok(());
             }
 
-            sleep(Duration::from_secs(1)).await;
+            sleep_in_test("waiting for webserver to be ready", Duration::from_secs(1)).await;
         }
 
         Err(anyhow!(
@@ -200,7 +209,7 @@ impl GatewayTest {
                 return Ok(());
             }
 
-            sleep(Duration::from_secs(1)).await;
+            sleep_in_test("waiting for gateway state", Duration::from_secs(1)).await;
         }
 
         Err(anyhow!(
@@ -224,7 +233,6 @@ impl Drop for GatewayTest {
 pub enum LightningNodeType {
     Cln,
     Lnd,
-    Ldk,
 }
 
 impl Display for LightningNodeType {
@@ -232,7 +240,6 @@ impl Display for LightningNodeType {
         match self {
             LightningNodeType::Cln => write!(f, "cln"),
             LightningNodeType::Lnd => write!(f, "lnd"),
-            LightningNodeType::Ldk => write!(f, "ldk"),
         }
     }
 }
@@ -248,9 +255,6 @@ impl LightningBuilder for RealLightningBuilder {
         match &self.node_type {
             LightningNodeType::Cln => Box::new(ClnLightningTest::new().await),
             LightningNodeType::Lnd => Box::new(LndLightningTest::new().await),
-            _ => {
-                unimplemented!("Unsupported Lightning implementation");
-            }
         }
     }
 }

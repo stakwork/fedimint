@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::{cmp, result};
 
-use anyhow::{anyhow, bail, ensure};
+use anyhow::{anyhow, ensure};
 use bech32::Variant::Bech32m;
 use bech32::{FromBase32, ToBase32};
 use bitcoin::secp256k1;
@@ -23,11 +23,11 @@ use fedimint_core::endpoint_constants::{
 };
 use fedimint_core::fmt_utils::AbbreviateDebug;
 use fedimint_core::module::SerdeModuleEncoding;
-use fedimint_core::task::{MaybeSend, MaybeSync, RwLock, RwLockWriteGuard};
+use fedimint_core::task::{MaybeSend, MaybeSync};
 use fedimint_core::time::now;
 use fedimint_core::{
-    apply, async_trait_maybe_send, dyn_newtype_define, ModuleDecoderRegistry, NumPeers, OutPoint,
-    PeerId, TransactionId,
+    apply, async_trait_maybe_send, dyn_newtype_define, ModuleDecoderRegistry, NumPeersExt,
+    OutPoint, PeerId, TransactionId,
 };
 use fedimint_logging::{LOG_CLIENT_NET_API, LOG_NET_API};
 use futures::stream::FuturesUnordered;
@@ -40,25 +40,33 @@ use jsonrpsee_ws_client::{WsClient, WsClientBuilder};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
-use tokio::sync::OnceCell;
+use tokio::sync::{OnceCell, RwLock, RwLockWriteGuard};
 use tracing::{debug, error, instrument, trace, warn};
 
+use crate::admin_client::{
+    ConfigGenConnectionsRequest, ConfigGenParamsRequest, ConfigGenParamsResponse, PeerServerParams,
+};
 use crate::backup::ClientBackupSnapshot;
 use crate::core::backup::SignedBackupRequest;
 use crate::core::{Decoder, OutputOutcome};
 use crate::encoding::DecodeError;
 use crate::endpoint_constants::{
-    AWAIT_OUTPUT_OUTCOME_ENDPOINT, AWAIT_TRANSACTION_ENDPOINT, BACKUP_ENDPOINT,
-    CLIENT_CONFIG_ENDPOINT, RECOVER_ENDPOINT, SESSION_COUNT_ENDPOINT, SUBMIT_TRANSACTION_ENDPOINT,
-    VERSION_ENDPOINT,
+    ADD_CONFIG_GEN_PEER_ENDPOINT, AUDIT_ENDPOINT, AUTH_ENDPOINT, AWAIT_OUTPUT_OUTCOME_ENDPOINT,
+    AWAIT_TRANSACTION_ENDPOINT, BACKUP_ENDPOINT, CONFIG_GEN_PEERS_ENDPOINT,
+    CONSENSUS_CONFIG_GEN_PARAMS_ENDPOINT, DEFAULT_CONFIG_GEN_PARAMS_ENDPOINT,
+    GUARDIAN_CONFIG_BACKUP_ENDPOINT, RECOVER_ENDPOINT, RESTART_FEDERATION_SETUP_ENDPOINT,
+    RUN_DKG_ENDPOINT, SESSION_COUNT_ENDPOINT, SESSION_STATUS_ENDPOINT,
+    SET_CONFIG_GEN_CONNECTIONS_ENDPOINT, SET_CONFIG_GEN_PARAMS_ENDPOINT, SET_PASSWORD_ENDPOINT,
+    START_CONSENSUS_ENDPOINT, STATUS_ENDPOINT, SUBMIT_TRANSACTION_ENDPOINT,
+    VERIFIED_CONFIGS_ENDPOINT, VERIFY_CONFIG_HASH_ENDPOINT, VERSION_ENDPOINT,
 };
-use crate::module::{ApiRequestErased, ApiVersion, SupportedApiVersionsSummary};
+use crate::module::audit::AuditSummary;
+use crate::module::{ApiAuth, ApiRequestErased, ApiVersion, SupportedApiVersionsSummary};
 use crate::query::{
-    DiscoverApiVersionSet, FilterMap, QueryStep, QueryStrategy, ThresholdConsensus,
-    UnionResponsesSingle,
+    DiscoverApiVersionSet, QueryStep, QueryStrategy, ThresholdConsensus, UnionResponsesSingle,
 };
-use crate::session_outcome::SessionOutcome;
-use crate::task;
+use crate::runtime;
+use crate::session_outcome::{AcceptedItem, SessionOutcome, SessionStatus};
 use crate::transaction::{SerdeTransaction, Transaction, TransactionError};
 use crate::util::SafeUrl;
 
@@ -162,6 +170,16 @@ impl FederationError {
             e.report_if_important(*peer_id)
         }
     }
+
+    /// Get the general error if any.
+    pub fn get_general_error(&self) -> Option<&anyhow::Error> {
+        self.general.as_ref()
+    }
+
+    /// Get errors from different peers.
+    pub fn get_peer_errors(&self) -> impl Iterator<Item = (PeerId, &PeerError)> {
+        self.peers.iter().map(|(peer, error)| (*peer, error))
+    }
 }
 
 type OutputOutcomeResult<O> = result::Result<O, OutputOutcomeError>;
@@ -250,6 +268,30 @@ pub struct ApiVersionSet {
 /// [`IRawFederationApi`].
 #[apply(async_trait_maybe_send!)]
 pub trait FederationApiExt: IRawFederationApi {
+    /// Make a request to a single peer in the federation with an optional
+    /// timeout.
+    async fn request_single_peer(
+        &self,
+        timeout: Option<Duration>,
+        method: String,
+        params: ApiRequestErased,
+        peer_id: PeerId,
+    ) -> JsonRpcResult<jsonrpsee_core::JsonValue> {
+        let request = async {
+            self.request_raw(peer_id, &method, &[params.to_json()])
+                .await
+        };
+
+        if let Some(timeout) = timeout {
+            match fedimint_core::runtime::timeout(timeout, request).await {
+                Ok(result) => result,
+                Err(_timeout) => Err(JsonRpcClientError::RequestTimeout),
+            }
+        } else {
+            request.await
+        }
+    }
+
     /// Make an aggregate request to federation, using `strategy` to logically
     /// merge the responses.
     async fn request_with_strategy<PeerRet: serde::de::DeserializeOwned, FedRet: Debug>(
@@ -276,7 +318,7 @@ pub trait FederationApiExt: IRawFederationApi {
                 };
 
                 let result = if let Some(timeout) = timeout {
-                    match fedimint_core::task::timeout(timeout, request).await {
+                    match fedimint_core::runtime::timeout(timeout, request).await {
                         Ok(result) => result,
                         Err(_timeout) => Err(JsonRpcClientError::RequestTimeout),
                     }
@@ -329,7 +371,7 @@ pub trait FederationApiExt: IRawFederationApi {
                                     async move {
                                         // Note: we need to sleep inside the retrying future,
                                         // so that `futures` is being polled continuously
-                                        task::sleep(Duration::from_millis(delay_ms)).await;
+                                        runtime::sleep(Duration::from_millis(delay_ms)).await;
                                         PeerResponse {
                                             peer: retry_peer,
                                             result: self
@@ -368,11 +410,48 @@ pub trait FederationApiExt: IRawFederationApi {
         Ret: serde::de::DeserializeOwned + Eq + Debug + Clone + MaybeSend,
     {
         self.request_with_strategy(
-            ThresholdConsensus::overcome_evil(self.all_peers().total()),
+            ThresholdConsensus::new(self.all_peers().total()),
             method,
             params,
         )
         .await
+    }
+
+    async fn request_admin<Ret>(
+        &self,
+        method: &str,
+        params: ApiRequestErased,
+        auth: ApiAuth,
+    ) -> FederationResult<Ret>
+    where
+        Ret: serde::de::DeserializeOwned + Eq + Debug + Clone + MaybeSend,
+    {
+        // We would never want to accidentally send our password to everyone
+        assert_eq!(
+            self.all_peers().len(),
+            1,
+            "attempted to broadcast admin password?!"
+        );
+        self.request_current_consensus(method.into(), params.with_auth(auth))
+            .await
+    }
+
+    async fn request_admin_no_auth<Ret>(
+        &self,
+        method: &str,
+        params: ApiRequestErased,
+    ) -> FederationResult<Ret>
+    where
+        Ret: serde::de::DeserializeOwned + Eq + Debug + Clone + MaybeSend,
+    {
+        // There is no auth involved, but still - it should only ever be called on a
+        // single endpoint
+        assert_eq!(
+            self.all_peers().len(),
+            1,
+            "attempted to broadcast an admin request?!"
+        );
+        self.request_current_consensus(method.into(), params).await
     }
 }
 
@@ -399,6 +478,16 @@ impl AsRef<dyn IGlobalFederationApi + 'static> for DynGlobalApi {
 }
 
 impl DynGlobalApi {
+    pub fn from_pre_peer_id_endpoint(url: SafeUrl) -> Self {
+        // PeerIds are used only for informational purposes, but just in case, make a
+        // big number so it stands out
+        GlobalFederationApiWithCache::new(WsFederationApi::new(vec![(PeerId::from(1024), url)]))
+            .into()
+    }
+
+    pub fn from_single_endpoint(peer: PeerId, url: SafeUrl) -> Self {
+        GlobalFederationApiWithCache::new(WsFederationApi::new(vec![(peer, url)])).into()
+    }
     pub fn from_endpoints(peers: Vec<(PeerId, SafeUrl)>) -> Self {
         GlobalFederationApiWithCache::new(WsFederationApi::new(peers)).into()
     }
@@ -420,7 +509,7 @@ impl DynGlobalApi {
     where
         R: OutputOutcome,
     {
-        fedimint_core::task::timeout(timeout, async move {
+        fedimint_core::runtime::timeout(timeout, async move {
             let outcome: SerdeOutputOutcome = self
                 .inner
                 .request_current_consensus(
@@ -451,12 +540,15 @@ pub trait IGlobalFederationApi: IRawFederationApi {
         decoders: &ModuleDecoderRegistry,
     ) -> anyhow::Result<SessionOutcome>;
 
+    async fn get_session_status(
+        &self,
+        block_index: u64,
+        decoders: &ModuleDecoderRegistry,
+    ) -> anyhow::Result<SessionStatus>;
+
     async fn session_count(&self) -> FederationResult<u64>;
 
     async fn await_transaction(&self, txid: TransactionId) -> FederationResult<TransactionId>;
-
-    /// Fetch client configuration info only if verified against a federation id
-    async fn download_client_config(&self, info: &InviteCode) -> FederationResult<ClientConfig>;
 
     /// Fetches the server consensus hash if enough peers agree on it
     async fn server_config_consensus_hash(&self) -> FederationResult<sha256::Hash>;
@@ -472,7 +564,101 @@ pub trait IGlobalFederationApi: IRawFederationApi {
     async fn discover_api_version_set(
         &self,
         client_versions: &SupportedApiVersionsSummary,
+        timeout: Duration,
+        num_responses_required: Option<usize>,
     ) -> FederationResult<ApiVersionSet>;
+
+    /// Sets the password used to decrypt the configs and authenticate
+    ///
+    /// Must be called first before any other calls to the API
+    async fn set_password(&self, auth: ApiAuth) -> FederationResult<()>;
+
+    /// During config gen, sets the server connection containing our endpoints
+    ///
+    /// Optionally sends our server info to the config gen leader using
+    /// `add_config_gen_peer`
+    async fn set_config_gen_connections(
+        &self,
+        info: ConfigGenConnectionsRequest,
+        auth: ApiAuth,
+    ) -> FederationResult<()>;
+
+    /// During config gen, used for an API-to-API call that adds a peer's server
+    /// connection info to the leader.
+    ///
+    /// Note this call will fail until the leader has their API running and has
+    /// `set_server_connections` so clients should retry.
+    ///
+    /// This call is not authenticated because it's guardian-to-guardian
+    async fn add_config_gen_peer(&self, peer: PeerServerParams) -> FederationResult<()>;
+
+    /// During config gen, gets all the server connections we've received from
+    /// peers using `add_config_gen_peer`
+    ///
+    /// Could be called on the leader, so it's not authenticated
+    async fn get_config_gen_peers(&self) -> FederationResult<Vec<PeerServerParams>>;
+
+    /// Gets the default config gen params which can be configured by the
+    /// leader, gives them a template to modify
+    async fn get_default_config_gen_params(
+        &self,
+        auth: ApiAuth,
+    ) -> FederationResult<ConfigGenParamsRequest>;
+
+    /// Leader sets the consensus params, everyone sets the local params
+    ///
+    /// After calling this `ConfigGenParams` can be created for DKG
+    async fn set_config_gen_params(
+        &self,
+        requested: ConfigGenParamsRequest,
+        auth: ApiAuth,
+    ) -> FederationResult<()>;
+
+    /// Returns the consensus config gen params, followers will delegate this
+    /// call to the leader.  Once this endpoint returns successfully we can run
+    /// DKG.
+    async fn consensus_config_gen_params(&self) -> FederationResult<ConfigGenParamsResponse>;
+
+    /// Runs DKG, can only be called once after configs have been generated in
+    /// `get_consensus_config_gen_params`.  If DKG fails this returns a 500
+    /// error and config gen must be restarted.
+    async fn run_dkg(&self, auth: ApiAuth) -> FederationResult<()>;
+
+    /// After DKG, returns the hash of the consensus config tweaked with our id.
+    /// We need to share this with all other peers to complete verification.
+    async fn get_verify_config_hash(
+        &self,
+        auth: ApiAuth,
+    ) -> FederationResult<BTreeMap<PeerId, sha256::Hash>>;
+
+    /// Updates local state and notify leader that we have verified configs.
+    /// This allows for a synchronization point, before we start consensus.
+    async fn verified_configs(
+        &self,
+        auth: ApiAuth,
+    ) -> FederationResult<BTreeMap<PeerId, sha256::Hash>>;
+
+    /// Reads the configs from the disk, starts the consensus server, and shuts
+    /// down the config gen API to start the Fedimint API
+    ///
+    /// Clients may receive an error due to forced shutdown, should call the
+    /// `server_status` to see if consensus has started.
+    async fn start_consensus(&self, auth: ApiAuth) -> FederationResult<()>;
+
+    /// Returns the status of the server
+    async fn status(&self) -> FederationResult<StatusResponse>;
+
+    /// Show an audit across all modules
+    async fn audit(&self, auth: ApiAuth) -> FederationResult<AuditSummary>;
+
+    /// Download the guardian config to back it up
+    async fn guardian_config_backup(&self, auth: ApiAuth)
+        -> FederationResult<GuardianConfigBackup>;
+
+    /// Check auth credentials
+    async fn auth(&self, auth: ApiAuth) -> FederationResult<()>;
+
+    async fn restart_federation_setup(&self, auth: ApiAuth) -> FederationResult<()>;
 }
 
 pub fn deserialize_outcome<R>(
@@ -510,15 +696,28 @@ struct GlobalFederationApiWithCache<T> {
     /// (near-)bottlenecked on fetching blocks they will naturally
     /// synchronize, or split into a handful of groups. And if they are not,
     /// no LRU here is going to help them.
+    await_session_lru: Arc<tokio::sync::Mutex<lru::LruCache<u64, Arc<OnceCell<SessionOutcome>>>>>,
+
+    /// Like [`Self::await_session_lru`], but for
+    /// [`IGlobalFederationApi::get_session_status`].
+    ///
+    /// In theory these two LRUs have the same content, but one is locked by
+    /// potentially long-blocking operation, while the other non-blocking one.
+    /// Given how tiny they are, it's not worth complicating things to unify
+    /// them.
     #[allow(clippy::type_complexity)]
-    await_block_lru: Arc<tokio::sync::Mutex<lru::LruCache<u64, Arc<OnceCell<SessionOutcome>>>>>,
+    get_session_status_lru:
+        Arc<tokio::sync::Mutex<lru::LruCache<u64, Arc<OnceCell<SessionOutcome>>>>>,
 }
 
 impl<T> GlobalFederationApiWithCache<T> {
     pub fn new(inner: T) -> GlobalFederationApiWithCache<T> {
         Self {
             inner,
-            await_block_lru: Arc::new(tokio::sync::Mutex::new(lru::LruCache::new(
+            await_session_lru: Arc::new(tokio::sync::Mutex::new(lru::LruCache::new(
+                NonZeroUsize::new(32).expect("is non-zero"),
+            ))),
+            get_session_status_lru: Arc::new(tokio::sync::Mutex::new(lru::LruCache::new(
                 NonZeroUsize::new(32).expect("is non-zero"),
             ))),
         }
@@ -534,9 +733,24 @@ where
         block_index: u64,
         decoders: &ModuleDecoderRegistry,
     ) -> anyhow::Result<SessionOutcome> {
-        debug!(block_index, "Fetching block's outcome from Federation");
+        debug!(block_index, "Awaiting block's outcome from Federation");
         self.request_current_consensus::<SerdeModuleEncoding<SessionOutcome>>(
             AWAIT_SESSION_OUTCOME_ENDPOINT.to_string(),
+            ApiRequestErased::new(block_index),
+        )
+        .await?
+        .try_into_inner(decoders)
+        .map_err(|e| anyhow!(e.to_string()))
+    }
+
+    async fn get_session_status_raw(
+        &self,
+        block_index: u64,
+        decoders: &ModuleDecoderRegistry,
+    ) -> anyhow::Result<SessionStatus> {
+        debug!(block_index, "Fetching block's outcome from Federation");
+        self.request_current_consensus::<SerdeModuleEncoding<SessionStatus>>(
+            SESSION_STATUS_ENDPOINT.to_string(),
             ApiRequestErased::new(block_index),
         )
         .await?
@@ -576,22 +790,61 @@ where
 {
     async fn await_block(
         &self,
-        block_index: u64,
+        session_idx: u64,
         decoders: &ModuleDecoderRegistry,
     ) -> anyhow::Result<SessionOutcome> {
-        let mut lru_lock = self.await_block_lru.lock().await;
+        let mut lru_lock = self.await_session_lru.lock().await;
 
-        let block_entry_arc = lru_lock
-            .get_or_insert(block_index, || Arc::new(OnceCell::new()))
+        let entry_arc = lru_lock
+            .get_or_insert(session_idx, || Arc::new(OnceCell::new()))
             .clone();
 
-        // we drop the lru lock so requests for other `block_index` can work in parallel
+        // we drop the lru lock so requests for other `session_idx` can work in parallel
         drop(lru_lock);
 
-        block_entry_arc
-            .get_or_try_init(|| self.await_block_raw(block_index, decoders))
+        entry_arc
+            .get_or_try_init(|| self.await_block_raw(session_idx, decoders))
             .await
             .cloned()
+    }
+
+    async fn get_session_status(
+        &self,
+        session_idx: u64,
+        decoders: &ModuleDecoderRegistry,
+    ) -> anyhow::Result<SessionStatus> {
+        let mut lru_lock = self.get_session_status_lru.lock().await;
+
+        let entry_arc = lru_lock
+            .get_or_insert(session_idx, || Arc::new(OnceCell::new()))
+            .clone();
+
+        // we drop the lru lock so requests for other `session_idx` can work in parallel
+        drop(lru_lock);
+
+        enum NoCacheErr {
+            Initial,
+            Pending(Vec<AcceptedItem>),
+            Err(anyhow::Error),
+        }
+        match entry_arc
+            .get_or_try_init(|| async {
+                match self.get_session_status_raw(session_idx, decoders).await {
+                    Err(e) => Err(NoCacheErr::Err(e)),
+                    Ok(SessionStatus::Initial) => Err(NoCacheErr::Initial),
+                    Ok(SessionStatus::Pending(s)) => Err(NoCacheErr::Pending(s)),
+                    // only status we can cache (hance outer Ok)
+                    Ok(SessionStatus::Complete(s)) => Ok(s),
+                }
+            })
+            .await
+            .cloned()
+        {
+            Ok(s) => Ok(SessionStatus::Complete(s)),
+            Err(NoCacheErr::Initial) => Ok(SessionStatus::Initial),
+            Err(NoCacheErr::Pending(s)) => Ok(SessionStatus::Pending(s)),
+            Err(NoCacheErr::Err(e)) => Err(e),
+        }
     }
 
     /// Submit a transaction for inclusion
@@ -620,47 +873,6 @@ where
             ApiRequestErased::new(txid),
         )
         .await
-    }
-
-    async fn download_client_config(
-        &self,
-        invite_code: &InviteCode,
-    ) -> FederationResult<ClientConfig> {
-        // we have to download the api endpoints first
-        let id = invite_code.federation_id();
-        let qs = FilterMap::new(
-            move |cfg: ClientConfig| {
-                if id.0 != cfg.global.api_endpoints.consensus_hash() {
-                    bail!("Guardian api endpoint map does not hash to FederationId")
-                }
-
-                Ok(cfg.global.api_endpoints)
-            },
-            self.all_peers().total(),
-        )
-        // downloading the endpoints shouldn't take too long
-        .with_request_timeout(Duration::from_secs(5));
-
-        let api_endpoints = self
-            .request_with_strategy(
-                qs,
-                CLIENT_CONFIG_ENDPOINT.to_owned(),
-                ApiRequestErased::default(),
-            )
-            .await?;
-
-        // now we can build an api for all guardians and download the client config
-        let api_endpoints = api_endpoints
-            .into_iter()
-            .map(|(peer, url)| (peer, url.url))
-            .collect();
-
-        WsFederationApi::new(api_endpoints)
-            .request_current_consensus(
-                CLIENT_CONFIG_ENDPOINT.to_owned(),
-                ApiRequestErased::default(),
-            )
-            .await
     }
 
     async fn server_config_consensus_hash(&self) -> FederationResult<sha256::Hash> {
@@ -695,16 +907,146 @@ where
     async fn discover_api_version_set(
         &self,
         client_versions: &SupportedApiVersionsSummary,
+        timeout: Duration,
+        num_responses_required: Option<usize>,
     ) -> FederationResult<ApiVersionSet> {
-        let timeout = Duration::from_secs(60);
         self.request_with_strategy(
             DiscoverApiVersionSet::new(
-                self.all_peers().len(),
+                num_responses_required
+                    .unwrap_or(self.all_peers().len())
+                    .min(self.all_peers().len()),
                 now().add(timeout),
                 client_versions.clone(),
             ),
             VERSION_ENDPOINT.to_owned(),
             ApiRequestErased::default(),
+        )
+        .await
+    }
+
+    async fn set_password(&self, auth: ApiAuth) -> FederationResult<()> {
+        self.request_admin(SET_PASSWORD_ENDPOINT, ApiRequestErased::default(), auth)
+            .await
+    }
+
+    async fn set_config_gen_connections(
+        &self,
+        info: ConfigGenConnectionsRequest,
+        auth: ApiAuth,
+    ) -> FederationResult<()> {
+        self.request_admin(
+            SET_CONFIG_GEN_CONNECTIONS_ENDPOINT,
+            ApiRequestErased::new(info),
+            auth,
+        )
+        .await
+    }
+
+    async fn add_config_gen_peer(&self, peer: PeerServerParams) -> FederationResult<()> {
+        self.request_admin_no_auth(ADD_CONFIG_GEN_PEER_ENDPOINT, ApiRequestErased::new(peer))
+            .await
+    }
+
+    async fn get_config_gen_peers(&self) -> FederationResult<Vec<PeerServerParams>> {
+        self.request_admin_no_auth(CONFIG_GEN_PEERS_ENDPOINT, ApiRequestErased::default())
+            .await
+    }
+
+    async fn get_default_config_gen_params(
+        &self,
+        auth: ApiAuth,
+    ) -> FederationResult<ConfigGenParamsRequest> {
+        self.request_admin(
+            DEFAULT_CONFIG_GEN_PARAMS_ENDPOINT,
+            ApiRequestErased::default(),
+            auth,
+        )
+        .await
+    }
+
+    async fn set_config_gen_params(
+        &self,
+        requested: ConfigGenParamsRequest,
+        auth: ApiAuth,
+    ) -> FederationResult<()> {
+        self.request_admin(
+            SET_CONFIG_GEN_PARAMS_ENDPOINT,
+            ApiRequestErased::new(requested),
+            auth,
+        )
+        .await
+    }
+
+    async fn consensus_config_gen_params(&self) -> FederationResult<ConfigGenParamsResponse> {
+        self.request_admin_no_auth(
+            CONSENSUS_CONFIG_GEN_PARAMS_ENDPOINT,
+            ApiRequestErased::default(),
+        )
+        .await
+    }
+
+    async fn run_dkg(&self, auth: ApiAuth) -> FederationResult<()> {
+        self.request_admin(RUN_DKG_ENDPOINT, ApiRequestErased::default(), auth)
+            .await
+    }
+
+    async fn get_verify_config_hash(
+        &self,
+        auth: ApiAuth,
+    ) -> FederationResult<BTreeMap<PeerId, sha256::Hash>> {
+        self.request_admin(
+            VERIFY_CONFIG_HASH_ENDPOINT,
+            ApiRequestErased::default(),
+            auth,
+        )
+        .await
+    }
+
+    async fn verified_configs(
+        &self,
+        auth: ApiAuth,
+    ) -> FederationResult<BTreeMap<PeerId, sha256::Hash>> {
+        self.request_admin(VERIFIED_CONFIGS_ENDPOINT, ApiRequestErased::default(), auth)
+            .await
+    }
+
+    async fn start_consensus(&self, auth: ApiAuth) -> FederationResult<()> {
+        self.request_admin(START_CONSENSUS_ENDPOINT, ApiRequestErased::default(), auth)
+            .await
+    }
+
+    async fn status(&self) -> FederationResult<StatusResponse> {
+        self.request_admin_no_auth(STATUS_ENDPOINT, ApiRequestErased::default())
+            .await
+    }
+
+    async fn audit(&self, auth: ApiAuth) -> FederationResult<AuditSummary> {
+        self.request_admin(AUDIT_ENDPOINT, ApiRequestErased::default(), auth)
+            .await
+    }
+
+    async fn guardian_config_backup(
+        &self,
+        auth: ApiAuth,
+    ) -> FederationResult<GuardianConfigBackup> {
+        self.request_admin(
+            GUARDIAN_CONFIG_BACKUP_ENDPOINT,
+            ApiRequestErased::default(),
+            auth,
+        )
+        .await
+    }
+
+    async fn auth(&self, auth: ApiAuth) -> FederationResult<()> {
+        self.request_admin(AUTH_ENDPOINT, ApiRequestErased::default(), auth)
+            .await
+    }
+
+    async fn restart_federation_setup(&self, auth: ApiAuth) -> FederationResult<()> {
+        self.request_admin(
+            RESTART_FEDERATION_SETUP_ENDPOINT,
+            ApiRequestErased::default(),
+            auth,
         )
         .await
     }
@@ -775,6 +1117,26 @@ impl InviteCode {
         ])
     }
 
+    /// Constructs an [`InviteCode`] which contains as many guardian URLs as
+    /// needed to always be able to join a working federation
+    pub fn new_with_essential_num_guardians(
+        peer_to_url_map: &BTreeMap<PeerId, SafeUrl>,
+        federation_id: FederationId,
+    ) -> Self {
+        let max_size = peer_to_url_map.max_evil() + 1;
+        let mut code_vec: Vec<InviteCodeData> = peer_to_url_map
+            .iter()
+            .take(max_size)
+            .map(|(peer, url)| InviteCodeData::Api {
+                url: url.clone(),
+                peer: *peer,
+            })
+            .collect();
+        code_vec.push(InviteCodeData::FederationId(federation_id));
+
+        InviteCode(code_vec)
+    }
+
     /// Returns the API URL of one of the guardians.
     pub fn url(&self) -> SafeUrl {
         self.0
@@ -796,6 +1158,17 @@ impl InviteCode {
                 _ => None,
             })
             .expect("Ensured by constructor")
+    }
+
+    /// Get all peer URLs in the [`InviteCode`]
+    pub fn peers(&self) -> BTreeMap<PeerId, SafeUrl> {
+        self.0
+            .iter()
+            .filter_map(|entry| match entry {
+                InviteCodeData::Api { url, peer } => Some((*peer, url.clone())),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Returns the federation's ID that can be used to authenticate the config
@@ -1141,14 +1514,19 @@ pub struct StatusResponse {
     pub federation: Option<FederationStatus>,
 }
 
+/// Archive of all the guardian config files that can be used to recover a lost
+/// guardian node.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GuardianConfigBackup {
+    #[serde(with = "fedimint_core::hex::serde")]
+    pub tar_archive_bytes: Vec<u8>,
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
-    use std::fmt;
-    use std::str::FromStr;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex;
-    use std::time::Duration;
 
     use anyhow::anyhow;
     use jsonrpsee_core::client::BatchResponse;
@@ -1289,7 +1667,7 @@ mod tests {
                 error!(target: LOG_NET_API, "connect");
                 let id = CONNECTION_COUNT.fetch_add(1, Ordering::SeqCst);
                 // slow down
-                task::sleep(Duration::from_millis(100)).await;
+                runtime::sleep(Duration::from_millis(100)).await;
                 if FAIL.lock().unwrap().contains(&id) {
                     Err(jsonrpsee_core::client::Error::Transport(anyhow!(
                         "intentional error"
@@ -1385,5 +1763,24 @@ mod tests {
         assert_eq!(connect_as_string, bech32);
         let connect_parsed_json: InviteCode = serde_json::from_str(&json).unwrap();
         assert_eq!(connect_parsed_json, connect_parsed);
+    }
+
+    #[test]
+    fn creates_essential_guardians_invite_code() {
+        let mut peer_to_url_map = BTreeMap::new();
+        peer_to_url_map.insert(PeerId(0), "ws://test1".parse().expect("URL fail"));
+        peer_to_url_map.insert(PeerId(1), "ws://test2".parse().expect("URL fail"));
+        peer_to_url_map.insert(PeerId(2), "ws://test3".parse().expect("URL fail"));
+        peer_to_url_map.insert(PeerId(3), "ws://test4".parse().expect("URL fail"));
+        let max_size = peer_to_url_map.max_evil() + 1;
+
+        let code =
+            InviteCode::new_with_essential_num_guardians(&peer_to_url_map, FederationId::dummy());
+
+        assert_eq!(FederationId::dummy(), code.federation_id());
+
+        let expected_map: BTreeMap<PeerId, SafeUrl> =
+            peer_to_url_map.into_iter().take(max_size).collect();
+        assert_eq!(expected_map, code.peers());
     }
 }

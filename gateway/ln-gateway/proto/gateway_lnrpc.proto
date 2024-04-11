@@ -28,6 +28,8 @@ service GatewayLightning {
   rpc RouteHtlcs(EmptyRequest) returns (stream InterceptHtlcRequest) {}
 
   rpc CompleteHtlc(InterceptHtlcResponse) returns (EmptyResponse) {}
+
+  rpc CreateInvoice(CreateInvoiceRequest) returns (CreateInvoiceResponse) {}
 }
 
 message EmptyRequest {}
@@ -50,12 +52,16 @@ message GetNodeInfoResponse {
 }
 
 message PayInvoiceRequest {
+  // Bolt11 invoice
   string invoice = 1;
 
+  // The maximum delay, in blocks, that the payment route can be locked for
   uint64 max_delay = 2;
 
+  // The maximum fee, in millisats, that will be paid as a lightning routing fee
   uint64 max_fee_msat = 3;
 
+  // The hash of the payment
   bytes payment_hash = 4;
 }
 
@@ -174,4 +180,18 @@ message GetRouteHintsResponse {
 
   // The route hints to the associated lightning node
   repeated RouteHint route_hints = 1;
+}
+
+message CreateInvoiceRequest {
+  bytes payment_hash = 1;
+
+  uint64 amount_msat = 2;
+
+  uint32 expiry = 3;
+
+  string description = 4;
+}
+
+message CreateInvoiceResponse {
+  string invoice = 1;
 }

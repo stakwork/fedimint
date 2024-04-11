@@ -10,27 +10,28 @@ use assert_matches::assert_matches;
 use bitcoin::Network;
 use bitcoin_hashes::{sha256, Hash};
 use fedimint_client::transaction::{ClientInput, ClientOutput, TransactionBuilder};
-use fedimint_client::ClientArc;
+use fedimint_client::ClientHandleArc;
+use fedimint_core::bitcoin_migration::bitcoin30_to_bitcoin29_network;
 use fedimint_core::config::FederationId;
 use fedimint_core::core::{IntoDynInstance, OperationId};
-use fedimint_core::task::sleep;
-use fedimint_core::util::NextOrPending;
+use fedimint_core::task::sleep_in_test;
+use fedimint_core::util::{retry, FibonacciBackoff, NextOrPending};
 use fedimint_core::{msats, sats, Amount, OutPoint, TransactionId};
 use fedimint_dummy_client::{DummyClientInit, DummyClientModule};
 use fedimint_dummy_common::config::DummyGenParams;
 use fedimint_dummy_server::DummyInit;
+use fedimint_ln_client::api::LnFederationApi;
 use fedimint_ln_client::pay::{PayInvoicePayload, PaymentData};
 use fedimint_ln_client::{
     LightningClientInit, LightningClientModule, LightningClientStateMachines,
     LightningOperationMeta, LightningOperationMetaVariant, LnPayState, LnReceiveState,
     OutgoingLightningPayment, PayType,
 };
-use fedimint_ln_common::api::LnFederationApi;
-use fedimint_ln_common::config::{GatewayFee, LightningGenParams};
+use fedimint_ln_common::config::{FeeToAmount, GatewayFee, LightningGenParams};
 use fedimint_ln_common::contracts::incoming::IncomingContractOffer;
 use fedimint_ln_common::contracts::outgoing::OutgoingContractAccount;
 use fedimint_ln_common::contracts::{EncryptedPreimage, FundedContract, Preimage, PreimageKey};
-use fedimint_ln_common::{LightningInput, LightningOutput};
+use fedimint_ln_common::{LightningGateway, LightningInput, LightningOutput, PrunedInvoice};
 use fedimint_ln_server::LightningInit;
 use fedimint_logging::LOG_TEST;
 use fedimint_testing::btc::BitcoinTest;
@@ -39,19 +40,25 @@ use fedimint_testing::federation::FederationTest;
 use fedimint_testing::fixtures::Fixtures;
 use fedimint_testing::gateway::{GatewayTest, LightningNodeType, DEFAULT_GATEWAY_PASSWORD};
 use fedimint_testing::ln::LightningTest;
+use fedimint_unknown_common::config::UnknownGenParams;
+use fedimint_unknown_server::UnknownInit;
 use futures::Future;
-use lightning_invoice::{Bolt11Invoice, RoutingFees};
+use lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescription, Description, RoutingFees};
 use ln_gateway::gateway_lnrpc::GetNodeInfoResponse;
 use ln_gateway::rpc::rpc_client::{GatewayRpcClient, GatewayRpcError, GatewayRpcResult};
+use ln_gateway::rpc::rpc_server::hash_password;
 use ln_gateway::rpc::{
-    BalancePayload, ConnectFedPayload, LeaveFedPayload, SetConfigurationPayload,
+    BalancePayload, ConnectFedPayload, FederationRoutingFees, LeaveFedPayload,
+    SetConfigurationPayload,
+};
+use ln_gateway::state_machine::pay::{
+    OutgoingContractError, OutgoingPaymentError, OutgoingPaymentErrorType,
 };
 use ln_gateway::state_machine::{
     GatewayClientModule, GatewayClientStateMachines, GatewayExtPayStates, GatewayExtReceiveStates,
     GatewayMeta, Htlc,
 };
-use ln_gateway::utils::retry;
-use ln_gateway::{GatewayState, DEFAULT_FEES, DEFAULT_NETWORK};
+use ln_gateway::{DEFAULT_FEES, DEFAULT_NETWORK};
 use reqwest::StatusCode;
 use secp256k1::PublicKey;
 use tracing::info;
@@ -59,14 +66,16 @@ use tracing::info;
 async fn pay_invoice(
     ln_module: &LightningClientModule,
     invoice: Bolt11Invoice,
+    gateway_id: &PublicKey,
 ) -> anyhow::Result<OutgoingLightningPayment> {
-    let gateway = ln_module.select_active_gateway_opt().await;
+    let gateway = ln_module.select_gateway(gateway_id).await;
     ln_module.pay_bolt11_invoice(gateway, invoice, ()).await
 }
 
 fn fixtures() -> Fixtures {
     info!(target: LOG_TEST, "Setting up fixtures");
-    let fixtures = Fixtures::new_primary(DummyClientInit, DummyInit, DummyGenParams::default());
+    let fixtures = Fixtures::new_primary(DummyClientInit, DummyInit, DummyGenParams::default())
+        .with_server_only_module(UnknownInit, UnknownGenParams::default());
     let ln_params = LightningGenParams::regtest(fixtures.bitcoin_server());
     fixtures.with_module(LightningClientInit, LightningInit, ln_params)
 }
@@ -76,7 +85,7 @@ async fn single_federation_test<B>(
             GatewayTest,
             Box<dyn LightningTest>,
             FederationTest,
-            ClientArc, // User Client
+            ClientHandleArc, // User Client
             Arc<dyn BitcoinTest>,
         ) -> B
         + Copy,
@@ -92,11 +101,11 @@ where
 
     for (gateway_ln, other_node) in [(lnd1, cln1), (cln2, lnd2)] {
         let fed = fixtures.new_fed().await;
-        let user_client = fed.new_client().await;
         let mut gateway = fixtures
             .new_gateway(gateway_ln, 0, Some(DEFAULT_GATEWAY_PASSWORD.to_string()))
             .await;
         gateway.connect_fed(&fed).await;
+        let user_client = fed.new_client().await;
         let bitcoin = fixtures.bitcoin();
         f(gateway, other_node, fed, user_client, bitcoin).await?;
     }
@@ -124,9 +133,6 @@ where
     let lightning = match lightning_node_type {
         LightningNodeType::Lnd => fixtures.lnd().await,
         LightningNodeType::Cln => fixtures.cln().await,
-        _ => {
-            panic!("Unsupported lightning implementation");
-        }
     };
 
     let gateway = fixtures
@@ -141,22 +147,40 @@ where
     Ok(())
 }
 
-pub fn sha256(data: &[u8]) -> sha256::Hash {
-    bitcoin::hashes::sha256::Hash::hash(data)
+fn sha256(data: &[u8]) -> sha256::Hash {
+    sha256::Hash::hash(data)
 }
 
+/// Helper function for constructing the `PaymentData` that the gateway uses to
+/// pay the invoice. LND supports "private" payments where the description is
+/// stripped from the invoice.
+fn get_payment_data(gateway: Option<LightningGateway>, invoice: Bolt11Invoice) -> PaymentData {
+    match gateway {
+        Some(g) if g.supports_private_payments => {
+            let pruned_invoice: PrunedInvoice = invoice.try_into().expect("Invoice has amount");
+            PaymentData::PrunedInvoice(pruned_invoice)
+        }
+        _ => PaymentData::Invoice(invoice),
+    }
+}
+
+/// Test helper function for paying a valid BOLT11 invoice with a gateway
+/// specified by `gateway_id`.
 async fn pay_valid_invoice(
     invoice: Bolt11Invoice,
-    user_client: &ClientArc,
-    client: &ClientArc,
+    user_client: &ClientHandleArc,
+    gateway_client: &ClientHandleArc,
+    gateway_id: &PublicKey,
 ) -> anyhow::Result<()> {
-    // User client pays test invoice
     let user_lightning_module = &user_client.get_first_module::<LightningClientModule>();
+    let gateway = user_lightning_module.select_gateway(gateway_id).await;
+
+    // User client pays test invoice
     let OutgoingLightningPayment {
         payment_type,
         contract_id,
         fee: _,
-    } = pay_invoice(user_lightning_module, invoice.clone()).await?;
+    } = pay_invoice(user_lightning_module, invoice.clone(), gateway_id).await?;
     match payment_type {
         PayType::Lightning(pay_op) => {
             let mut pay_sub = user_lightning_module
@@ -170,15 +194,15 @@ async fn pay_valid_invoice(
             let payload = PayInvoicePayload {
                 federation_id: user_client.federation_id(),
                 contract_id,
-                payment_data: PaymentData::Invoice(invoice),
+                payment_data: get_payment_data(gateway, invoice),
                 preimage_auth: Hash::hash(&[0; 32]),
             };
 
-            let gw_pay_op = client
+            let gw_pay_op = gateway_client
                 .get_first_module::<GatewayClientModule>()
                 .gateway_pay_bolt11_invoice(payload)
                 .await?;
-            let mut gw_pay_sub = client
+            let mut gw_pay_sub = gateway_client
                 .get_first_module::<GatewayClientModule>()
                 .gateway_subscribe_ln_pay(gw_pay_op)
                 .await?
@@ -186,7 +210,7 @@ async fn pay_valid_invoice(
             assert_eq!(gw_pay_sub.ok().await?, GatewayExtPayStates::Created);
             assert_matches!(gw_pay_sub.ok().await?, GatewayExtPayStates::Preimage { .. });
 
-            let dummy_module = client.get_first_module::<DummyClientModule>();
+            let dummy_module = gateway_client.get_first_module::<DummyClientModule>();
             if let GatewayExtPayStates::Success { out_points, .. } = gw_pay_sub.ok().await? {
                 for outpoint in out_points {
                     dummy_module.receive_money(outpoint).await?;
@@ -201,48 +225,10 @@ async fn pay_valid_invoice(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_gateway_can_pay_ldk_node() -> anyhow::Result<()> {
-    // Running LDK Node with the mock services doesnt provide any additional
-    // coverage, since `FakeLightningTest` does not open any channels.
-    if !Fixtures::is_real_test() {
-        return Ok(());
-    }
-
-    single_federation_test(|gateway, _, fed, user_client, bitcoin| async move {
-        let ldk = Fixtures::spawn_ldk(bitcoin.clone()).await;
-
-        ldk.open_channel(
-            Amount::from_msats(5_000_000_000),
-            gateway.node_pub_key,
-            gateway.listening_addr.clone(),
-            bitcoin.lock_exclusive().await,
-        )
-        .await?;
-
-        let gateway = gateway.remove_client(&fed).await;
-        // Print money for user_client
-        let dummy_module = user_client.get_first_module::<DummyClientModule>();
-        let (_, outpoint) = dummy_module.print_money(sats(1000)).await?;
-        dummy_module.receive_money(outpoint).await?;
-        assert_eq!(user_client.get_balance().await, sats(1000));
-
-        // Create test invoice
-        let invoice = ldk.invoice(sats(250), None).await?;
-        pay_valid_invoice(invoice, &user_client, &gateway).await?;
-
-        assert_eq!(user_client.get_balance().await, sats(1000 - 250));
-        assert_eq!(gateway.get_balance().await, sats(250));
-
-        Ok(())
-    })
-    .await
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn test_gateway_client_pay_valid_invoice() -> anyhow::Result<()> {
     single_federation_test(
         |gateway, other_lightning_client, fed, user_client, _| async move {
-            let gateway = gateway.remove_client(&fed).await;
+            let gateway_client = gateway.remove_client_hack(&fed).await;
             // Print money for user_client
             let dummy_module = user_client.get_first_module::<DummyClientModule>();
             let (_, outpoint) = dummy_module.print_money(sats(1000)).await?;
@@ -252,10 +238,16 @@ async fn test_gateway_client_pay_valid_invoice() -> anyhow::Result<()> {
             // Create test invoice
             let invoice = other_lightning_client.invoice(sats(250), None).await?;
 
-            pay_valid_invoice(invoice, &user_client, &gateway).await?;
+            pay_valid_invoice(
+                invoice,
+                &user_client,
+                &gateway_client,
+                &gateway.gateway.gateway_id,
+            )
+            .await?;
 
             assert_eq!(user_client.get_balance().await, sats(1000 - 250));
-            assert_eq!(gateway.get_balance().await, sats(250));
+            assert_eq!(gateway_client.get_balance().await, sats(250));
 
             Ok(())
         },
@@ -264,7 +256,7 @@ async fn test_gateway_client_pay_valid_invoice() -> anyhow::Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_can_change_routing_fees() -> anyhow::Result<()> {
+async fn test_can_change_default_routing_fees() -> anyhow::Result<()> {
     single_federation_test(
         |gateway, other_lightning_client, fed, user_client, _| async move {
             let rpc_client = gateway
@@ -277,30 +269,209 @@ async fn test_can_change_routing_fees() -> anyhow::Result<()> {
             dummy_module.receive_money(outpoint).await?;
             assert_eq!(user_client.get_balance().await, sats(1000));
 
-            let fee = "10,0".to_string();
+            let fee = "10,10000".to_string();
+            let federation_fee = FederationRoutingFees::from_str(&fee)?;
             let set_configuration_payload = SetConfigurationPayload {
                 password: None,
                 num_route_hints: None,
                 routing_fees: Some(fee.clone()),
                 network: None,
+                per_federation_routing_fees: None,
             };
-            verify_rpc(
-                || rpc_client.set_configuration(set_configuration_payload.clone()),
-                StatusCode::OK,
-            )
+            verify_gateway_rpc_success("set_configuration", || {
+                rpc_client.set_configuration(set_configuration_payload.clone())
+            })
             .await;
 
+            // we need to reconnect to set the fees as defaults from gateway
+            reconnect_federation(&rpc_client, &fed).await;
+
+            // Update the gateway cache since the fees have changed
+            let ln_module = user_client.get_first_module::<LightningClientModule>();
+            ln_module.update_gateway_cache().await?;
+
             // Create test invoice
-            let invoice = other_lightning_client.invoice(sats(250), None).await?;
+            let invoice_amount = sats(250);
+            let invoice = other_lightning_client.invoice(invoice_amount, None).await?;
 
-            let gateway = gateway.remove_client(&fed).await;
-            pay_valid_invoice(invoice, &user_client, &gateway).await?;
+            let gateway_client = gateway.remove_client_hack(&fed).await;
+            pay_valid_invoice(
+                invoice,
+                &user_client,
+                &gateway_client,
+                &gateway.gateway.gateway_id,
+            )
+            .await?;
 
+            let fee: RoutingFees = federation_fee.into();
+            let fee_amount = fee.to_amount(&invoice_amount);
             assert_eq!(
                 user_client.get_balance().await,
-                sats(1000 - 250) - msats(10)
+                sats(1000 - 250) - fee_amount
             );
-            assert_eq!(gateway.get_balance().await, sats(250) + msats(10));
+            assert_eq!(gateway_client.get_balance().await, sats(250) + fee_amount);
+
+            Ok(())
+        },
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_can_change_federation_routing_fees() -> anyhow::Result<()> {
+    single_federation_test(
+        |gateway, other_lightning_client, fed, user_client, _| async move {
+            let rpc_client = gateway
+                .get_rpc()
+                .await
+                .with_password(Some(DEFAULT_GATEWAY_PASSWORD.to_string()));
+            // Print money for user_client
+            let dummy_module = user_client.get_first_module::<DummyClientModule>();
+            let (_, outpoint) = dummy_module.print_money(sats(1000)).await?;
+            dummy_module.receive_money(outpoint).await?;
+            assert_eq!(user_client.get_balance().await, sats(1000));
+
+            let fee = "10,10000".to_string();
+            let federation_fee = FederationRoutingFees::from_str(&fee)?;
+            let set_configuration_payload = SetConfigurationPayload {
+                password: None,
+                num_route_hints: None,
+                routing_fees: None,
+                network: None,
+                per_federation_routing_fees: Some(vec![(fed.id(), federation_fee.clone())]),
+            };
+            verify_gateway_rpc_success("set_configuration", || {
+                rpc_client.set_configuration(set_configuration_payload.clone())
+            })
+            .await;
+
+            // Update the gateway cache since the fees have changed
+            let ln_module = user_client.get_first_module::<LightningClientModule>();
+            ln_module.update_gateway_cache().await?;
+
+            // Create test invoice
+            let invoice_amount = sats(250);
+            let invoice = other_lightning_client.invoice(invoice_amount, None).await?;
+
+            let gateway_client = gateway.remove_client_hack(&fed).await;
+            pay_valid_invoice(
+                invoice,
+                &user_client,
+                &gateway_client,
+                &gateway.gateway.gateway_id,
+            )
+            .await?;
+
+            let fee: RoutingFees = federation_fee.into();
+            let fee_amount = fee.to_amount(&invoice_amount);
+            assert_eq!(
+                user_client.get_balance().await,
+                sats(1000 - 250) - fee_amount
+            );
+            assert_eq!(gateway_client.get_balance().await, sats(250) + fee_amount);
+
+            Ok(())
+        },
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_gateway_enforces_fees() -> anyhow::Result<()> {
+    single_federation_test(
+        |gateway_test, other_lightning_client, fed, user_client, _| async move {
+            let rpc_client = gateway_test
+                .get_rpc()
+                .await
+                .with_password(Some(DEFAULT_GATEWAY_PASSWORD.to_string()));
+            // Print money for user_client
+            let dummy_module = user_client.get_first_module::<DummyClientModule>();
+            let (_, outpoint) = dummy_module.print_money(sats(1000)).await?;
+            dummy_module.receive_money(outpoint).await?;
+            assert_eq!(user_client.get_balance().await, sats(1000));
+
+            // Change the fees of the gateway
+            let fee = "10,10000".to_string();
+            let set_configuration_payload = SetConfigurationPayload {
+                password: None,
+                num_route_hints: None,
+                routing_fees: Some(fee.clone()),
+                network: None,
+                per_federation_routing_fees: None,
+            };
+            verify_gateway_rpc_success("set_configuration", || {
+                rpc_client.set_configuration(set_configuration_payload.clone())
+            })
+            .await;
+
+            // we need to reconnect to set the fees as defaults from gateway
+            reconnect_federation(&rpc_client, &fed).await;
+
+            info!("### Changed gateway routing fees");
+
+            let user_lightning_module = user_client.get_first_module::<LightningClientModule>();
+            let gateway_id = gateway_test.gateway.gateway_id;
+            let gateway = user_lightning_module.select_gateway(&gateway_id).await;
+            let gateway_client = gateway_test.remove_client_hack(&fed).await;
+
+            let invoice_amount = sats(250);
+            let invoice = other_lightning_client.invoice(invoice_amount, None).await?;
+
+            // Try to pay an invoice, this should fail since the client will not set the
+            // gateway's fees.
+            info!("### User client paying invoice");
+            let OutgoingLightningPayment {
+                payment_type,
+                contract_id,
+                fee: _,
+            } = user_lightning_module
+                .pay_bolt11_invoice(gateway.clone(), invoice.clone(), ())
+                .await
+                .expect("No Lightning Payment was started");
+            match payment_type {
+                PayType::Lightning(pay_op) => {
+                    let mut pay_sub = user_lightning_module
+                        .subscribe_ln_pay(pay_op)
+                        .await?
+                        .into_stream();
+                    assert_eq!(pay_sub.ok().await?, LnPayState::Created);
+                    let funded = pay_sub.ok().await?;
+                    assert_matches!(funded, LnPayState::Funded);
+                    info!("### User client funded contract");
+
+                    let payload = PayInvoicePayload {
+                        federation_id: user_client.federation_id(),
+                        contract_id,
+                        payment_data: get_payment_data(gateway, invoice),
+                        preimage_auth: Hash::hash(&[0; 32]),
+                    };
+
+                    let gw_pay_op = gateway_client
+                        .get_first_module::<GatewayClientModule>()
+                        .gateway_pay_bolt11_invoice(payload)
+                        .await?;
+                    let mut gw_pay_sub = gateway_client
+                        .get_first_module::<GatewayClientModule>()
+                        .gateway_subscribe_ln_pay(gw_pay_op)
+                        .await?
+                        .into_stream();
+                    assert_eq!(gw_pay_sub.ok().await?, GatewayExtPayStates::Created);
+                    info!("### Gateway client started payment");
+                    assert_matches!(
+                        gw_pay_sub.ok().await?,
+                        GatewayExtPayStates::Canceled {
+                            error: OutgoingPaymentError {
+                                error_type: OutgoingPaymentErrorType::InvalidOutgoingContract {
+                                    error: OutgoingContractError::Underfunded(_, _)
+                                },
+                                ..
+                            }
+                        }
+                    );
+                    info!("### Gateway client canceled payment");
+                }
+                _ => panic!("Expected Lightning payment!"),
+            }
 
             Ok(())
         },
@@ -312,7 +483,8 @@ async fn test_can_change_routing_fees() -> anyhow::Result<()> {
 async fn test_gateway_cannot_claim_invalid_preimage() -> anyhow::Result<()> {
     single_federation_test(
         |gateway, other_lightning_client, fed, user_client, _| async move {
-            let gateway = gateway.remove_client(&fed).await;
+            let gateway_id = gateway.gateway.gateway_id;
+            let gateway = gateway.remove_client_hack(&fed).await;
             // Print money for user_client
             let dummy_module = user_client.get_first_module::<DummyClientModule>();
             let (_, outpoint) = dummy_module.print_money(sats(1000)).await?;
@@ -325,7 +497,12 @@ async fn test_gateway_cannot_claim_invalid_preimage() -> anyhow::Result<()> {
                 payment_type: _,
                 contract_id,
                 fee: _,
-            } = pay_invoice(&user_client.get_first_module(), invoice.clone()).await?;
+            } = pay_invoice(
+                &user_client.get_first_module(),
+                invoice.clone(),
+                &gateway_id,
+            )
+            .await?;
 
             // Try to directly claim the outgoing contract with an invalid preimage
             let gateway_module = gateway.get_first_module::<GatewayClientModule>();
@@ -378,7 +555,8 @@ async fn test_gateway_cannot_claim_invalid_preimage() -> anyhow::Result<()> {
 async fn test_gateway_client_pay_unpayable_invoice() -> anyhow::Result<()> {
     single_federation_test(
         |gateway, other_lightning_client, fed, user_client, _| async move {
-            let gateway = gateway.remove_client(&fed).await;
+            let gateway_id = gateway.gateway.gateway_id;
+            let gateway_client = gateway.remove_client_hack(&fed).await;
             // Print money for user client
             let dummy_module = user_client.get_first_module::<DummyClientModule>();
             let lightning_module = user_client.get_first_module::<LightningClientModule>();
@@ -387,16 +565,16 @@ async fn test_gateway_client_pay_unpayable_invoice() -> anyhow::Result<()> {
             assert_eq!(user_client.get_balance().await, sats(1000));
 
             // Create invoice that cannot be paid
-            let invoice = other_lightning_client
-                .unpayable_invoice(sats(250), None)
-                .unwrap();
+            let invoice = other_lightning_client.unpayable_invoice(sats(250), None);
+
+            let gateway = lightning_module.select_gateway(&gateway_id).await;
 
             // User client pays test invoice
             let OutgoingLightningPayment {
                 payment_type,
                 contract_id,
                 fee: _,
-            } = pay_invoice(&lightning_module, invoice.clone()).await?;
+            } = pay_invoice(&lightning_module, invoice.clone(), &gateway_id).await?;
             match payment_type {
                 PayType::Lightning(pay_op) => {
                     let mut pay_sub = lightning_module
@@ -410,15 +588,15 @@ async fn test_gateway_client_pay_unpayable_invoice() -> anyhow::Result<()> {
                     let payload = PayInvoicePayload {
                         federation_id: user_client.federation_id(),
                         contract_id,
-                        payment_data: PaymentData::Invoice(invoice),
+                        payment_data: get_payment_data(gateway, invoice),
                         preimage_auth: Hash::hash(&[0; 32]),
                     };
 
-                    let gw_pay_op = gateway
+                    let gw_pay_op = gateway_client
                         .get_first_module::<GatewayClientModule>()
                         .gateway_pay_bolt11_invoice(payload)
                         .await?;
-                    let mut gw_pay_sub = gateway
+                    let mut gw_pay_sub = gateway_client
                         .get_first_module::<GatewayClientModule>()
                         .gateway_subscribe_ln_pay(gw_pay_op)
                         .await?
@@ -442,7 +620,8 @@ async fn test_gateway_client_pay_unpayable_invoice() -> anyhow::Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_gateway_client_intercept_valid_htlc() -> anyhow::Result<()> {
     single_federation_test(|gateway, _, fed, user_client, _| async move {
-        let gateway = gateway.remove_client(&fed).await;
+        let gateway_id = gateway.gateway.gateway_id;
+        let gateway = gateway.remove_client_hack(&fed).await;
         // Print money for gateway client
         let initial_gateway_balance = sats(1000);
         let dummy_module = gateway.get_first_module::<DummyClientModule>();
@@ -452,13 +631,16 @@ async fn test_gateway_client_intercept_valid_htlc() -> anyhow::Result<()> {
 
         // User client creates invoice in federation
         let invoice_amount = sats(100);
-        let (_invoice_op, invoice, _) = user_client
-            .get_first_module::<LightningClientModule>()
+        let ln_module = user_client.get_first_module::<LightningClientModule>();
+        let ln_gateway = ln_module.select_gateway(&gateway_id).await;
+        let desc = Description::new("description".to_string())?;
+        let (_invoice_op, invoice, _) = ln_module
             .create_bolt11_invoice(
                 invoice_amount,
-                "description".into(),
+                Bolt11InvoiceDescription::Direct(&desc),
                 None,
                 "test intercept valid HTLC",
+                ln_gateway,
             )
             .await?;
 
@@ -499,7 +681,7 @@ async fn test_gateway_client_intercept_valid_htlc() -> anyhow::Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_gateway_client_intercept_offer_does_not_exist() -> anyhow::Result<()> {
     single_federation_test(|gateway, _, fed, _, _| async move {
-        let gateway = gateway.remove_client(&fed).await;
+        let gateway = gateway.remove_client_hack(&fed).await;
         // Print money for gateway client
         let initial_gateway_balance = sats(1000);
         let dummy_module = gateway.get_first_module::<DummyClientModule>();
@@ -537,15 +719,19 @@ async fn test_gateway_client_intercept_offer_does_not_exist() -> anyhow::Result<
 #[tokio::test(flavor = "multi_thread")]
 async fn test_gateway_client_intercept_htlc_no_funds() -> anyhow::Result<()> {
     single_federation_test(|gateway, _, fed, user_client, _| async move {
-        let gateway = gateway.remove_client(&fed).await;
+        let gateway_id = gateway.gateway.gateway_id;
+        let gateway = gateway.remove_client_hack(&fed).await;
         // User client creates invoice in federation
-        let (_invoice_op, invoice, _) = user_client
-            .get_first_module::<LightningClientModule>()
+        let ln_module = user_client.get_first_module::<LightningClientModule>();
+        let ln_gateway = ln_module.select_gateway(&gateway_id).await;
+        let desc = Description::new("description".to_string())?;
+        let (_invoice_op, invoice, _) = ln_module
             .create_bolt11_invoice(
                 sats(100),
-                "description".into(),
+                Bolt11InvoiceDescription::Direct(&desc),
                 None,
                 "test intercept htlc but with no funds",
+                ln_gateway,
             )
             .await?;
 
@@ -579,7 +765,7 @@ async fn test_gateway_client_intercept_htlc_no_funds() -> anyhow::Result<()> {
 async fn test_gateway_client_intercept_htlc_invalid_offer() -> anyhow::Result<()> {
     single_federation_test(
         |gateway, other_lightning_client, fed, user_client, _| async move {
-            let gateway = gateway.remove_client(&fed).await;
+            let gateway = gateway.remove_client_hack(&fed).await;
             // Print money for gateway client
             let initial_gateway_balance = sats(1000);
             let gateway_dummy_module = gateway.get_first_module::<DummyClientModule>();
@@ -590,7 +776,7 @@ async fn test_gateway_client_intercept_htlc_invalid_offer() -> anyhow::Result<()
             assert_eq!(gateway.get_balance().await, sats(1000));
 
             // Create test invoice
-            let invoice = other_lightning_client.unpayable_invoice(sats(250), None)?;
+            let invoice = other_lightning_client.unpayable_invoice(sats(250), None);
 
             // Create offer with a preimage that doesn't correspond to the payment hash of
             // the invoice
@@ -622,6 +808,7 @@ async fn test_gateway_client_intercept_htlc_invalid_offer() -> anyhow::Result<()
                 variant: LightningOperationMetaVariant::Receive {
                     out_point: OutPoint { txid, out_idx: 0 },
                     invoice: invoice.clone(),
+                    gateway_id: None,
                 },
                 extra_meta: serde_json::to_value("test intercept HTLC with invalid offer")
                     .expect("Failed to serialize string into json"),
@@ -704,7 +891,8 @@ async fn test_gateway_register_with_federation() -> anyhow::Result<()> {
         proportional_millionths: 0,
     };
     let lightning_module = user_client.get_first_module::<LightningClientModule>();
-    let gateways = lightning_module.fetch_registered_gateways().await?;
+    lightning_module.update_gateway_cache().await?;
+    let gateways = lightning_module.list_gateways().await;
     assert!(!gateways.is_empty());
     assert!(gateways
         .into_iter()
@@ -715,19 +903,22 @@ async fn test_gateway_register_with_federation() -> anyhow::Result<()> {
         .get_rpc()
         .await
         .with_password(Some(DEFAULT_GATEWAY_PASSWORD.to_string()));
-    verify_rpc(
-        || {
-            rpc_client.leave_federation(LeaveFedPayload {
-                federation_id: fed.id(),
-            })
-        },
-        StatusCode::OK,
-    )
+    verify_gateway_rpc_success("leave_federation", || {
+        rpc_client.leave_federation(LeaveFedPayload {
+            federation_id: fed.id(),
+        })
+    })
     .await;
 
+    lightning_module.update_gateway_cache().await?;
+    let gateways = lightning_module.list_gateways().await;
+    assert!(gateways.is_empty());
+
     // Reconnect the federation and verify that the gateway has registered.
-    let gateways = lightning_module.fetch_registered_gateways().await?;
     gateway_test.connect_fed(&fed).await;
+
+    lightning_module.update_gateway_cache().await?;
+    let gateways = lightning_module.list_gateways().await;
     assert!(!gateways.is_empty());
     assert!(gateways
         .into_iter()
@@ -740,7 +931,8 @@ async fn test_gateway_register_with_federation() -> anyhow::Result<()> {
 async fn test_gateway_cannot_pay_expired_invoice() -> anyhow::Result<()> {
     single_federation_test(
         |gateway, other_lightning_client, fed, user_client, _| async move {
-            let gateway = gateway.remove_client(&fed).await;
+            let gateway_id = gateway.gateway.gateway_id;
+            let gateway_client = gateway.remove_client_hack(&fed).await;
             let invoice = other_lightning_client
                 .invoice(sats(1000), 1.into())
                 .await
@@ -748,7 +940,7 @@ async fn test_gateway_cannot_pay_expired_invoice() -> anyhow::Result<()> {
             assert_eq!(invoice.expiry_time(), Duration::from_secs(1));
 
             // at seconds granularity, must wait `expiry + 1s` to make sure expired
-            sleep(Duration::from_secs(2)).await;
+            sleep_in_test("waiting for invoice to expire", Duration::from_secs(2)).await;
 
             // Print money for user_client
             let dummy_module = user_client.get_first_module::<DummyClientModule>();
@@ -758,11 +950,12 @@ async fn test_gateway_cannot_pay_expired_invoice() -> anyhow::Result<()> {
 
             // User client pays test invoice
             let lightning_module = user_client.get_first_module::<LightningClientModule>();
+            let gateway = lightning_module.select_gateway(&gateway_id).await;
             let OutgoingLightningPayment {
                 payment_type,
                 contract_id,
                 fee: _,
-            } = pay_invoice(&lightning_module, invoice.clone()).await?;
+            } = pay_invoice(&lightning_module, invoice.clone(), &gateway_id).await?;
             match payment_type {
                 PayType::Lightning(pay_op) => {
                     let mut pay_sub = lightning_module
@@ -776,15 +969,15 @@ async fn test_gateway_cannot_pay_expired_invoice() -> anyhow::Result<()> {
                     let payload = PayInvoicePayload {
                         federation_id: user_client.federation_id(),
                         contract_id,
-                        payment_data: PaymentData::Invoice(invoice),
+                        payment_data: get_payment_data(gateway, invoice),
                         preimage_auth: Hash::hash(&[0; 32]),
                     };
 
-                    let gw_pay_op = gateway
+                    let gw_pay_op = gateway_client
                         .get_first_module::<GatewayClientModule>()
                         .gateway_pay_bolt11_invoice(payload)
                         .await?;
-                    let mut gw_pay_sub = gateway
+                    let mut gw_pay_sub = gateway_client
                         .get_first_module::<GatewayClientModule>()
                         .gateway_subscribe_ln_pay(gw_pay_op)
                         .await?
@@ -801,7 +994,7 @@ async fn test_gateway_cannot_pay_expired_invoice() -> anyhow::Result<()> {
 
             // Balance should be unchanged
             assert_eq!(user_client.get_balance().await, sats(2000));
-            assert_eq!(gateway.get_balance().await, sats(0));
+            assert_eq!(gateway_client.get_balance().await, sats(0));
 
             Ok(())
         },
@@ -831,7 +1024,6 @@ async fn test_gateway_filters_route_hints_by_inbound() -> anyhow::Result<()> {
             let gateway_ln = match gateway_type {
                 LightningNodeType::Cln => fixtures.cln().await,
                 LightningNodeType::Lnd => fixtures.lnd().await,
-                LightningNodeType::Ldk => unimplemented!("LDK Node is not supported as a gateway"),
             };
 
             let GetNodeInfoResponse { pub_key, .. } = gateway_ln.info().await?;
@@ -840,7 +1032,6 @@ async fn test_gateway_filters_route_hints_by_inbound() -> anyhow::Result<()> {
             tracing::info!("Creating federation with gateway type {gateway_type}. Number of route hints: {num_route_hints}");
 
             let fed = fixtures.new_fed().await;
-            let user_client = fed.new_client().await;
             let mut gateway = fixtures
                 .new_gateway(
                     gateway_ln,
@@ -849,17 +1040,23 @@ async fn test_gateway_filters_route_hints_by_inbound() -> anyhow::Result<()> {
                 )
                 .await;
             gateway.connect_fed(&fed).await;
+            let user_client = fed.new_client().await;
 
             let invoice_amount = sats(100);
+            let gateway_id = gateway.gateway.gateway_id;
+            let ln_module = user_client.get_first_module::<LightningClientModule>();
+            let ln_gateway = ln_module.select_gateway(&gateway_id).await;
+            let desc = Description::new("description".to_string())?;
             let (_invoice_op, invoice, _) = user_client
                 .get_first_module::<LightningClientModule>()
                 .create_bolt11_invoice(
                     invoice_amount,
-                    "description".into(),
+                    Bolt11InvoiceDescription::Direct(&desc),
                     None,
                     format!(
                         "gateway type: {gateway_type} number of route hints: {num_route_hints}"
                     ),
+                    ln_gateway,
                 )
                 .await?;
             let route_hints = invoice.route_hints();
@@ -875,14 +1072,14 @@ async fn test_gateway_filters_route_hints_by_inbound() -> anyhow::Result<()> {
                         "Found {} route hints when 1 was expected for {gateway_type} gateway",
                         route_hints.len()
                     );
-                    let route_hint = route_hints.get(0).unwrap();
+                    let route_hint = route_hints.first().unwrap();
                     assert_eq!(
                         route_hint.0.len(),
                         1,
                         "Found {} hops when 1 was expected for {gateway_type} gateway",
                         route_hint.0.len()
                     );
-                    let route_hint_pub_key = route_hint.0.get(0).unwrap().src_node_id;
+                    let route_hint_pub_key = route_hint.0.first().unwrap().src_node_id;
                     assert_eq!(
                         route_hint_pub_key, public_key,
                         "Public key of route hint hop did not match expected public key"
@@ -904,7 +1101,7 @@ async fn test_gateway_filters_route_hints_by_inbound() -> anyhow::Result<()> {
                     for route_hint in route_hints {
                         if route_hint.0.len() == 1 {
                             // If there's only one hop, it should contain the gateway's public key
-                            let route_hint_pub_key = route_hint.0.get(0).unwrap().src_node_id;
+                            let route_hint_pub_key = route_hint.0.first().unwrap().src_node_id;
                             assert_eq!(route_hint_pub_key, public_key);
                             num_one_hops += 1;
                         } else {
@@ -950,14 +1147,14 @@ async fn test_cannot_connect_same_federation() -> anyhow::Result<()> {
         invite_code: fed.invite_code().to_string(),
     };
 
-    verify_rpc(
-        || rpc_client.connect_federation(join_payload.clone()),
-        StatusCode::OK,
-    )
+    verify_gateway_rpc_success("connect_federation", || {
+        rpc_client.connect_federation(join_payload.clone())
+    })
     .await;
 
     // Try to connect the same federation
-    verify_rpc(
+    verify_gateway_rpc_failure(
+        "connect_federation",
         || rpc_client.connect_federation(join_payload.clone()),
         StatusCode::INTERNAL_SERVER_ERROR,
     )
@@ -973,7 +1170,7 @@ async fn test_gateway_configuration() -> anyhow::Result<()> {
     let fed = fixtures.new_fed().await;
     let lnd = fixtures.lnd().await;
     let gateway = fixtures.new_gateway(lnd, 0, None).await;
-    let rpc_client = gateway.get_rpc().await;
+    let initial_rpc_client = gateway.get_rpc().await;
 
     // Verify that we can't join a federation yet because the configuration is not
     // set
@@ -981,14 +1178,15 @@ async fn test_gateway_configuration() -> anyhow::Result<()> {
         invite_code: fed.invite_code().to_string(),
     };
 
-    verify_rpc(
-        || rpc_client.connect_federation(join_payload.clone()),
+    verify_gateway_rpc_failure(
+        "connect_federation",
+        || initial_rpc_client.connect_federation(join_payload.clone()),
         StatusCode::NOT_FOUND,
     )
     .await;
 
     // Verify that the gateway's state is "Configuring"
-    let gw_info = rpc_client.get_info().await?;
+    let gw_info = verify_gateway_rpc_success("get_info", || initial_rpc_client.get_info()).await;
     assert_eq!(gw_info.gateway_state, "Configuring".to_string());
 
     // Verify that the gateway's fees, and network are `None`
@@ -1001,30 +1199,49 @@ async fn test_gateway_configuration() -> anyhow::Result<()> {
         num_route_hints: None,
         routing_fees: None,
         network: None,
+        per_federation_routing_fees: None,
     };
-    verify_rpc(
-        || rpc_client.set_configuration(set_configuration_payload.clone()),
-        StatusCode::OK,
+    verify_gateway_rpc_success("set_configuration", || {
+        initial_rpc_client.set_configuration(set_configuration_payload.clone())
+    })
+    .await;
+
+    // Verify that the gateway's password is stored correctly (i.e. the stored hash
+    // and salt match the password)
+    let gateway_config = gateway
+        .gateway
+        .gateway_config
+        .read()
+        .await
+        .clone()
+        .expect("Gateway config should be set");
+    assert_eq!(
+        gateway_config.hashed_password,
+        hash_password(test_password.clone(), gateway_config.password_salt)
+    );
+
+    // Verify client with no password fails since the password has been set
+    verify_gateway_rpc_failure(
+        "get_info",
+        || initial_rpc_client.get_info(),
+        StatusCode::UNAUTHORIZED,
     )
     .await;
 
-    GatewayTest::wait_for_gateway_state(gateway.gateway.clone(), |gw_state| {
-        matches!(gw_state, GatewayState::Running { .. })
-    })
-    .await?;
-
-    // Verify old password no longer works
-    verify_rpc(|| rpc_client.get_info(), StatusCode::UNAUTHORIZED).await;
-
     // Verify the gateway's state is "Running" with default fee and default or
     // lightning node network
-    let rpc_client = rpc_client.with_password(Some(test_password));
-    let gw_info = rpc_client.get_info().await?;
+    let initial_rpc_client_with_password = initial_rpc_client.with_password(Some(test_password));
+    let gw_info =
+        verify_gateway_rpc_success("get_info", || initial_rpc_client_with_password.get_info())
+            .await;
     assert_eq!(gw_info.gateway_state, "Running".to_string());
     assert_eq!(gw_info.fees, Some(DEFAULT_FEES));
-    assert_eq!(gw_info.network, Some(DEFAULT_NETWORK));
+    assert_eq!(
+        gw_info.network,
+        Some(bitcoin30_to_bitcoin29_network(DEFAULT_NETWORK))
+    );
 
-    // Verify we can change most configurations when the gateway is running
+    // Verify we can change configurations when the gateway is running
     let new_password = "new_password".to_string();
     let fee = "1000,2000".to_string();
     let set_configuration_payload = SetConfigurationPayload {
@@ -1032,42 +1249,46 @@ async fn test_gateway_configuration() -> anyhow::Result<()> {
         num_route_hints: Some(1),
         routing_fees: Some(fee.clone()),
         network: None,
+        per_federation_routing_fees: None,
     };
-    verify_rpc(
-        || rpc_client.set_configuration(set_configuration_payload.clone()),
-        StatusCode::OK,
-    )
+    verify_gateway_rpc_success("set_configuration", || {
+        initial_rpc_client_with_password.set_configuration(set_configuration_payload.clone())
+    })
     .await;
 
     // Verify info works with the new password.
-    // Need to retry because the webserver might be restarting.
-    let rpc_client = rpc_client.with_password(Some(new_password.clone()));
-    let gw_info = retry(
-        "Get info after restart".to_string(),
-        || async {
-            let info = rpc_client.get_info().await?;
-            Ok(info)
-        },
-        Duration::from_secs(1),
-        5,
-    )
-    .await?;
+    let new_password_rpc_client = initial_rpc_client.with_password(Some(new_password.clone()));
+    let gw_info =
+        verify_gateway_rpc_success("get_info", || new_password_rpc_client.get_info()).await;
 
     assert_eq!(gw_info.gateway_state, "Running".to_string());
     assert_eq!(gw_info.fees, Some(GatewayFee::from_str(&fee)?.0));
-    assert_eq!(gw_info.network, Some(DEFAULT_NETWORK));
+    assert_eq!(
+        gw_info.network,
+        Some(bitcoin30_to_bitcoin29_network(DEFAULT_NETWORK))
+    );
+
+    // Verify that get_info with the old password fails
+    verify_gateway_rpc_failure(
+        "get_info",
+        || initial_rpc_client_with_password.get_info(),
+        StatusCode::UNAUTHORIZED,
+    )
+    .await;
 
     // Verify we can configure gateway to a network same as than the lightning nodes
     let set_configuration_payload = SetConfigurationPayload {
         password: Some(new_password.clone()),
         num_route_hints: None,
+        network: Some(bitcoin30_to_bitcoin29_network(DEFAULT_NETWORK)), /* Same as connected
+                                                                         * lightning node's
+                                                                         * network */
         routing_fees: None,
-        network: Some(DEFAULT_NETWORK), // Same as connected lightning node's network
+        per_federation_routing_fees: None,
     };
-    verify_rpc(
-        || rpc_client.set_configuration(set_configuration_payload.clone()),
-        StatusCode::OK,
-    )
+    verify_gateway_rpc_success("set_configuration", || {
+        new_password_rpc_client.set_configuration(set_configuration_payload.clone())
+    })
     .await;
 
     // Verify we cannot reconfigure gateway to a network different than the
@@ -1075,31 +1296,58 @@ async fn test_gateway_configuration() -> anyhow::Result<()> {
     let set_configuration_payload = SetConfigurationPayload {
         password: Some(new_password.clone()),
         num_route_hints: None,
+        network: Some(bitcoin30_to_bitcoin29_network(Network::Testnet)), /* Different from
+                                                                          * connected lightning
+                                                                          * node's network */
         routing_fees: None,
-        network: Some(Network::Testnet), // Different from connected lightning node's network
+        per_federation_routing_fees: None,
     };
-    verify_rpc(
-        || rpc_client.set_configuration(set_configuration_payload.clone()),
+    verify_gateway_rpc_failure(
+        "set_configuration",
+        || new_password_rpc_client.set_configuration(set_configuration_payload.clone()),
         StatusCode::INTERNAL_SERVER_ERROR,
     )
     .await;
 
     // Verify we can connect to a federation if the gateway is configured to use
     // the same network. Test federations are on Regtest by default
-    verify_rpc(
-        || rpc_client.connect_federation(join_payload.clone()),
-        StatusCode::OK,
-    )
+    verify_gateway_rpc_success("connect_federation", || {
+        new_password_rpc_client.connect_federation(join_payload.clone())
+    })
     .await;
-    verify_rpc(
-        || {
-            rpc_client.get_balance(BalancePayload {
-                federation_id: fed.invite_code().federation_id(),
-            })
-        },
-        StatusCode::OK,
-    )
+
+    verify_gateway_rpc_success("get_balance", || {
+        new_password_rpc_client.get_balance(BalancePayload {
+            federation_id: fed.invite_code().federation_id(),
+        })
+    })
     .await;
+
+    // Verify we can configure gateway to charge fees for specific federation
+    let federation_routing_fees = FederationRoutingFees::from_str("10,10000")?;
+    let set_configuration_payload = SetConfigurationPayload {
+        password: None,
+        num_route_hints: None,
+        routing_fees: None,
+        network: None,
+        per_federation_routing_fees: Some(vec![(fed.id(), federation_routing_fees.clone())]),
+    };
+    verify_gateway_rpc_success("set_configuration", || {
+        new_password_rpc_client.set_configuration(set_configuration_payload.clone())
+    })
+    .await;
+    // Verify info has new per federation routing fees.
+    let new_password_rpc_client = initial_rpc_client.with_password(Some(new_password.clone()));
+    let gw_info =
+        verify_gateway_rpc_success("get_info", || new_password_rpc_client.get_info()).await;
+    assert_eq!(
+        gw_info
+            .federations
+            .iter()
+            .find(|f| f.federation_id == fed.id())
+            .and_then(|f| f.routing_fees.clone()),
+        Some(federation_routing_fees)
+    );
 
     Ok(())
 }
@@ -1168,6 +1416,82 @@ async fn test_gateway_shows_info_about_all_connected_federations() -> anyhow::Re
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_gateway_can_leave_connected_federations() -> anyhow::Result<()> {
+    multi_federation_test(
+        LightningNodeType::Lnd,
+        |gateway, rpc, fed1, fed2, _| async move {
+            assert_eq!(rpc.get_info().await.unwrap().federations.len(), 0);
+
+            let invite1 = fed1.invite_code();
+            let invite2 = fed2.invite_code();
+
+            let id1 = invite1.federation_id();
+            let id2 = invite2.federation_id();
+
+            connect_federations(&rpc, &[fed1, fed2]).await.unwrap();
+
+            let info = rpc.get_info().await.unwrap();
+            assert_eq!(info.federations.len(), 2);
+            assert!(info
+                .federations
+                .iter()
+                .any(|info| info.federation_id == id1 && info.channel_id == Some(1)));
+            assert!(info
+                .federations
+                .iter()
+                .any(|info| info.federation_id == id2 && info.channel_id == Some(2)));
+
+            // remove first connected federation
+            let fed_info = rpc
+                .leave_federation(LeaveFedPayload { federation_id: id1 })
+                .await
+                .unwrap();
+            assert_eq!(fed_info.federation_id, id1);
+            assert_eq!(fed_info.channel_id, Some(1));
+
+            // reconnect the first federation
+            let fed_info = rpc
+                .connect_federation(ConnectFedPayload {
+                    invite_code: invite1.to_string(),
+                })
+                .await
+                .unwrap();
+            assert_eq!(fed_info.federation_id, id1);
+            assert_eq!(fed_info.channel_id, Some(3));
+
+            // remove second connected federation
+            let fed_info = rpc
+                .leave_federation(LeaveFedPayload { federation_id: id2 })
+                .await
+                .unwrap();
+            assert_eq!(fed_info.federation_id, id2);
+            assert_eq!(fed_info.channel_id, Some(2));
+
+            // reconnect the second federation
+            let fed_info = rpc
+                .connect_federation(ConnectFedPayload {
+                    invite_code: invite2.to_string(),
+                })
+                .await
+                .unwrap();
+            assert_eq!(fed_info.federation_id, id2);
+            assert_eq!(fed_info.channel_id, Some(4));
+
+            let info = rpc.get_info().await.unwrap();
+            assert_eq!(info.federations.len(), 2);
+            assert_eq!(
+                info.channels.unwrap().keys().cloned().collect::<Vec<u64>>(),
+                vec![3, 4]
+            );
+
+            drop(gateway); // keep until the end to avoid the gateway shutting down too early
+            Ok(())
+        },
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_gateway_shows_balance_for_any_connected_federation() -> anyhow::Result<()> {
     multi_federation_test(
         LightningNodeType::Lnd,
@@ -1199,15 +1523,33 @@ async fn test_gateway_executes_swaps_between_connected_federations() -> anyhow::
     multi_federation_test(
         LightningNodeType::Lnd,
         |gateway, rpc, fed1, fed2, _| async move {
+            let gateway_id = gateway.gateway.gateway_id;
             let id1 = fed1.invite_code().federation_id();
             let id2 = fed2.invite_code().federation_id();
 
-            let client1 = fed1.new_client().await;
-            let client2 = fed2.new_client().await;
+            connect_federations(&rpc, &[fed1.clone(), fed2.clone()])
+                .await
+                .unwrap();
 
-            connect_federations(&rpc, &[fed1, fed2]).await.unwrap();
+            // setting specific routing fees for fed1
+            let fed_routing_fees = FederationRoutingFees::from_str("10,10000")?;
+            let set_configuration_payload = SetConfigurationPayload {
+                password: None,
+                num_route_hints: None,
+                routing_fees: None,
+                network: None,
+                per_federation_routing_fees: Some(vec![(id1, fed_routing_fees.clone())]),
+            };
+            verify_gateway_rpc_success("set_configuration", || {
+                rpc.set_configuration(set_configuration_payload.clone())
+            })
+            .await;
+
             send_msats_to_gateway(&gateway, id1, 10_000).await;
             send_msats_to_gateway(&gateway, id2, 10_000).await;
+
+            let client1 = fed1.new_client().await;
+            let client2 = fed2.new_client().await;
 
             // Check gateway balances before facilitating direct swap between federations
             let pre_balances = get_balances(&rpc, &[id1, id2]).await;
@@ -1222,17 +1564,19 @@ async fn test_gateway_executes_swaps_between_connected_federations() -> anyhow::
 
             // User creates invoice in federation 2
             let invoice_amt = msats(2_500);
-            let (receive_op, invoice, _) = client2
-                .get_first_module::<LightningClientModule>()
+            let ln_module = client2.get_first_module::<LightningClientModule>();
+            let ln_gateway = ln_module.select_gateway(&gateway_id).await;
+            let desc = Description::new("description".to_string())?;
+            let (receive_op, invoice, _) = ln_module
                 .create_bolt11_invoice(
                     invoice_amt,
-                    "description".into(),
+                    Bolt11InvoiceDescription::Direct(&desc),
                     None,
                     "test gw swap between federations",
+                    ln_gateway,
                 )
                 .await?;
-            let mut receive_sub = client2
-                .get_first_module::<LightningClientModule>()
+            let mut receive_sub = ln_module
                 .subscribe_ln_receive(receive_op)
                 .await?
                 .into_stream();
@@ -1242,7 +1586,7 @@ async fn test_gateway_executes_swaps_between_connected_federations() -> anyhow::
                 payment_type,
                 contract_id: _,
                 fee,
-            } = pay_invoice(&client1.get_first_module(), invoice.clone()).await?;
+            } = pay_invoice(&client1.get_first_module(), invoice.clone(), &gateway_id).await?;
             match payment_type {
                 PayType::Lightning(pay_op) => {
                     let mut pay_sub = client1
@@ -1254,6 +1598,10 @@ async fn test_gateway_executes_swaps_between_connected_federations() -> anyhow::
                     let funded = pay_sub.ok().await?;
                     assert_matches!(funded, LnPayState::Funded);
                     assert_eq!(client1.get_balance().await, deposit_amt - invoice_amt - fee);
+                    assert_eq!(
+                        routing_fees_in_msats(&fed_routing_fees, &invoice_amt),
+                        fee.msats
+                    );
                 }
                 _ => panic!("Expected Lightning payment!"),
             }
@@ -1276,6 +1624,10 @@ async fn test_gateway_executes_swaps_between_connected_federations() -> anyhow::
             // its balances on both federations.
             let post_balances = retry(
                 "Gateway balance after swap".to_string(),
+                FibonacciBackoff::default()
+                    .with_min_delay(Duration::from_millis(200))
+                    .with_max_delay(Duration::from_secs(3))
+                    .with_max_times(10),
                 || async {
                     let post_balances = get_balances(&rpc, &[id1, id2]).await;
                     if post_balances[0] == pre_balances[0] || post_balances[1] == pre_balances[1] {
@@ -1283,8 +1635,6 @@ async fn test_gateway_executes_swaps_between_connected_federations() -> anyhow::
                     };
                     Ok(post_balances)
                 },
-                Duration::from_secs(1),
-                15,
             )
             .await?;
             assert_eq!(
@@ -1292,6 +1642,10 @@ async fn test_gateway_executes_swaps_between_connected_federations() -> anyhow::
                 pre_balances[0] + (invoice_amt + fee).msats
             );
             assert_eq!(post_balances[1], pre_balances[1] - invoice_amt.msats);
+            assert_eq!(
+                routing_fees_in_msats(&fed_routing_fees, &invoice_amt),
+                fee.msats
+            );
 
             Ok(())
         },
@@ -1299,16 +1653,63 @@ async fn test_gateway_executes_swaps_between_connected_federations() -> anyhow::
     .await
 }
 
-async fn verify_rpc<Fut, T>(func: impl Fn() -> Fut, status_code: StatusCode)
+fn routing_fees_in_msats(routing_fees: &FederationRoutingFees, amount: &Amount) -> u64 {
+    ((amount.msats * routing_fees.proportional_millionths as u64) / 1_000_000)
+        + routing_fees.base_msat as u64
+}
+
+async fn reconnect_federation(rpc: &GatewayRpcClient, fed: &FederationTest) {
+    verify_gateway_rpc_success("leave_federation", || {
+        rpc.leave_federation(LeaveFedPayload {
+            federation_id: fed.id(),
+        })
+    })
+    .await;
+    verify_gateway_rpc_success("connect_federation", || {
+        rpc.connect_federation(ConnectFedPayload {
+            invite_code: fed.invite_code().to_string(),
+        })
+    })
+    .await;
+}
+
+/// Verifies that a gateway RPC succeeds. If it fails, the status code of the
+/// RPC is printed.
+async fn verify_gateway_rpc_success<Fut, T>(name: &str, func: impl Fn() -> Fut) -> T
 where
     Fut: Future<Output = GatewayRpcResult<T>>,
 {
-    if let Err(GatewayRpcError::BadStatus(status)) = func().await {
-        assert_eq!(status, status_code)
+    match func().await {
+        Ok(ret) => ret,
+        Err(GatewayRpcError::RequestError(e)) => panic!("RequestError during {name}: {e:?}"),
+        Err(GatewayRpcError::BadStatus(status)) => {
+            panic!("{name} returned error code {status} when success was expected")
+        }
     }
 }
 
-pub async fn connect_federations(
+/// Verifies that a gateway RPC fails with a specific `StatusCode`
+async fn verify_gateway_rpc_failure<Fut, T>(
+    name: &str,
+    func: impl Fn() -> Fut,
+    status_code: StatusCode,
+) where
+    Fut: Future<Output = GatewayRpcResult<T>>,
+{
+    match func().await {
+        Ok(_) => panic!("{name} returned success, expected {status_code}"),
+        Err(GatewayRpcError::RequestError(e)) => panic!("RequestError during {name}: {e:?}"),
+        Err(GatewayRpcError::BadStatus(status)) => {
+            assert_eq!(
+                status, status_code,
+                "Unexpected status code returned. Expected: {status_code}, found {status}"
+            )
+        }
+    }
+}
+
+/// Connects the gateway to all federations in `feds`.
+async fn connect_federations(
     rpc: &GatewayRpcClient,
     feds: &[FederationTest],
 ) -> anyhow::Result<()> {
@@ -1320,6 +1721,7 @@ pub async fn connect_federations(
     Ok(())
 }
 
+/// Retrieves the balance of each federation the gateway is connected to.
 async fn get_balances(
     rpc: &GatewayRpcClient,
     ids: impl IntoIterator<Item = &FederationId>,
@@ -1337,6 +1739,7 @@ async fn get_balances(
     balances
 }
 
+/// Prints msats for the gateway using the dummy module.
 async fn send_msats_to_gateway(gateway: &GatewayTest, id: FederationId, msats: u64) {
     let client = gateway.select_client(id).await;
     let dummy_module = client.get_first_module::<DummyClientModule>();

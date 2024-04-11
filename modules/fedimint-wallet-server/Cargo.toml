@@ -1,6 +1,6 @@
 [package]
 name = "fedimint-wallet-server"
-version = "0.3.0-alpha"
+version = "0.4.0-alpha"
 authors = ["The Fedimint Developers"]
 edition = "2021"
 description = "fedimint-wallet is a n on-chain bitcoin wallet module. It uses a key-value store and is not a standard HD wallet."
@@ -16,29 +16,31 @@ name = "fedimint_wallet_server"
 path = "src/lib.rs"
 
 [dependencies]
-anyhow = "1.0.66"
+anyhow = { workspace = true }
 async-trait = "0.1"
 bitcoin = { version = "0.29.2", features = [ "rand", "serde"] }
-erased-serde = "0.3"
-fedimint-bitcoind = { version = "0.3.0-alpha", path = "../../fedimint-bitcoind" }
-fedimint-core = { version = "0.3.0-alpha", path = "../../fedimint-core" }
-fedimint-metrics = { version = "0.3.0-alpha", path = "../../fedimint-metrics" }
-fedimint-wallet-common = { version = "0.3.0-alpha", path = "../fedimint-wallet-common" }
-futures = "0.3"
-miniscript = { version = "9.0.2", features = [ "compiler", "serde" ] }
-impl-tools = "0.8.0"
-rand = "0.8"
-secp256k1 = { version = "0.24.2", features = [ "serde" ] }
-serde = { version = "1.0.149", features = [ "derive" ] }
-strum = "0.24"
-strum_macros = "0.24"
-thiserror = "1.0.39"
-tokio = { version = "1.26.0", features = ["sync"], optional = true }
-tracing ="0.1.37"
-url = "2.3.1"
-validator = { version = "0.16", features = ["derive"] }
-fedimint-server = { version = "0.3.0-alpha", path = "../../fedimint-server" }
+erased-serde = { workspace = true }
+fedimint-bitcoind = { version = "=0.4.0-alpha", path = "../../fedimint-bitcoind" }
+fedimint-core = { version = "=0.4.0-alpha", path = "../../fedimint-core" }
+fedimint-metrics = { version = "=0.4.0-alpha", path = "../../fedimint-metrics" }
+fedimint-wallet-common = { version = "=0.4.0-alpha", path = "../fedimint-wallet-common" }
+futures = { workspace = true }
+hex = { workspace = true }
+miniscript = { version = "10.0.0", features = [ "compiler", "serde" ] }
+miniscript9 = { package = "miniscript", version = "9.0.2" }
+impl-tools = "0.10.0"
+rand = { workspace = true }
+secp256k1 = { version = "0.24.3", features = [ "serde" ] }
+serde = { version = "1.0.197", features = [ "derive" ] }
+strum = { workspace = true }
+strum_macros = { workspace = true }
+thiserror = { workspace = true }
+tokio = { version = "1.36.0", features = ["sync"], optional = true }
+tracing = { workspace = true }
+url = { workspace = true }
+validator = { version = "0.17", features = ["derive"] }
+fedimint-server = { version = "=0.4.0-alpha", path = "../../fedimint-server" }
 
 [dev-dependencies]
-tracing-subscriber = { version = "0.3.16", features = [ "env-filter" ] }
-tokio = { version = "1.26.0", features = ["full"] }
+tracing-subscriber = { version = "0.3.18", features = [ "env-filter" ] }
+tokio = { version = "1.36.0", features = ["full"] }

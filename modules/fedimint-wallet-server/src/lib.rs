@@ -1,5 +1,7 @@
+pub mod db;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::convert::{Infallible, TryInto};
+use std::convert::Infallible;
 #[cfg(not(target_family = "wasm"))]
 use std::time::Duration;
 
@@ -14,17 +16,16 @@ use bitcoin::{
     Transaction, TxIn, TxOut, Txid,
 };
 use common::config::WalletConfigConsensus;
-use common::db::{
-    BlockCountVoteKey, BlockCountVotePrefix, DbKeyPrefix, FeeRateVoteKey, FeeRateVotePrefix,
-    PegOutNonceKey,
-};
 use common::{
-    proprietary_tweak_key, PegOutFees, PegOutSignatureItem, PendingTransaction,
-    ProcessPegOutSigError, SpendableUTXO, UnsignedTransaction, WalletCommonInit,
-    WalletConsensusItem, WalletCreationError, WalletInput, WalletModuleTypes, WalletOutput,
-    WalletOutputOutcome, CONFIRMATION_TARGET,
+    proprietary_tweak_key, PegOutFees, PegOutSignatureItem, ProcessPegOutSigError, SpendableUTXO,
+    WalletCommonInit, WalletConsensusItem, WalletCreationError, WalletInput, WalletModuleTypes,
+    WalletOutput, WalletOutputOutcome, CONFIRMATION_TARGET,
 };
 use fedimint_bitcoind::{create_bitcoind, DynBitcoindRpc};
+use fedimint_core::bitcoin_migration::{
+    bitcoin29_to_bitcoin30_secp256k1_public_key, bitcoin30_to_bitcoin29_script,
+    bitcoin30_to_bitcoin29_secp256k1_public_key,
+};
 use fedimint_core::config::{
     ConfigGenModuleParams, DkgResult, ServerModuleConfig, ServerModuleConsensusConfig,
     TypedServerModuleConfig, TypedServerModuleConsensusConfig,
@@ -33,14 +34,14 @@ use fedimint_core::core::ModuleInstanceId;
 use fedimint_core::db::{
     Database, DatabaseTransaction, DatabaseVersion, IDatabaseTransactionOpsCoreTyped,
 };
-use fedimint_core::encoding::Encodable;
+use fedimint_core::encoding::{Decodable, Encodable};
 use fedimint_core::endpoint_constants::{
     BLOCK_COUNT_ENDPOINT, BLOCK_COUNT_LOCAL_ENDPOINT, PEG_OUT_FEES_ENDPOINT,
 };
 use fedimint_core::module::audit::Audit;
 use fedimint_core::module::{
-    api_endpoint, ApiEndpoint, CoreConsensusVersion, InputMeta, ModuleConsensusVersion, ModuleInit,
-    PeerHandle, ServerModuleInit, ServerModuleInitArgs, SupportedModuleApiVersions,
+    api_endpoint, ApiEndpoint, ApiVersion, CoreConsensusVersion, InputMeta, ModuleConsensusVersion,
+    ModuleInit, PeerHandle, ServerModuleInit, ServerModuleInitArgs, SupportedModuleApiVersions,
     TransactionItemAmount,
 };
 use fedimint_core::server::DynServerModule;
@@ -48,82 +49,46 @@ use fedimint_core::server::DynServerModule;
 use fedimint_core::task::sleep;
 use fedimint_core::task::{TaskGroup, TaskHandle};
 use fedimint_core::{
-    apply, async_trait_maybe_send, push_db_key_items, push_db_pair_items, Amount, Feerate,
-    NumPeers, OutPoint, PeerId, ServerModule,
+    apply, async_trait_maybe_send, push_db_key_items, push_db_pair_items, Feerate, NumPeersExt,
+    OutPoint, PeerId, ServerModule,
 };
-use fedimint_metrics::{histogram_opts, lazy_static, prometheus, register_histogram, Histogram};
 use fedimint_server::config::distributedgen::PeerHandleOps;
 pub use fedimint_wallet_common as common;
 use fedimint_wallet_common::config::{WalletClientConfig, WalletConfig, WalletGenParams};
-use fedimint_wallet_common::db::{
-    BlockHashKey, BlockHashKeyPrefix, PegOutBitcoinTransaction, PegOutBitcoinTransactionPrefix,
-    PegOutTxSignatureCI, PegOutTxSignatureCIPrefix, PendingTransactionKey,
-    PendingTransactionPrefixKey, UTXOKey, UTXOPrefixKey, UnsignedTransactionKey,
-    UnsignedTransactionPrefixKey,
-};
 use fedimint_wallet_common::keys::CompressedPublicKey;
 use fedimint_wallet_common::tweakable::Tweakable;
 use fedimint_wallet_common::{Rbf, WalletInputError, WalletOutputError, WalletOutputV0};
 use futures::StreamExt;
-use miniscript::psbt::PsbtExt;
+use hex::ToHex;
+use metrics::{
+    WALLET_INOUT_FEES_SATS, WALLET_INOUT_SATS, WALLET_PEGIN_FEES_SATS, WALLET_PEGIN_SATS,
+    WALLET_PEGOUT_FEES_SATS, WALLET_PEGOUT_SATS,
+};
 use miniscript::{translate_hash_fail, Descriptor, TranslatePk};
+use miniscript9::psbt::PsbtExt;
 use rand::rngs::OsRng;
 use secp256k1::{Message, Scalar};
+use serde::Serialize;
 use strum::IntoEnumIterator;
 use tracing::{debug, error, info, instrument, trace, warn};
 
-lazy_static! {
-    static ref AMOUNTS_BUCKETS_SATS: Vec<f64> = vec![
-        0.0,
-        0.1,
-        1.0,
-        10.0,
-        100.0,
-        1000.0,
-        10000.0,
-        100000.0,
-        1000000.0,
-        10000000.0,
-        100000000.0
-    ];
-    static ref WALLET_PEGIN_SATS: Histogram = register_histogram!(histogram_opts!(
-        "wallet_pegin_sats",
-        "Value of peg-in transactions in sats",
-        AMOUNTS_BUCKETS_SATS.clone()
-    ))
-    .unwrap();
-    static ref WALLET_PEGIN_FEES_SATS: Histogram = register_histogram!(histogram_opts!(
-        "wallet_pegin_fees_sats",
-        "Value of peg-in fees in sats",
-        AMOUNTS_BUCKETS_SATS.clone()
-    ))
-    .unwrap();
-    static ref WALLET_PEGOUT_SATS: Histogram = register_histogram!(histogram_opts!(
-        "wallet_pegout_sats",
-        "Value of peg-out transactions in sats",
-        AMOUNTS_BUCKETS_SATS.clone()
-    ))
-    .unwrap();
-    static ref WALLET_PEGOUT_FEES_SATS: Histogram = register_histogram!(histogram_opts!(
-        "wallet_pegout_fees_sats",
-        "Value of peg-out fees in sats",
-        AMOUNTS_BUCKETS_SATS.clone()
-    ))
-    .unwrap();
-    static ref ALL_METRICS: [Box<dyn prometheus::core::Collector>; 4] = [
-        Box::new(WALLET_PEGIN_SATS.clone()),
-        Box::new(WALLET_PEGIN_FEES_SATS.clone()),
-        Box::new(WALLET_PEGOUT_SATS.clone()),
-        Box::new(WALLET_PEGOUT_FEES_SATS.clone()),
-    ];
-}
+use crate::db::{
+    BlockCountVoteKey, BlockCountVotePrefix, BlockHashKey, BlockHashKeyPrefix, DbKeyPrefix,
+    FeeRateVoteKey, FeeRateVotePrefix, PegOutBitcoinTransaction, PegOutBitcoinTransactionPrefix,
+    PegOutNonceKey, PegOutTxSignatureCI, PegOutTxSignatureCIPrefix, PendingTransactionKey,
+    PendingTransactionPrefixKey, UTXOKey, UTXOPrefixKey, UnsignedTransactionKey,
+    UnsignedTransactionPrefixKey,
+};
+use crate::metrics::WALLET_BLOCK_COUNT;
+
+mod metrics;
 
 #[derive(Debug, Clone)]
 pub struct WalletInit;
 
-#[apply(async_trait_maybe_send!)]
 impl ModuleInit for WalletInit {
     type Common = WalletCommonInit;
+    const DATABASE_VERSION: DatabaseVersion = DatabaseVersion(0);
 
     async fn dump_database(
         &self,
@@ -226,7 +191,6 @@ impl ModuleInit for WalletInit {
 #[apply(async_trait_maybe_send!)]
 impl ServerModuleInit for WalletInit {
     type Params = WalletGenParams;
-    const DATABASE_VERSION: DatabaseVersion = DatabaseVersion(0);
 
     fn versions(&self, _core: CoreConsensusVersion) -> &[ModuleConsensusVersion] {
         const MODULE_CONSENSUS_VERSION: ModuleConsensusVersion = ModuleConsensusVersion::new(0, 0);
@@ -238,10 +202,20 @@ impl ServerModuleInit for WalletInit {
     }
 
     async fn init(&self, args: &ServerModuleInitArgs<Self>) -> anyhow::Result<DynServerModule> {
-        // Ensure all metrics are initialized
-        for metric in ALL_METRICS.iter() {
-            metric.collect();
+        for direction in [&"incoming", "outgoing"] {
+            WALLET_INOUT_FEES_SATS
+                .with_label_values(&[direction])
+                .get_sample_count();
+            WALLET_INOUT_SATS
+                .with_label_values(&[direction])
+                .get_sample_count();
         }
+        // Eagerly initialize metrics that trigger infrequently
+        WALLET_PEGIN_FEES_SATS.get_sample_count();
+        WALLET_PEGIN_SATS.get_sample_count();
+        WALLET_PEGOUT_SATS.get_sample_count();
+        WALLET_PEGOUT_FEES_SATS.get_sample_count();
+
         Ok(Wallet::new(
             args.cfg().to_typed()?,
             args.db().clone(),
@@ -300,10 +274,20 @@ impl ServerModuleInit for WalletInit {
         let (sk, pk) = secp.generate_keypair(&mut OsRng);
         let our_key = CompressedPublicKey { key: pk };
         let peer_peg_in_keys: BTreeMap<PeerId, CompressedPublicKey> = peers
-            .exchange_pubkeys("wallet".to_string(), our_key.key)
+            .exchange_pubkeys(
+                "wallet".to_string(),
+                bitcoin29_to_bitcoin30_secp256k1_public_key(our_key.key),
+            )
             .await?
             .into_iter()
-            .map(|(k, key)| (k, CompressedPublicKey { key }))
+            .map(|(k, key)| {
+                (
+                    k,
+                    CompressedPublicKey {
+                        key: bitcoin30_to_bitcoin29_secp256k1_public_key(key),
+                    },
+                )
+            })
             .collect();
 
         let wallet_cfg = WalletConfig::new(
@@ -394,6 +378,7 @@ impl ServerModule for Wallet {
                 "Proposing block count"
             );
 
+            WALLET_BLOCK_COUNT.set(block_count_vote as i64);
             items.push(WalletConsensusItem::BlockCount(block_count_vote));
         }
 
@@ -686,6 +671,7 @@ impl ServerModule for Wallet {
         vec![
             api_endpoint! {
                 BLOCK_COUNT_ENDPOINT,
+                ApiVersion::new(0, 0),
                 async |module: &Wallet, context, _params: ()| -> u32 {
                     // TODO: perhaps change this to an Option
                     Ok(module.consensus_block_count(&mut context.dbtx().into_nc()).await.unwrap_or_default())
@@ -693,12 +679,14 @@ impl ServerModule for Wallet {
             },
             api_endpoint! {
                 BLOCK_COUNT_LOCAL_ENDPOINT,
+                ApiVersion::new(0, 0),
                 async |module: &Wallet, _context, _params: ()| -> Option<u32> {
                     Ok(*module.block_count_local.lock().expect("Locking failed"))
                 }
             },
             api_endpoint! {
                 PEG_OUT_FEES_ENDPOINT,
+                ApiVersion::new(0, 0),
                 async |module: &Wallet, context, params: (Address, u64)| -> Option<PegOutFees> {
                     let (address, sats) = params;
                     let feerate = module.consensus_fee_rate(&mut context.dbtx().into_nc()).await;
@@ -730,15 +718,35 @@ impl ServerModule for Wallet {
     }
 }
 
-fn calculate_pegin_metrics(dbtx: &mut DatabaseTransaction<'_>, amount: Amount, fee: Amount) {
+fn calculate_pegin_metrics(
+    dbtx: &mut DatabaseTransaction<'_>,
+    amount: fedimint_core::Amount,
+    fee: fedimint_core::Amount,
+) {
     dbtx.on_commit(move || {
+        WALLET_INOUT_SATS
+            .with_label_values(&["incoming"])
+            .observe(amount.sats_f64());
+        WALLET_INOUT_FEES_SATS
+            .with_label_values(&["incoming"])
+            .observe(fee.sats_f64());
         WALLET_PEGIN_SATS.observe(amount.sats_f64());
         WALLET_PEGIN_FEES_SATS.observe(fee.sats_f64());
     });
 }
 
-fn calculate_pegout_metrics(dbtx: &mut DatabaseTransaction<'_>, amount: Amount, fee: Amount) {
+fn calculate_pegout_metrics(
+    dbtx: &mut DatabaseTransaction<'_>,
+    amount: fedimint_core::Amount,
+    fee: fedimint_core::Amount,
+) {
     dbtx.on_commit(move || {
+        WALLET_INOUT_SATS
+            .with_label_values(&["outgoing"])
+            .observe(amount.sats_f64());
+        WALLET_INOUT_FEES_SATS
+            .with_label_values(&["outgoing"])
+            .observe(fee.sats_f64());
         WALLET_PEGOUT_SATS.observe(amount.sats_f64());
         WALLET_PEGOUT_FEES_SATS.observe(fee.sats_f64());
     });
@@ -774,11 +782,9 @@ impl Wallet {
     ) -> Result<Wallet, WalletCreationError> {
         let broadcaster_bitcoind_rpc = bitcoind.clone();
         let broadcaster_db = db.clone();
-        task_group
-            .spawn("broadcast pending", |handle| async move {
-                run_broadcast_pending_tx(broadcaster_db, broadcaster_bitcoind_rpc, &handle).await;
-            })
-            .await;
+        task_group.spawn("broadcast pending", |handle| async move {
+            run_broadcast_pending_tx(broadcaster_db, broadcaster_bitcoind_rpc, &handle).await;
+        });
 
         let bitcoind_rpc = bitcoind;
 
@@ -1068,12 +1074,13 @@ impl Wallet {
     ) {
         self.remove_rbf_transactions(dbtx, pending_tx).await;
 
-        let script_pk = self
-            .cfg
-            .consensus
-            .peg_in_descriptor
-            .tweak(&pending_tx.tweak, &self.secp)
-            .script_pubkey();
+        let script_pk = bitcoin30_to_bitcoin29_script(
+            self.cfg
+                .consensus
+                .peg_in_descriptor
+                .tweak(&pending_tx.tweak, &self.secp)
+                .script_pubkey(),
+        );
         for (idx, output) in pending_tx.tx.output.iter().enumerate() {
             if output.script_pubkey == script_pk {
                 dbtx.insert_entry(
@@ -1342,6 +1349,8 @@ impl<'a> StatelessWallet<'a> {
             12 + // up to 2**16-1 outputs
             out_weight + // weight of all outputs
             16; // lock time
+                // https://github.com/fedimint/fedimint/issues/4590
+        #[allow(deprecated)]
         let max_input_weight = (self
             .descriptor
             .max_satisfaction_weight()
@@ -1436,17 +1445,17 @@ impl<'a> StatelessWallet<'a> {
                         non_witness_utxo: None,
                         witness_utxo: Some(TxOut {
                             value: utxo.amount.to_sat(),
-                            script_pubkey,
+                            script_pubkey: bitcoin30_to_bitcoin29_script(script_pubkey),
                         }),
                         partial_sigs: Default::default(),
                         sighash_type: None,
                         redeem_script: None,
-                        witness_script: Some(
+                        witness_script: Some(bitcoin30_to_bitcoin29_script(
                             self.descriptor
                                 .tweak(&utxo.tweak, self.secp)
                                 .script_code()
                                 .expect("Failed to tweak descriptor"),
-                        ),
+                        )),
                         bip32_derivation: Default::default(),
                         final_script_sig: None,
                         final_script_witness: None,
@@ -1571,7 +1580,7 @@ impl<'a> StatelessWallet<'a> {
             })
             .expect("can't fail");
 
-        descriptor.script_pubkey()
+        bitcoin30_to_bitcoin29_script(descriptor.script_pubkey())
     }
 }
 
@@ -1582,6 +1591,65 @@ pub fn nonce_from_idx(nonce_idx: u64) -> [u8; 33] {
     nonce[1..].copy_from_slice(&nonce_idx.consensus_hash::<sha256::Hash>()[..]);
 
     nonce
+}
+
+/// A peg-out tx that is ready to be broadcast with a tweak for the change UTXO
+#[derive(Clone, Debug, Encodable, Decodable)]
+pub struct PendingTransaction {
+    pub tx: Transaction,
+    pub tweak: [u8; 33],
+    pub change: bitcoin::Amount,
+    pub destination: Script,
+    pub fees: PegOutFees,
+    pub selected_utxos: Vec<(UTXOKey, SpendableUTXO)>,
+    pub peg_out_amount: bitcoin::Amount,
+    pub rbf: Option<Rbf>,
+}
+
+impl Serialize for PendingTransaction {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut bytes = Vec::new();
+        self.consensus_encode(&mut bytes).unwrap();
+
+        if serializer.is_human_readable() {
+            serializer.serialize_str(&bytes.encode_hex::<String>())
+        } else {
+            serializer.serialize_bytes(&bytes)
+        }
+    }
+}
+
+/// A PSBT that is awaiting enough signatures from the federation to becoming a
+/// `PendingTransaction`
+#[derive(Clone, Debug, Eq, PartialEq, Encodable, Decodable)]
+pub struct UnsignedTransaction {
+    pub psbt: PartiallySignedTransaction,
+    pub signatures: Vec<(PeerId, PegOutSignatureItem)>,
+    pub change: bitcoin::Amount,
+    pub fees: PegOutFees,
+    pub destination: Script,
+    pub selected_utxos: Vec<(UTXOKey, SpendableUTXO)>,
+    pub peg_out_amount: bitcoin::Amount,
+    pub rbf: Option<Rbf>,
+}
+
+impl Serialize for UnsignedTransaction {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut bytes = Vec::new();
+        self.consensus_encode(&mut bytes).unwrap();
+
+        if serializer.is_human_readable() {
+            serializer.serialize_str(&bytes.encode_hex::<String>())
+        } else {
+            serializer.serialize_bytes(&bytes)
+        }
+    }
 }
 
 #[cfg(test)]

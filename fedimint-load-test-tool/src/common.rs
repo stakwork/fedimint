@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -8,8 +9,9 @@ use devimint::cmd;
 use devimint::util::{ClnLightningCli, FedimintCli, LnCli};
 use fedimint_client::secret::{PlainRootSecretStrategy, RootSecretStrategy};
 use fedimint_client::transaction::TransactionBuilder;
-use fedimint_client::{Client, ClientArc, FederationInfo};
+use fedimint_client::{Client, ClientHandleArc};
 use fedimint_core::api::InviteCode;
+use fedimint_core::config::ClientConfig;
 use fedimint_core::core::{IntoDynInstance, OperationId};
 use fedimint_core::db::Database;
 use fedimint_core::module::CommonModuleInit;
@@ -17,6 +19,7 @@ use fedimint_core::{Amount, OutPoint, TieredSummary};
 use fedimint_ln_client::{
     LightningClientInit, LightningClientModule, LnPayState, OutgoingLightningPayment,
 };
+use fedimint_ln_common::LightningGateway;
 use fedimint_mint_client::{MintClientInit, MintClientModule, MintCommonInit, OOBNotes};
 use fedimint_wallet_client::WalletClientInit;
 use futures::StreamExt;
@@ -59,7 +62,7 @@ pub async fn try_get_notes_cli(amount: &Amount, tries: usize) -> anyhow::Result<
 }
 
 pub async fn reissue_notes(
-    client: &ClientArc,
+    client: &ClientHandleArc,
     oob_notes: OOBNotes,
     event_sender: &mpsc::UnboundedSender<MetricEvent>,
 ) -> anyhow::Result<()> {
@@ -83,12 +86,12 @@ pub async fn reissue_notes(
 }
 
 pub async fn do_spend_notes(
-    mint: &ClientArc,
+    mint: &ClientHandleArc,
     amount: Amount,
 ) -> anyhow::Result<(OperationId, OOBNotes)> {
     let mint = &mint.get_first_module::<MintClientModule>();
     let (operation_id, oob_notes) = mint
-        .spend_notes(amount, Duration::from_secs(600), ())
+        .spend_notes(amount, Duration::from_secs(600), false, ())
         .await?;
     let mut updates = mint
         .subscribe_spend_notes(operation_id)
@@ -107,7 +110,7 @@ pub async fn do_spend_notes(
 }
 
 pub async fn await_spend_notes_finish(
-    client: &ClientArc,
+    client: &ClientHandleArc,
     operation_id: OperationId,
 ) -> anyhow::Result<()> {
     let mut updates = client
@@ -131,7 +134,7 @@ pub async fn await_spend_notes_finish(
 pub async fn build_client(
     invite_code: Option<InviteCode>,
     rocksdb: Option<&PathBuf>,
-) -> anyhow::Result<(ClientArc, Option<InviteCode>)> {
+) -> anyhow::Result<(ClientHandleArc, Option<InviteCode>)> {
     let db = if let Some(rocksdb) = rocksdb {
         Database::new(
             fedimint_rocksdb::RocksDb::open(rocksdb)?,
@@ -145,18 +148,15 @@ pub async fn build_client(
     client_builder.with_module(LightningClientInit);
     client_builder.with_module(WalletClientInit::default());
     client_builder.with_primary_module(1);
-    let client_secret = Client::load_or_generate_client_secret(client_builder.db()).await?;
+    let client_secret =
+        Client::load_or_generate_client_secret(client_builder.db_no_decoders()).await?;
     let root_secret = PlainRootSecretStrategy::to_root_secret(&client_secret);
 
-    let client = if !Client::is_initialized(client_builder.db()).await {
+    let client = if !Client::is_initialized(client_builder.db_no_decoders()).await {
         if let Some(invite_code) = &invite_code {
-            let federation_info = FederationInfo::from_invite_code(invite_code.clone()).await?;
+            let client_config = ClientConfig::download_from_invite_code(invite_code).await?;
             client_builder
-                .join(
-                    root_secret,
-                    federation_info.config().clone(),
-                    invite_code.clone(),
-                )
+                .join(root_secret, client_config.clone())
                 .await
         } else {
             bail!("Database not initialize and invite code not provided");
@@ -164,7 +164,7 @@ pub async fn build_client(
     } else {
         client_builder.open(root_secret).await
     }?;
-    Ok((client, invite_code))
+    Ok((Arc::new(client), invite_code))
 }
 
 pub async fn lnd_create_invoice(amount: Amount) -> anyhow::Result<(Bolt11Invoice, String)> {
@@ -217,19 +217,19 @@ pub async fn lnd_wait_invoice_payment(r_hash: String) -> anyhow::Result<()> {
 pub async fn gateway_pay_invoice(
     prefix: &str,
     gateway_name: &str,
-    client: &ClientArc,
+    client: &ClientHandleArc,
     invoice: Bolt11Invoice,
     event_sender: &mpsc::UnboundedSender<MetricEvent>,
+    ln_gateway: Option<LightningGateway>,
 ) -> anyhow::Result<()> {
     let m = fedimint_core::time::now();
     let lightning_module = &client.get_first_module::<LightningClientModule>();
-    let gateway = lightning_module.select_active_gateway_opt().await;
     let OutgoingLightningPayment {
         payment_type,
         contract_id: _,
         fee: _,
     } = lightning_module
-        .pay_bolt11_invoice(gateway, invoice, ())
+        .pay_bolt11_invoice(ln_gateway, invoice, ())
         .await?;
     let operation_id = match payment_type {
         fedimint_ln_client::PayType::Internal(_) => bail!("Internal payment not expected"),
@@ -326,20 +326,11 @@ pub async fn cln_wait_invoice_payment(label: &str) -> anyhow::Result<()> {
     }
 }
 
-pub async fn switch_default_gateway(client: &ClientArc, gateway_id: &str) -> anyhow::Result<()> {
-    let gateway_id = parse_gateway_id(gateway_id)?;
-    client
-        .get_first_module::<LightningClientModule>()
-        .set_active_gateway(&gateway_id)
-        .await?;
-    Ok(())
-}
-
 pub fn parse_gateway_id(s: &str) -> Result<secp256k1::PublicKey, secp256k1::Error> {
     secp256k1::PublicKey::from_str(s)
 }
 
-pub async fn get_note_summary(client: &ClientArc) -> anyhow::Result<TieredSummary> {
+pub async fn get_note_summary(client: &ClientHandleArc) -> anyhow::Result<TieredSummary> {
     let mint_client = client.get_first_module::<MintClientModule>();
     let summary = mint_client
         .get_wallet_summary(
@@ -354,7 +345,7 @@ pub async fn get_note_summary(client: &ClientArc) -> anyhow::Result<TieredSummar
 }
 
 pub async fn remint_denomination(
-    client: &ClientArc,
+    client: &ClientHandleArc,
     denomination: Amount,
     quantity: u16,
 ) -> anyhow::Result<()> {

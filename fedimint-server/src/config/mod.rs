@@ -4,9 +4,12 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use anyhow::{bail, format_err};
+use bitcoin::secp256k1::PublicKey;
 use fedimint_core::admin_client::ConfigGenParamsConsensus;
 use fedimint_core::api::InviteCode;
-use fedimint_core::cancellable::Cancelled;
+use fedimint_core::bitcoin_migration::{
+    bitcoin29_to_bitcoin30_secp256k1_public_key, bitcoin30_to_bitcoin29_secp256k1_public_key,
+};
 pub use fedimint_core::config::{
     serde_binary_human_readable, ClientConfig, DkgError, DkgPeerMsg, DkgResult, FederationId,
     GlobalClientConfig, JsonWithKind, ModuleInitRegistry, PeerUrl, ServerModuleConfig,
@@ -18,12 +21,12 @@ use fedimint_core::module::{
     SupportedApiVersionsSummary, SupportedCoreApiVersions,
 };
 use fedimint_core::net::peers::{IMuxPeerConnections, IPeerConnections, PeerConnections};
-use fedimint_core::task::{timeout, Elapsed, TaskGroup};
+use fedimint_core::task::{timeout, Cancelled, Elapsed, TaskGroup};
 use fedimint_core::{timing, PeerId};
 use fedimint_logging::{LOG_NET_PEER, LOG_NET_PEER_DKG};
 use futures::future::join_all;
 use rand::rngs::OsRng;
-use secp256k1_zkp::{PublicKey, Secp256k1, SecretKey};
+use secp256k1_zkp::{Secp256k1, SecretKey};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio_rustls::rustls;
@@ -31,8 +34,9 @@ use tracing::{error, info};
 
 use crate::config::api::ConfigGenParamsLocal;
 use crate::config::distributedgen::{DkgRunner, PeerHandleOps};
+use crate::envs::FM_MAX_CLIENT_CONNECTIONS_ENV;
 use crate::fedimint_core::encoding::Encodable;
-use crate::fedimint_core::NumPeers;
+use crate::fedimint_core::NumPeersExt;
 use crate::multiplexed::PeerConnectionMultiplexer;
 use crate::net::connect::{dns_sanitize, Connector, TlsConfig};
 use crate::net::peers::{DelayCalculator, NetworkConfig};
@@ -50,9 +54,6 @@ const DEFAULT_MAX_CLIENT_CONNECTIONS: u32 = 1000;
 const DEFAULT_BROADCAST_EXPECTED_ROUNDS_PER_SESSION: u16 = 45 * 20;
 const DEFAULT_BROADCAST_ROUND_DELAY_MS: u16 = 50;
 const DEFAULT_BROADCAST_MAX_ROUNDS_PER_SESSION: u16 = 5000;
-
-/// The env var for maximum open connections the API can handle
-const ENV_MAX_CLIENT_CONNECTIONS: &str = "FM_MAX_CLIENT_CONNECTIONS";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 /// All the serializable configuration for the fedimint server
@@ -210,13 +211,12 @@ impl ServerConfig {
     pub fn supported_api_versions() -> SupportedCoreApiVersions {
         SupportedCoreApiVersions {
             core_consensus: CORE_CONSENSUS_VERSION,
-            api: MultiApiVersion::try_from_iter([ApiVersion { major: 0, minor: 0 }])
+            api: MultiApiVersion::try_from_iter([ApiVersion { major: 0, minor: 2 }])
                 .expect("not version conflicts"),
         }
     }
     /// Creates a new config from the results of a trusted or distributed key
     /// setup
-    #[allow(clippy::too_many_arguments)]
     pub fn from(
         params: ConfigGenParams,
         identity: PeerId,
@@ -269,6 +269,10 @@ impl ServerConfig {
             self.local.identity,
             FederationId(self.consensus.api_endpoints.consensus_hash()),
         )
+    }
+
+    pub fn get_federation_id(&self) -> FederationId {
+        FederationId(self.consensus.api_endpoints.consensus_hash())
     }
 
     pub fn add_modules(&mut self, modules: BTreeMap<ModuleInstanceId, ServerModuleConfig>) {
@@ -360,7 +364,12 @@ impl ServerConfig {
 
         let my_public_key = private.broadcast_secret_key.public_key(&Secp256k1::new());
 
-        if Some(&my_public_key) != consensus.broadcast_public_keys.get(identity) {
+        if Some(my_public_key)
+            != consensus
+                .broadcast_public_keys
+                .get(identity)
+                .map(|pk| bitcoin30_to_bitcoin29_secp256k1_public_key(*pk))
+        {
             bail!("Broadcast secret key doesn't match corresponding public key");
         }
         if peers.keys().max().copied().map(|id| id.to_usize()) != Some(peers.len() - 1) {
@@ -398,7 +407,10 @@ impl ServerConfig {
         let mut broadcast_sks = BTreeMap::new();
         for peer_id in peer0.peer_ids() {
             let (broadcast_sk, broadcast_pk) = secp256k1_zkp::generate_keypair(&mut OsRng);
-            broadcast_pks.insert(peer_id, broadcast_pk);
+            broadcast_pks.insert(
+                peer_id,
+                bitcoin29_to_bitcoin30_secp256k1_public_key(broadcast_pk),
+            );
             broadcast_sks.insert(peer_id, broadcast_sk);
         }
 
@@ -468,7 +480,10 @@ impl ServerConfig {
         let (broadcast_sk, broadcast_pk) = secp256k1_zkp::generate_keypair(&mut OsRng);
 
         let broadcast_public_keys = broadcast_keys_exchange
-            .exchange_pubkeys("broadcast".to_string(), broadcast_pk)
+            .exchange_pubkeys(
+                "broadcast".to_string(),
+                bitcoin29_to_bitcoin30_secp256k1_public_key(broadcast_pk),
+            )
             .await?;
 
         // in case we are running by ourselves, avoid DKG
@@ -687,7 +702,7 @@ impl ConfigGenParams {
 
 // TODO: Remove once new config gen UI is written
 pub fn max_connections() -> u32 {
-    env::var(ENV_MAX_CLIENT_CONNECTIONS)
+    env::var(FM_MAX_CLIENT_CONNECTIONS_ENV)
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_MAX_CLIENT_CONNECTIONS)
@@ -735,8 +750,8 @@ mod serde_tls_cert_map {
     use std::borrow::Cow;
     use std::collections::BTreeMap;
 
-    use bitcoin_hashes::hex::{FromHex, ToHex};
     use fedimint_core::PeerId;
+    use hex::{FromHex, ToHex};
     use serde::de::Error;
     use serde::ser::SerializeMap;
     use serde::{Deserialize, Deserializer, Serializer};
@@ -752,7 +767,7 @@ mod serde_tls_cert_map {
         let mut serializer = serializer.serialize_map(Some(certs.len()))?;
         for (key, value) in certs.iter() {
             serializer.serialize_key(key)?;
-            let hex_str = value.0.to_hex();
+            let hex_str = value.0.encode_hex::<String>();
             serializer.serialize_value(&hex_str)?;
         }
         serializer.end()
@@ -768,7 +783,8 @@ mod serde_tls_cert_map {
         let mut certs = BTreeMap::new();
 
         for (key, value) in map {
-            let cert = rustls::Certificate(Vec::from_hex(&value).map_err(D::Error::custom)?);
+            let cert =
+                rustls::Certificate(Vec::from_hex(value.as_ref()).map_err(D::Error::custom)?);
             certs.insert(key, cert);
         }
         Ok(certs)
@@ -778,7 +794,7 @@ mod serde_tls_cert_map {
 mod serde_tls_key {
     use std::borrow::Cow;
 
-    use bitcoin_hashes::hex::{FromHex, ToHex};
+    use hex::{FromHex, ToHex};
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
     use tokio_rustls::rustls;
 
@@ -786,7 +802,7 @@ mod serde_tls_key {
     where
         S: Serializer,
     {
-        let hex_str = key.0.to_hex();
+        let hex_str = key.0.encode_hex::<String>();
         Serialize::serialize(&hex_str, serializer)
     }
 
@@ -795,7 +811,7 @@ mod serde_tls_key {
         D: Deserializer<'de>,
     {
         let hex_str: Cow<str> = Deserialize::deserialize(deserializer)?;
-        let bytes = Vec::from_hex(&hex_str).map_err(serde::de::Error::custom)?;
+        let bytes = Vec::from_hex(hex_str.as_ref()).map_err(serde::de::Error::custom)?;
         Ok(rustls::PrivateKey(bytes))
     }
 }

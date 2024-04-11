@@ -86,6 +86,11 @@ impl<M, State> ModuleRegistry<M, State> {
         self.inner.iter().map(|(id, (kind, m))| (*id, kind, m))
     }
 
+    /// Return an iterator over module ids an kinds
+    pub fn iter_modules_id_kind(&self) -> impl Iterator<Item = (ModuleInstanceId, &ModuleKind)> {
+        self.inner.iter().map(|(id, (kind, _))| (*id, kind))
+    }
+
     /// Return an iterator over all module data
     pub fn iter_modules_mut(
         &mut self,
@@ -138,6 +143,18 @@ impl<M: std::fmt::Debug, State> ModuleRegistry<M, State> {
         assert!(
             self.inner.insert(id, (kind, module)).is_none(),
             "Module was already registered!"
+        )
+    }
+
+    pub fn append_module(&mut self, kind: ModuleKind, module: M) {
+        let last_id = self
+            .inner
+            .last_key_value()
+            .map(|id| id.0.checked_add(1).expect("Module id overflow"))
+            .unwrap_or_default();
+        assert!(
+            self.inner.insert(last_id, (kind, module)).is_none(),
+            "Module was already registered?!"
         )
     }
 }

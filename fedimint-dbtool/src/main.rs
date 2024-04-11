@@ -1,14 +1,16 @@
 #![allow(where_clauses_object_safety)] // https://github.com/dtolnay/async-trait/issues/228
+pub mod envs;
+
 use std::path::PathBuf;
 
 use anyhow::Result;
-use bitcoin_hashes::hex::ToHex;
 use bytes::Bytes;
 use clap::{Parser, Subcommand};
 use fedimint_client::module::init::{ClientModuleInitRegistry, DynClientModuleInit};
 use fedimint_core::config::ServerModuleInitRegistry;
 use fedimint_core::db::{IDatabaseTransactionOpsCore, IRawDatabaseExt};
 use fedimint_core::module::DynServerModuleInit;
+use fedimint_core::util::handle_version_hash_command;
 use fedimint_ln_client::LightningClientInit;
 use fedimint_ln_server::LightningInit;
 use fedimint_logging::TracingSetup;
@@ -17,14 +19,17 @@ use fedimint_mint_server::MintInit;
 use fedimint_wallet_client::WalletClientInit;
 use fedimint_wallet_server::WalletInit;
 use futures::StreamExt;
+use hex::ToHex;
 
 use crate::dump::DatabaseDump;
+use crate::envs::{FM_DBTOOL_CONFIG_DIR_ENV, FM_DBTOOL_DATABASE_ENV, FM_PASSWORD_ENV};
 
 mod dump;
 
 #[derive(Debug, Clone, Parser)]
+#[command(version)]
 struct Options {
-    #[clap(long, env = "FM_DBTOOL_DATABASE")]
+    #[clap(long, env = FM_DBTOOL_DATABASE_ENV)]
     database: String,
 
     #[clap(long, hide = true)]
@@ -69,9 +74,9 @@ enum DbCommand {
     /// configuration file. If dumping the client database, the password can
     /// be an arbitrary string.
     Dump {
-        #[clap(long, env = "FM_DBTOOL_CONFIG_DIR")]
+        #[clap(long, env = FM_DBTOOL_CONFIG_DIR_ENV)]
         cfg_dir: PathBuf,
-        #[arg(long, env = "FM_PASSWORD")]
+        #[arg(long, env = FM_PASSWORD_ENV)]
         password: String,
         #[arg(long, required = false)]
         modules: Option<String>,
@@ -81,17 +86,23 @@ enum DbCommand {
 }
 
 fn hex_parser(hex: &str) -> Result<Bytes> {
-    let bytes: Vec<u8> = bitcoin_hashes::hex::FromHex::from_hex(hex)?;
+    let bytes: Vec<u8> = hex::FromHex::from_hex(hex)?;
     Ok(bytes.into())
 }
 
 fn print_kv(key: &[u8], value: &[u8]) {
-    println!("{} {}", key.to_hex(), value.to_hex());
+    println!(
+        "{} {}",
+        key.encode_hex::<String>(),
+        value.encode_hex::<String>()
+    );
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    handle_version_hash_command(env!("FEDIMINT_BUILD_CODE_VERSION"));
     TracingSetup::default().init()?;
+
     let options: Options = Options::parse();
 
     match options.command {

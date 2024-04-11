@@ -4,14 +4,16 @@ use std::sync::Arc;
 use bitcoin_hashes::sha256;
 use fedimint_client::sm::{ClientSMDatabaseTransaction, State, StateTransition};
 use fedimint_client::transaction::{ClientInput, ClientOutput};
-use fedimint_client::{ClientArc, DynGlobalClientContext};
+use fedimint_client::{ClientHandleArc, DynGlobalClientContext};
 use fedimint_core::config::FederationId;
 use fedimint_core::core::OperationId;
 use fedimint_core::db::IDatabaseTransactionOpsCoreTyped;
 use fedimint_core::encoding::{Decodable, Encodable};
+use fedimint_core::util::Spanned;
 use fedimint_core::{Amount, OutPoint, TransactionId};
+use fedimint_ln_client::api::LnFederationApi;
 use fedimint_ln_client::pay::{PayInvoicePayload, PaymentData};
-use fedimint_ln_common::api::LnFederationApi;
+use fedimint_ln_common::config::FeeToAmount;
 use fedimint_ln_common::contracts::outgoing::OutgoingContractAccount;
 use fedimint_ln_common::contracts::{ContractId, FundedContract, IdentifiableContract, Preimage};
 use fedimint_ln_common::{LightningInput, LightningOutput};
@@ -19,14 +21,14 @@ use futures::future;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio_stream::StreamExt;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, warn, Instrument};
 
 use super::{GatewayClientContext, GatewayClientStateMachines, GatewayExtReceiveStates};
-use crate::db::PreimageAuthentication;
+use crate::db::{FederationIdKey, PreimageAuthentication};
 use crate::gateway_lnrpc::{PayInvoiceRequest, PayInvoiceResponse};
 use crate::lightning::LightningRpcError;
 use crate::state_machine::GatewayClientModule;
-use crate::GatewayState;
+use crate::{GatewayState, RoutingFees};
 
 #[cfg_attr(doc, aquamarine::aquamarine)]
 /// State machine that executes the Lightning payment on behalf of
@@ -47,7 +49,7 @@ use crate::GatewayState;
 ///    CancelContract -- cancel tx submission successful --> Canceled
 ///    CancelContract -- cancel tx submission unsuccessful --> Failed
 /// ```
-#[derive(Debug, Clone, Eq, PartialEq, Decodable, Encodable, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Decodable, Encodable, Serialize, Deserialize)]
 pub enum GatewayPayStates {
     PayInvoice(GatewayPayInvoice),
     CancelContract(Box<GatewayPayCancelContract>),
@@ -66,12 +68,12 @@ pub enum GatewayPayStates {
     },
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Decodable, Encodable, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Decodable, Encodable, Serialize, Deserialize)]
 pub struct GatewayPayCommon {
     pub operation_id: OperationId,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Decodable, Encodable, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Decodable, Encodable, Serialize, Deserialize)]
 pub struct GatewayPayStateMachine {
     pub common: GatewayPayCommon,
     pub state: GatewayPayStates,
@@ -80,12 +82,10 @@ pub struct GatewayPayStateMachine {
 impl State for GatewayPayStateMachine {
     type ModuleContext = GatewayClientContext;
 
-    type GlobalContext = DynGlobalClientContext;
-
     fn transitions(
         &self,
         context: &Self::ModuleContext,
-        global_context: &Self::GlobalContext,
+        global_context: &DynGlobalClientContext,
     ) -> Vec<fedimint_client::sm::StateTransition<Self>> {
         match &self.state {
             GatewayPayStates::PayInvoice(gateway_pay_invoice) => gateway_pay_invoice.transitions(
@@ -119,7 +119,9 @@ impl State for GatewayPayStateMachine {
     }
 }
 
-#[derive(Error, Debug, Serialize, Deserialize, Encodable, Decodable, Clone, Eq, PartialEq)]
+#[derive(
+    Error, Debug, Serialize, Deserialize, Encodable, Decodable, Clone, Eq, PartialEq, Hash,
+)]
 pub enum OutgoingContractError {
     #[error("Invalid OutgoingContract {contract_id}")]
     InvalidOutgoingContract { contract_id: ContractId },
@@ -139,7 +141,9 @@ pub enum OutgoingContractError {
     InvoiceExpired(u64),
 }
 
-#[derive(Error, Debug, Serialize, Deserialize, Encodable, Decodable, Clone, Eq, PartialEq)]
+#[derive(
+    Error, Debug, Serialize, Deserialize, Encodable, Decodable, Clone, Eq, PartialEq, Hash,
+)]
 pub enum OutgoingPaymentErrorType {
     #[error("OutgoingContract does not exist {contract_id}")]
     OutgoingContractDoesNotExist { contract_id: ContractId },
@@ -151,11 +155,15 @@ pub enum OutgoingPaymentErrorType {
     SwapFailed { swap_error: String },
     #[error("Invoice has already been paid")]
     InvoiceAlreadyPaid,
+    #[error("No federation configuration")]
+    InvalidFederationConfiguration,
 }
 
-#[derive(Error, Debug, Serialize, Deserialize, Encodable, Decodable, Clone, Eq, PartialEq)]
+#[derive(
+    Error, Debug, Serialize, Deserialize, Encodable, Decodable, Clone, Eq, PartialEq, Hash,
+)]
 pub struct OutgoingPaymentError {
-    error_type: OutgoingPaymentErrorType,
+    pub error_type: OutgoingPaymentErrorType,
     contract_id: ContractId,
     contract: Option<OutgoingContractAccount>,
 }
@@ -166,7 +174,7 @@ impl Display for OutgoingPaymentError {
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Decodable, Encodable, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Decodable, Encodable, Serialize, Deserialize)]
 pub struct GatewayPayInvoice {
     pub pay_invoice_payload: PayInvoicePayload,
 }
@@ -201,6 +209,7 @@ impl GatewayPayInvoice {
             context.clone(),
             pay_invoice_payload.contract_id,
             pay_invoice_payload.payment_data.clone(),
+            pay_invoice_payload.federation_id,
         )
         .await
         {
@@ -263,13 +272,16 @@ impl GatewayPayInvoice {
             Self::check_swap_to_federation(context.clone(), payment_parameters.payment_data.clone())
                 .await
         {
-            Self::buy_preimage_via_direct_swap(
-                client,
-                payment_parameters.payment_data.clone(),
-                contract.clone(),
-                common.clone(),
-            )
-            .await
+            client
+                .with(|client| {
+                    Self::buy_preimage_via_direct_swap(
+                        client,
+                        payment_parameters.payment_data.clone(),
+                        contract.clone(),
+                        common.clone(),
+                    )
+                })
+                .await
         } else {
             Self::buy_preimage_over_lightning(
                 context,
@@ -286,6 +298,7 @@ impl GatewayPayInvoice {
         context: GatewayClientContext,
         contract_id: ContractId,
         payment_data: PaymentData,
+        federation_id: FederationId,
     ) -> Result<(OutgoingContractAccount, PaymentParameters), OutgoingPaymentError> {
         debug!("Await payment parameters for outgoing contract {contract_id:?}");
         let account = global_context
@@ -327,12 +340,24 @@ impl GatewayPayInvoice {
                 });
             }
 
+            let mut gateway_dbtx = context.gateway.gateway_db.begin_transaction_nc().await;
+            let config = gateway_dbtx
+                .get_value(&FederationIdKey { id: federation_id })
+                .await
+                .ok_or(OutgoingPaymentError {
+                    error_type: OutgoingPaymentErrorType::InvalidFederationConfiguration,
+                    contract_id,
+                    contract: Some(outgoing_contract_account.clone()),
+                })?;
+            let routing_fees = config.fees;
+
             let payment_parameters = Self::validate_outgoing_account(
                 &outgoing_contract_account,
                 context.redeem_key,
                 context.timelock_delta,
                 consensus_block_count.unwrap(),
                 &payment_data,
+                routing_fees,
             )
             .await
             .map_err(|e| {
@@ -439,7 +464,7 @@ impl GatewayPayInvoice {
     }
 
     async fn buy_preimage_via_direct_swap(
-        client: ClientArc,
+        client: ClientHandleArc,
         payment_data: PaymentData,
         contract: OutgoingContractAccount,
         common: GatewayPayCommon,
@@ -546,10 +571,11 @@ impl GatewayPayInvoice {
 
     async fn validate_outgoing_account(
         account: &OutgoingContractAccount,
-        redeem_key: bitcoin::KeyPair,
+        redeem_key: bitcoin29::KeyPair,
         timelock_delta: u64,
         consensus_block_count: u64,
         payment_data: &PaymentData,
+        routing_fees: RoutingFees,
     ) -> Result<PaymentParameters, OutgoingContractError> {
         let our_pub_key = secp256k1::PublicKey::from_keypair(&redeem_key);
 
@@ -565,9 +591,11 @@ impl GatewayPayInvoice {
             .amount()
             .ok_or(OutgoingContractError::InvoiceMissingAmount)?;
 
-        if account.amount < payment_amount {
+        let gateway_fee = routing_fees.to_amount(&payment_amount);
+        let necessary_contract_amount = payment_amount + gateway_fee;
+        if account.amount < necessary_contract_amount {
             return Err(OutgoingContractError::Underfunded(
-                payment_amount,
+                necessary_contract_amount,
                 account.amount,
             ));
         }
@@ -600,7 +628,7 @@ impl GatewayPayInvoice {
     async fn check_swap_to_federation(
         context: GatewayClientContext,
         payment_data: PaymentData,
-    ) -> Option<ClientArc> {
+    ) -> Option<Spanned<ClientHandleArc>> {
         let rhints = payment_data.route_hints();
         match rhints.first().and_then(|rh| rh.0.last()) {
             None => None,
@@ -626,13 +654,13 @@ impl GatewayPayInvoice {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Decodable, Encodable, Serialize, Deserialize)]
-pub struct PaymentParameters {
+struct PaymentParameters {
     max_delay: u64,
     max_send_amount: Amount,
     payment_data: PaymentData,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Decodable, Encodable, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Decodable, Encodable, Serialize, Deserialize)]
 pub struct GatewayPayClaimOutgoingContract {
     contract: OutgoingContractAccount,
     preimage: Preimage,
@@ -687,7 +715,7 @@ impl GatewayPayClaimOutgoingContract {
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Decodable, Encodable, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Decodable, Encodable, Serialize, Deserialize)]
 pub struct GatewayPayWaitForSwapPreimage {
     contract: OutgoingContractAccount,
     federation_id: FederationId,
@@ -738,53 +766,58 @@ impl GatewayPayWaitForSwapPreimage {
                 },
             })?;
 
-        let mut stream = client
-            .get_first_module::<GatewayClientModule>()
-            .gateway_subscribe_ln_receive(operation_id)
-            .await
-            .map_err(|e| {
-                let contract_id = contract.contract.contract_id();
-                warn!(
-                    ?contract_id,
-                    "Failed to subscribe to ln receive of direct swap: {e:?}"
-                );
-                OutgoingPaymentError {
-                    contract_id,
-                    contract: Some(contract.clone()),
-                    error_type: OutgoingPaymentErrorType::SwapFailed {
-                        swap_error: format!(
-                            "Failed to subscribe to ln receive of direct swap: {e}"
-                        ),
-                    },
-                }
-            })?
-            .into_stream();
+        async {
+            let mut stream = client
+                .value()
+                .get_first_module::<GatewayClientModule>()
+                .gateway_subscribe_ln_receive(operation_id)
+                .await
+                .map_err(|e| {
+                    let contract_id = contract.contract.contract_id();
+                    warn!(
+                        ?contract_id,
+                        "Failed to subscribe to ln receive of direct swap: {e:?}"
+                    );
+                    OutgoingPaymentError {
+                        contract_id,
+                        contract: Some(contract.clone()),
+                        error_type: OutgoingPaymentErrorType::SwapFailed {
+                            swap_error: format!(
+                                "Failed to subscribe to ln receive of direct swap: {e}"
+                            ),
+                        },
+                    }
+                })?
+                .into_stream();
 
-        loop {
-            debug!("Waiting next state of preimage buy for contract {contract:?}");
-            if let Some(state) = stream.next().await {
-                match state {
-                    GatewayExtReceiveStates::Funding => {
-                        debug!(?contract, "Funding");
-                        continue;
-                    }
-                    GatewayExtReceiveStates::Preimage(preimage) => {
-                        debug!(?contract, "Received preimage");
-                        return Ok(preimage);
-                    }
-                    other => {
-                        warn!(?contract, "Got state {other:?}");
-                        return Err(OutgoingPaymentError {
-                            contract_id: contract.contract.contract_id(),
-                            contract: Some(contract),
-                            error_type: OutgoingPaymentErrorType::SwapFailed {
-                                swap_error: "Failed to receive preimage".to_string(),
-                            },
-                        });
+            loop {
+                debug!("Waiting next state of preimage buy for contract {contract:?}");
+                if let Some(state) = stream.next().await {
+                    match state {
+                        GatewayExtReceiveStates::Funding => {
+                            debug!(?contract, "Funding");
+                            continue;
+                        }
+                        GatewayExtReceiveStates::Preimage(preimage) => {
+                            debug!(?contract, "Received preimage");
+                            return Ok(preimage);
+                        }
+                        other => {
+                            warn!(?contract, "Got state {other:?}");
+                            return Err(OutgoingPaymentError {
+                                contract_id: contract.contract.contract_id(),
+                                contract: Some(contract),
+                                error_type: OutgoingPaymentErrorType::SwapFailed {
+                                    swap_error: "Failed to receive preimage".to_string(),
+                                },
+                            });
+                        }
                     }
                 }
             }
         }
+        .instrument(client.span())
+        .await
     }
 
     async fn transition_claim_outgoing_contract(
@@ -810,7 +843,7 @@ impl GatewayPayWaitForSwapPreimage {
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Decodable, Encodable, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Decodable, Encodable, Serialize, Deserialize)]
 pub struct GatewayPayCancelContract {
     contract: OutgoingContractAccount,
     error: OutgoingPaymentError,

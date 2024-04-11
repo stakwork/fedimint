@@ -4,27 +4,31 @@ use std::hash::Hash;
 use std::ops::Mul;
 use std::path::Path;
 use std::str::FromStr;
+use std::time::Duration;
 
 use anyhow::{bail, format_err, Context};
 use bitcoin::secp256k1;
-use bitcoin_hashes::hex::{format_hex, FromHex};
 use bitcoin_hashes::sha256::{Hash as Sha256, HashEngine};
 use bitcoin_hashes::{hex, sha256};
-use fedimint_core::cancellable::Cancelled;
+use bls12_381::Scalar;
+use fedimint_core::api::{FederationApiExt, InviteCode, WsFederationApi};
 use fedimint_core::core::{ModuleInstanceId, ModuleKind};
 use fedimint_core::encoding::{DynRawFallback, Encodable};
+use fedimint_core::endpoint_constants::CLIENT_CONFIG_ENDPOINT;
 use fedimint_core::module::registry::ModuleRegistry;
+use fedimint_core::module::ApiRequestErased;
+use fedimint_core::task::Cancelled;
 use fedimint_core::util::SafeUrl;
 use fedimint_core::{BitcoinHash, ModuleDecoderRegistry};
 use fedimint_logging::LOG_CORE;
+use hex::{format_hex, FromHex};
 use serde::de::DeserializeOwned;
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use tbs::{serde_impl, Scalar};
 use thiserror::Error;
 use threshold_crypto::group::{Curve, Group, GroupEncoding};
 use threshold_crypto::{G1Projective, G2Projective};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::core::DynClientConfig;
 use crate::encoding::Decodable;
@@ -32,7 +36,8 @@ use crate::module::{
     CoreConsensusVersion, DynCommonModuleInit, DynServerModuleInit, IDynCommonModuleInit,
     ModuleConsensusVersion,
 };
-use crate::{maybe_add_send_sync, PeerId};
+use crate::query::FilterMap;
+use crate::{bls12_381_serde, maybe_add_send_sync, PeerId};
 
 // TODO: make configurable
 /// This limits the RAM consumption of a AlephBFT Unit to roughly 50kB
@@ -161,7 +166,7 @@ pub struct GlobalClientConfig {
 }
 
 impl GlobalClientConfig {
-    pub fn federation_id(&self) -> FederationId {
+    pub fn calculate_federation_id(&self) -> FederationId {
         FederationId(self.api_endpoints.consensus_hash())
     }
 
@@ -187,8 +192,110 @@ impl ClientConfig {
         })
     }
 
-    pub fn federation_id(&self) -> FederationId {
-        self.global.federation_id()
+    pub fn calculate_federation_id(&self) -> FederationId {
+        self.global.calculate_federation_id()
+    }
+
+    /// Get the value of a given meta field
+    pub fn meta<V: serde::de::DeserializeOwned + 'static>(
+        &self,
+        key: &str,
+    ) -> Result<Option<V>, anyhow::Error> {
+        let Some(str_value) = self.global.meta.get(key) else {
+            return Ok(None);
+        };
+        let res = serde_json::from_str(str_value)
+            .map(Some)
+            .context(format!("Decoding meta field '{key}' failed"));
+
+        // In the past we encoded some string fields as "just a string" without quotes,
+        // this code ensures that old meta values still parse since config is hard to
+        // change
+        if res.is_err() && std::any::TypeId::of::<V>() == std::any::TypeId::of::<String>() {
+            let string_ret = Box::new(str_value.clone());
+            let ret = unsafe {
+                // We can transmute a String to V because we know that V==String
+                std::mem::transmute::<Box<String>, Box<V>>(string_ret)
+            };
+            Ok(Some(*ret))
+        } else {
+            res
+        }
+    }
+
+    /// Create an invite code with the api endpoint of the given peer which can
+    /// be used to download this client config
+    pub fn invite_code(&self, peer: &PeerId) -> Option<InviteCode> {
+        self.global.api_endpoints.get(peer).map(|peer_url| {
+            InviteCode::new(peer_url.url.clone(), *peer, self.calculate_federation_id())
+        })
+    }
+
+    /// Tries to download the client config from the federation,
+    /// attempts to retry teb times before giving up.
+    pub async fn download_from_invite_code(
+        invite_code: &InviteCode,
+    ) -> anyhow::Result<ClientConfig> {
+        debug!("Downloading client config from {:?}", invite_code);
+
+        crate::util::retry(
+            "Downloading client config",
+            // 0.2, 0.2, 0.4, 0.6, 1.0, 1.6, ...
+            // sum = 21.2
+            fedimint_core::util::FibonacciBackoff::default()
+                .with_min_delay(Duration::from_millis(200))
+                .with_max_delay(Duration::from_secs(5))
+                .with_max_times(10),
+            || Self::try_download_client_config(invite_code),
+        )
+        .await
+        .context("Failed to download client config")
+    }
+
+    /// Tries to download the client config only once.
+    pub async fn try_download_client_config(
+        invite_code: &InviteCode,
+    ) -> anyhow::Result<ClientConfig> {
+        // we have to download the api endpoints first
+        let federation_id = invite_code.federation_id();
+
+        let query_strategy = FilterMap::new(
+            move |cfg: ClientConfig| {
+                if federation_id.0 != cfg.global.api_endpoints.consensus_hash() {
+                    bail!("Guardian api endpoint map does not hash to FederationId")
+                }
+
+                Ok(cfg.global.api_endpoints)
+            },
+            1,
+        );
+
+        let api_endpoints = WsFederationApi::from_invite_code(&[invite_code.clone()])
+            .request_with_strategy(
+                query_strategy,
+                CLIENT_CONFIG_ENDPOINT.to_owned(),
+                ApiRequestErased::default(),
+            )
+            .await?;
+
+        // now we can build an api for all guardians and download the client config
+        let api_endpoints = api_endpoints
+            .into_iter()
+            .map(|(peer, url)| (peer, url.url))
+            .collect();
+
+        let client_config = WsFederationApi::new(api_endpoints)
+            .request_current_consensus::<ClientConfig>(
+                CLIENT_CONFIG_ENDPOINT.to_owned(),
+                ApiRequestErased::default(),
+            )
+            .await?;
+
+        if client_config.calculate_federation_id() != federation_id {
+            bail!("Obtained client config has different federation id");
+        }
+
+        Ok(client_config)
     }
 }
 
@@ -243,6 +350,16 @@ impl Display for FederationIdPrefix {
 impl Display for FederationId {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         format_hex(&self.0, f)
+    }
+}
+
+impl FromStr for FederationIdPrefix {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(Vec::from_hex(s)?.try_into().map_err(
+            |bytes: Vec<u8>| hex::Error::InvalidLength(4, bytes.len()),
+        )?))
     }
 }
 
@@ -362,14 +479,14 @@ impl<M> Default for ModuleInitRegistry<M> {
 /// during config gen
 #[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ConfigGenModuleParams {
-    pub local: Option<serde_json::Value>,
-    pub consensus: Option<serde_json::Value>,
+    pub local: serde_json::Value,
+    pub consensus: serde_json::Value,
 }
 
 pub type ServerModuleInitRegistry = ModuleInitRegistry<DynServerModuleInit>;
 
 impl ConfigGenModuleParams {
-    pub fn new(local: Option<serde_json::Value>, consensus: Option<serde_json::Value>) -> Self {
+    pub fn new(local: serde_json::Value, consensus: serde_json::Value) -> Self {
         Self { local, consensus }
     }
 
@@ -382,19 +499,15 @@ impl ConfigGenModuleParams {
         ))
     }
 
-    fn parse<P: DeserializeOwned>(
-        name: &str,
-        json: Option<serde_json::Value>,
-    ) -> anyhow::Result<P> {
-        let json = json.ok_or(format_err!("{name} config gen params missing"))?;
-        serde_json::from_value(json).context("Schema mismatch")
+    fn parse<P: DeserializeOwned>(name: &str, json: serde_json::Value) -> anyhow::Result<P> {
+        serde_json::from_value(json).with_context(|| format!("Schema mismatch for {name} argument"))
     }
 
     pub fn from_typed<P: ModuleInitParams>(p: P) -> anyhow::Result<Self> {
         let (local, consensus) = p.to_parts();
         Ok(Self {
-            local: Some(serde_json::to_value(local)?),
-            consensus: Some(serde_json::to_value(consensus)?),
+            local: serde_json::to_value(local)?,
+            consensus: serde_json::to_value(consensus)?,
         })
     }
 }
@@ -489,17 +602,26 @@ impl<M> ModuleInitRegistry<M> {
 }
 
 impl ModuleRegistry<ConfigGenModuleParams> {
-    pub fn attach_config_gen_params<T: ModuleInitParams>(
+    pub fn attach_config_gen_params_by_id<T: ModuleInitParams>(
         &mut self,
         id: ModuleInstanceId,
         kind: ModuleKind,
         gen: T,
     ) -> &mut Self {
-        self.register_module(
-            id,
-            kind,
-            ConfigGenModuleParams::from_typed(gen).expect("Invalid config gen params for {kind}"),
-        );
+        let params = ConfigGenModuleParams::from_typed(gen)
+            .unwrap_or_else(|err| panic!("Invalid config gen params for {kind}: {err}"));
+        self.register_module(id, kind, params);
+        self
+    }
+
+    pub fn attach_config_gen_params<T: ModuleInitParams>(
+        &mut self,
+        kind: ModuleKind,
+        gen: T,
+    ) -> &mut Self {
+        let params = ConfigGenModuleParams::from_typed(gen)
+            .unwrap_or_else(|err| panic!("Invalid config gen params for {kind}: {err}"));
+        self.append_module(kind, params);
         self
     }
 }
@@ -826,8 +948,8 @@ pub enum DkgMessage<G: DkgGroup> {
     HashedCommit(Sha256),
     Commit(#[serde(with = "serde_commit")] Vec<G>),
     Share(
-        #[serde(with = "serde_impl::scalar")] Scalar,
-        #[serde(with = "serde_impl::scalar")] Scalar,
+        #[serde(with = "bls12_381_serde::scalar")] Scalar,
+        #[serde(with = "bls12_381_serde::scalar")] Scalar,
     ),
     Extract(#[serde(with = "serde_commit")] Vec<G>),
 }
@@ -878,21 +1000,21 @@ pub trait SGroup: Sized {
 
 impl SGroup for G2Projective {
     fn serialize2<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        serde_impl::g2::serialize(&self.to_affine(), s)
+        bls12_381_serde::g2::serialize(&self.to_affine(), s)
     }
 
     fn deserialize2<'d, D: Deserializer<'d>>(d: D) -> Result<Self, D::Error> {
-        serde_impl::g2::deserialize(d).map(G2Projective::from)
+        bls12_381_serde::g2::deserialize(d).map(G2Projective::from)
     }
 }
 
 impl SGroup for G1Projective {
     fn serialize2<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        serde_impl::g1::serialize(&self.to_affine(), s)
+        bls12_381_serde::g1::serialize(&self.to_affine(), s)
     }
 
     fn deserialize2<'d, D: Deserializer<'d>>(d: D) -> Result<Self, D::Error> {
-        serde_impl::g1::deserialize(d).map(G1Projective::from)
+        bls12_381_serde::g1::deserialize(d).map(G1Projective::from)
     }
 }
 
@@ -916,7 +1038,7 @@ pub fn load_from_file<T: DeserializeOwned>(path: &Path) -> Result<T, anyhow::Err
 pub mod serde_binary_human_readable {
     use std::borrow::Cow;
 
-    use bitcoin_hashes::hex::{FromHex, ToHex};
+    use hex::{FromHex, ToHex};
     use serde::de::DeserializeOwned;
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -924,7 +1046,7 @@ pub mod serde_binary_human_readable {
         if s.is_human_readable() {
             let bytes =
                 bincode::serialize(x).map_err(|e| serde::ser::Error::custom(format!("{e:?}")))?;
-            s.serialize_str(&bytes.to_hex())
+            s.serialize_str(&bytes.encode_hex::<String>())
         } else {
             Serialize::serialize(x, s)
         }
@@ -933,10 +1055,61 @@ pub mod serde_binary_human_readable {
     pub fn deserialize<'d, T: DeserializeOwned, D: Deserializer<'d>>(d: D) -> Result<T, D::Error> {
         if d.is_human_readable() {
             let hex_str: Cow<str> = Deserialize::deserialize(d)?;
-            let bytes = Vec::from_hex(&hex_str).map_err(serde::de::Error::custom)?;
+            let bytes = Vec::from_hex(hex_str.as_ref()).map_err(serde::de::Error::custom)?;
             bincode::deserialize(&bytes).map_err(|e| serde::de::Error::custom(format!("{e:?}")))
         } else {
             Deserialize::deserialize(d)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use fedimint_core::config::{ClientConfig, GlobalClientConfig};
+
+    use crate::module::CoreConsensusVersion;
+
+    #[test]
+    fn test_dcode_meta() {
+        let config = ClientConfig {
+            global: GlobalClientConfig {
+                api_endpoints: Default::default(),
+                consensus_version: CoreConsensusVersion { major: 0, minor: 0 },
+                meta: vec![
+                    ("foo".to_string(), "bar".to_string()),
+                    ("baz".to_string(), "\"bam\"".to_string()),
+                    ("arr".to_string(), "[\"1\", \"2\"]".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            },
+            modules: Default::default(),
+        };
+
+        assert_eq!(
+            config
+                .meta::<String>("foo")
+                .expect("parsing legacy string failed"),
+            Some("bar".to_string())
+        );
+        assert_eq!(
+            config.meta::<String>("baz").expect("parsing string failed"),
+            Some("bam".to_string())
+        );
+        assert_eq!(
+            config
+                .meta::<Vec<String>>("arr")
+                .expect("parsing array failed"),
+            Some(vec!["1".to_string(), "2".to_string()])
+        );
+
+        assert!(config.meta::<Vec<String>>("foo").is_err());
+        assert!(config.meta::<Vec<String>>("baz").is_err());
+        assert_eq!(
+            config
+                .meta::<String>("arr")
+                .expect("parsing via legacy fallback failed"),
+            Some("[\"1\", \"2\"]".to_string())
+        );
     }
 }

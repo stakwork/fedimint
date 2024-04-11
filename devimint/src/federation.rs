@@ -1,90 +1,116 @@
+mod config;
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::ControlFlow;
 use std::path::PathBuf;
+use std::time::Duration;
 use std::{env, fs};
 
 use anyhow::{anyhow, bail, Context, Result};
 use bitcoincore_rpc::bitcoin::Network;
-use fedimint_core::admin_client::{
-    ConfigGenConnectionsRequest, ConfigGenParamsRequest, WsAdminClient,
-};
-use fedimint_core::api::ServerStatus;
-use fedimint_core::bitcoinrpc::BitcoinRpcConfig;
+use fedimint_core::admin_client::{ConfigGenConnectionsRequest, ConfigGenParamsRequest};
+use fedimint_core::api::{DynGlobalApi, ServerStatus};
 use fedimint_core::config::{load_from_file, ClientConfig, ServerModuleConfigGenParamsRegistry};
 use fedimint_core::core::LEGACY_HARDCODED_INSTANCE_ID_WALLET;
+use fedimint_core::envs::BitcoinRpcConfig;
 use fedimint_core::module::registry::ModuleDecoderRegistry;
 use fedimint_core::module::{ApiAuth, ModuleCommon};
+use fedimint_core::runtime::block_in_place;
+use fedimint_core::task::jit::JitTryAnyhow;
 use fedimint_core::util::SafeUrl;
 use fedimint_core::PeerId;
 use fedimint_logging::LOG_DEVIMINT;
 use fedimint_server::config::ConfigGenParams;
 use fedimint_testing::federation::local_config_gen_params;
 use fedimint_wallet_client::config::WalletClientConfig;
-use fedimintd::attach_default_module_init_params;
-use fedimintd::fedimintd::FM_EXTRA_DKG_META_VAR;
+use fedimintd::envs::FM_EXTRA_DKG_META_ENV;
+use fs_lock::FileLock;
 use futures::future::join_all;
 use rand::Rng;
+use tokio::time::Instant;
 use tracing::{debug, info};
 
 use super::external::Bitcoind;
 use super::util::{cmd, parse_map, Command, ProcessHandle, ProcessManager};
 use super::vars::utf8;
+use crate::envs::{FM_CLIENT_DIR_ENV, FM_DATA_DIR_ENV};
 use crate::util::{poll, FedimintdCmd};
+use crate::version_constants::VERSION_0_3_0_ALPHA;
 use crate::{poll_eq, vars};
 
+#[derive(Clone)]
 pub struct Federation {
     // client is only for internal use, use cli commands instead
-    members: BTreeMap<usize, Fedimintd>,
-    vars: BTreeMap<usize, vars::Fedimintd>,
-    bitcoind: Bitcoind,
+    pub members: BTreeMap<usize, Fedimintd>,
+    pub vars: BTreeMap<usize, vars::Fedimintd>,
+    pub bitcoind: Bitcoind,
 
-    /// Built in [`Client`]
-    client: Client,
+    /// Built in [`Client`], already joined
+    client: JitTryAnyhow<Client>,
 }
 
 /// `fedimint-cli` instance (basically path with client state: config + db)
+#[derive(Clone)]
 pub struct Client {
     name: String,
 }
 
 impl Client {
-    fn client_dir(&self) -> PathBuf {
-        let data_dir: PathBuf = env::var("FM_DATA_DIR")
-            .expect("FM_DATA_DIR not set")
+    fn clients_dir() -> PathBuf {
+        let data_dir: PathBuf = env::var(FM_DATA_DIR_ENV)
+            .expect("FM_DATA_DIR_ENV not set")
             .parse()
-            .expect("FM_DATA_DIR invalid");
-        data_dir.join("clients").join(&self.name)
+            .expect("FM_DATA_DIR_ENV invalid");
+        data_dir.join("clients")
+    }
+
+    fn client_dir(&self) -> PathBuf {
+        Self::clients_dir().join(&self.name)
+    }
+
+    pub fn client_name_lock(name: &str) -> Result<FileLock> {
+        let lock_path = Self::clients_dir().join(format!(".{name}.lock"));
+        let file_lock = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&lock_path)
+            .with_context(|| format!("Failed to open {}", lock_path.display()))?;
+
+        fs_lock::FileLock::new_exclusive(file_lock)
+            .with_context(|| format!("Failed to lock {}", lock_path.display()))
     }
 
     /// Create a [`Client`] that starts with a fresh state.
-    ///
-    /// Fails if directory exists. See [`Self::open_or_create`]
-    /// if that's not desired.
     pub async fn create(name: &str) -> Result<Client> {
-        let client = Self {
-            name: name.to_owned(),
-        };
+        block_in_place(|| {
+            let _lock = Self::client_name_lock(name);
+            for i in 0u64.. {
+                let client = Self {
+                    name: format!("{name}-{i}"),
+                };
 
-        if !client.client_dir().exists() {
-            std::fs::create_dir_all(client.client_dir())?;
-        } else {
-            bail!("Client already exists: {name}");
-        }
-
-        Ok(client)
+                if !client.client_dir().exists() {
+                    std::fs::create_dir_all(client.client_dir())?;
+                    return Ok(client);
+                }
+            }
+            unreachable!()
+        })
     }
 
     /// Open or create a [`Client`] that starts with a fresh state.
     pub async fn open_or_create(name: &str) -> Result<Client> {
-        let client = Self {
-            name: name.to_owned(),
-        };
-
-        if !client.client_dir().exists() {
-            std::fs::create_dir_all(client.client_dir())?;
-        }
-
-        Ok(client)
+        block_in_place(|| {
+            let _lock = Self::client_name_lock(name);
+            let client = Self {
+                name: format!("{name}-0"),
+            };
+            if !client.client_dir().exists() {
+                std::fs::create_dir_all(client.client_dir())?;
+            }
+            Ok(client)
+        })
     }
 
     /// Client to join a federation
@@ -118,16 +144,33 @@ impl Client {
             .unwrap())
     }
 
-    pub async fn use_gateway(&self, gw: &super::Gatewayd) -> Result<()> {
-        let gateway_id = gw.gateway_id().await?;
-        cmd!(self, "switch-gateway", gateway_id.clone())
-            .run()
-            .await?;
-        info!(
-            "Using {name} gateway",
-            name = gw.ln.as_ref().unwrap().name()
-        );
+    // TODO(support:v0.2): remove
+    pub async fn use_gateway(&self, gw: &super::gatewayd::Gatewayd) -> Result<()> {
+        let fedimint_cli_version = crate::util::FedimintCli::version_or_default().await;
+        if fedimint_cli_version < *VERSION_0_3_0_ALPHA {
+            let gateway_id = gw.gateway_id().await?;
+            cmd!(self, "switch-gateway", gateway_id.clone())
+                .run()
+                .await?;
+            info!(
+                "Using {name} gateway",
+                name = gw.ln.as_ref().unwrap().name()
+            );
+        }
+
         Ok(())
+    }
+
+    pub async fn get_deposit_addr(&self) -> Result<(String, String)> {
+        let deposit = cmd!(self, "deposit-address").out_json().await?;
+        Ok((
+            deposit["address"].as_str().unwrap().to_string(),
+            deposit["operation_id"].as_str().unwrap().to_string(),
+        ))
+    }
+
+    pub async fn await_deposit(&self, operation_id: &str) -> Result<()> {
+        cmd!(self, "await-deposit", operation_id).run().await
     }
 
     pub async fn cmd(&self) -> Command {
@@ -145,7 +188,7 @@ impl Federation {
         servers: usize,
     ) -> Result<Self> {
         let mut members = BTreeMap::new();
-        let mut vars = BTreeMap::new();
+        let mut peer_to_env_vars_map = BTreeMap::new();
 
         let peers: Vec<_> = (0..servers).map(|id| PeerId::from(id as u16)).collect();
         let params: HashMap<PeerId, ConfigGenParams> = local_config_gen_params(
@@ -154,38 +197,71 @@ impl Federation {
             ServerModuleConfigGenParamsRegistry::default(),
         )?;
 
-        let mut admin_clients: BTreeMap<PeerId, WsAdminClient> = BTreeMap::new();
+        let mut admin_clients: BTreeMap<PeerId, DynGlobalApi> = BTreeMap::new();
         for (peer, peer_params) in &params {
-            let var = vars::Fedimintd::init(&process_mgr.globals, peer_params.to_owned()).await?;
+            let peer_env_vars =
+                vars::Fedimintd::init(&process_mgr.globals, peer_params.to_owned()).await?;
             members.insert(
                 peer.to_usize(),
-                Fedimintd::new(process_mgr, bitcoind.clone(), peer.to_usize(), &var).await?,
+                Fedimintd::new(
+                    process_mgr,
+                    bitcoind.clone(),
+                    peer.to_usize(),
+                    &peer_env_vars,
+                )
+                .await?,
             );
-            let admin_client = WsAdminClient::new(SafeUrl::parse(&var.FM_API_URL)?);
+            let admin_client =
+                DynGlobalApi::from_pre_peer_id_endpoint(SafeUrl::parse(&peer_env_vars.FM_API_URL)?);
             admin_clients.insert(*peer, admin_client);
-            vars.insert(peer.to_usize(), var);
+            peer_to_env_vars_map.insert(peer.to_usize(), peer_env_vars);
         }
 
         run_dkg(admin_clients, params).await?;
 
-        let out_dir = &vars[&0].FM_DATA_DIR;
-        let cfg_dir = &process_mgr.globals.FM_CLIENT_DIR;
-        let out_dir = utf8(out_dir);
-        let cfg_dir = utf8(cfg_dir);
         // move configs to config directory
-        tokio::fs::rename(
-            format!("{out_dir}/invite-code"),
-            format!("{cfg_dir}/invite-code"),
+        let client_dir = utf8(&process_mgr.globals.FM_CLIENT_DIR);
+        let invite_code_filename_original = "invite-code";
+
+        // copy over invite-code file to client directory
+        let peer_data_dir = utf8(&peer_to_env_vars_map[&0].FM_DATA_DIR);
+        tokio::fs::copy(
+            format!("{peer_data_dir}/{invite_code_filename_original}"),
+            format!("{client_dir}/{invite_code_filename_original}"),
         )
         .await
-        .context("moving invite code file")?;
-        info!("moved client configs");
+        .context("copying invite-code file")?;
+
+        // move each guardian's invite-code file to the client's directory
+        // appending the peer id to the end
+        for (index, peer_env_vars) in &peer_to_env_vars_map {
+            let peer_data_dir = utf8(&peer_env_vars.FM_DATA_DIR);
+
+            let invite_code_filename_indexed = format!("{invite_code_filename_original}-{}", index);
+            tokio::fs::rename(
+                format!("{peer_data_dir}/{}", invite_code_filename_original),
+                format!("{client_dir}/{}", invite_code_filename_indexed),
+            )
+            .await
+            .context("moving invite-code file")?;
+        }
+        debug!("Moved invite-code files to client data directory");
+
+        let client = JitTryAnyhow::new_try({
+            move || async move {
+                let client = Client::open_or_create("default").await?;
+                let invite_code = Self::invite_code_static()?;
+
+                cmd!(client, "join-federation", invite_code).run().await?;
+                Ok(client)
+            }
+        });
 
         Ok(Self {
             members,
-            vars,
+            vars: peer_to_env_vars_map,
             bitcoind,
-            client: Client::open_or_create("default").await?,
+            client,
         })
     }
 
@@ -196,21 +272,36 @@ impl Federation {
 
     /// Read the invite code from the client data dir
     pub fn invite_code(&self) -> Result<String> {
-        let data_dir: PathBuf = env::var("FM_CLIENT_DIR")?.parse()?;
+        let data_dir: PathBuf = env::var(FM_CLIENT_DIR_ENV)?.parse()?;
         let invite_code = fs::read_to_string(data_dir.join("invite-code"))?;
+        Ok(invite_code)
+    }
+
+    pub fn invite_code_static() -> Result<String> {
+        let data_dir: PathBuf = env::var(FM_CLIENT_DIR_ENV)?.parse()?;
+        let invite_code = fs::read_to_string(data_dir.join("invite-code"))?;
+        Ok(invite_code)
+    }
+    pub fn invite_code_for(peer_id: PeerId) -> Result<String> {
+        let data_dir: PathBuf = env::var(FM_CLIENT_DIR_ENV)?.parse()?;
+        let name = format!("invite-code-{}", peer_id);
+        let invite_code = fs::read_to_string(data_dir.join(name))?;
         Ok(invite_code)
     }
 
     /// Built-in, default, internal [`Client`]
     ///
     /// We should be moving away from using it for anything.
-    pub fn internal_client(&self) -> &Client {
-        &self.client
+    pub async fn internal_client(&self) -> Result<&Client> {
+        self.client
+            .get_try()
+            .await
+            .context("Internal client joining Federation")
     }
 
     /// Fork the built-in client of `Federation` and give it a name
     pub async fn fork_client(&self, name: &str) -> Result<Client> {
-        Client::new_forked(&self.client, name).await
+        Client::new_forked(self.internal_client().await?, name).await
     }
 
     /// New [`Client`] that already joined `self`
@@ -239,35 +330,114 @@ impl Federation {
         Ok(())
     }
 
-    pub async fn pegin_client(&self, amount: u64, client: &Client) -> Result<()> {
-        info!(amount, "Pegging-in client funds");
-        let deposit = cmd!(client, "deposit-address").out_json().await?;
-        let deposit_address = deposit["address"].as_str().unwrap();
-        let deposit_operation_id = deposit["operation_id"].as_str().unwrap();
-
-        self.bitcoind
-            .send_to(deposit_address.to_owned(), amount)
-            .await?;
-        self.bitcoind.mine_blocks(21).await?;
-
-        cmd!(client, "await-deposit", deposit_operation_id)
-            .run()
-            .await?;
+    /// Starts all peers not currently running.
+    pub async fn start_all_servers(&mut self, process_mgr: &ProcessManager) -> Result<()> {
+        info!("starting all servers");
+        let fed_size = process_mgr.globals.FM_FED_SIZE;
+        for peer_id in 0..fed_size {
+            if self.members.contains_key(&peer_id) {
+                continue;
+            }
+            self.start_server(process_mgr, peer_id).await?
+        }
+        self.await_all_peers().await?;
         Ok(())
     }
 
-    pub async fn pegin_gateway(&self, amount: u64, gw: &super::Gatewayd) -> Result<()> {
+    /// Terminates all running peers.
+    pub async fn terminate_all_servers(&mut self) -> Result<()> {
+        info!("terminating all servers");
+        let running_peer_ids: Vec<_> = self.members.keys().cloned().collect();
+        for peer_id in running_peer_ids {
+            self.terminate_server(peer_id).await?
+        }
+        Ok(())
+    }
+
+    /// Coordinated shutdown of all peers that restart using the provided
+    /// `bin_path`. Returns `Ok()` once all peers are online.
+    ///
+    /// Staggering the restart more closely simulates upgrades in the wild.
+    pub async fn restart_all_staggered_with_bin(
+        &mut self,
+        process_mgr: &ProcessManager,
+        bin_path: &PathBuf,
+    ) -> Result<()> {
+        let fed_size = process_mgr.globals.FM_FED_SIZE;
+
+        // ensure all peers are online
+        self.start_all_servers(process_mgr).await?;
+
+        // staggered shutdown of peers
+        while self.num_members() > 0 {
+            self.terminate_server(self.num_members() - 1).await?;
+            if self.num_members() > 0 {
+                fedimint_core::task::sleep_in_test(
+                    "waiting to shutdown remaining peers",
+                    Duration::from_secs(10),
+                )
+                .await;
+            }
+        }
+
+        std::env::set_var("FM_FEDIMINTD_BASE_EXECUTABLE", bin_path);
+
+        // staggered restart
+        for peer_id in 0..fed_size {
+            self.start_server(process_mgr, peer_id).await?;
+            if peer_id < fed_size - 1 {
+                fedimint_core::task::sleep_in_test(
+                    "waiting to restart remaining peers",
+                    Duration::from_secs(10),
+                )
+                .await;
+            }
+        }
+
+        self.await_all_peers().await?;
+
+        let fedimintd_version = crate::util::FedimintdCmd::version_or_default().await;
+        info!("upgraded fedimintd to version: {}", fedimintd_version);
+        Ok(())
+    }
+
+    pub async fn degrade_federation(&mut self, process_mgr: &ProcessManager) -> Result<()> {
+        let fed_size = process_mgr.globals.FM_FED_SIZE;
+        let offline_nodes = process_mgr.globals.FM_OFFLINE_NODES;
+        anyhow::ensure!(
+            fed_size > 3 * offline_nodes,
+            "too many offline nodes ({offline_nodes}) to reach consensus"
+        );
+
+        while self.num_members() > fed_size - offline_nodes {
+            self.terminate_server(self.num_members() - 1).await?;
+        }
+
+        if offline_nodes > 0 {
+            info!(fed_size, offline_nodes, "federation is degraded");
+        }
+        Ok(())
+    }
+
+    pub async fn pegin_client(&self, amount: u64, client: &Client) -> Result<()> {
+        info!(amount, "Pegging-in client funds");
+
+        let (address, operation_id) = client.get_deposit_addr().await?;
+
+        self.bitcoind.send_to(address, amount).await?;
+        self.bitcoind.mine_blocks(21).await?;
+
+        client.await_deposit(&operation_id).await?;
+        Ok(())
+    }
+
+    pub async fn pegin_gateway(&self, amount: u64, gw: &super::gatewayd::Gatewayd) -> Result<()> {
         info!(amount, "Pegging-in gateway funds");
-        let fed_id = self.federation_id().await;
-        let pegin_addr = cmd!(gw, "address", "--federation-id={fed_id}")
-            .out_json()
-            .await?
-            .as_str()
-            .context("address must be a string")?
-            .to_owned();
+        let fed_id = self.calculate_federation_id().await;
+        let pegin_addr = gw.get_pegin_addr(&fed_id).await?;
         self.bitcoind.send_to(pegin_addr, amount).await?;
         self.bitcoind.mine_blocks(21).await?;
-        poll("gateway pegin", None, || async {
+        poll("gateway pegin", || async {
             let gateway_balance = cmd!(gw, "balance", "--federation-id={fed_id}")
                 .out_json()
                 .await
@@ -280,22 +450,27 @@ impl Federation {
         Ok(())
     }
 
-    pub async fn federation_id(&self) -> String {
+    pub async fn calculate_federation_id(&self) -> String {
         self.client_config()
             .await
             .unwrap()
             .global
-            .federation_id()
+            .calculate_federation_id()
             .to_string()
     }
 
     pub async fn await_block_sync(&self) -> Result<u64> {
         let finality_delay = self.get_finality_delay().await?;
-        let block_count = self.bitcoind.get_block_count()?;
+        let block_count = self.bitcoind.get_block_count().await?;
         let expected = block_count.saturating_sub(finality_delay.into());
-        cmd!(self.client, "dev", "wait-block-count", expected)
-            .run()
-            .await?;
+        cmd!(
+            self.internal_client().await?,
+            "dev",
+            "wait-block-count",
+            expected
+        )
+        .run()
+        .await?;
         Ok(expected)
     }
 
@@ -318,31 +493,47 @@ impl Federation {
     }
 
     pub async fn await_gateways_registered(&self) -> Result<()> {
-        poll("gateways registered", None, || async {
-            let num_gateways = cmd!(self.client, "list-gateways")
-                .out_json()
-                .await
-                .map_err(ControlFlow::Continue)?
-                .as_array()
-                .context("invalid output")
-                .map_err(ControlFlow::Break)?
-                .len();
+        let start_time = Instant::now();
+        debug!(target: LOG_DEVIMINT, "Awaiting LN gateways registration");
+        poll("gateways registered", || async {
+            let num_gateways = cmd!(
+                self.internal_client()
+                    .await
+                    .map_err(ControlFlow::Continue)?,
+                "list-gateways"
+            )
+            .out_json()
+            .await
+            .map_err(ControlFlow::Continue)?
+            .as_array()
+            .context("invalid output")
+            .map_err(ControlFlow::Break)?
+            .len();
             poll_eq!(num_gateways, 2)
         })
         .await?;
+        debug!(target: LOG_DEVIMINT,
+            elapsed_ms = %start_time.elapsed().as_millis(),
+            "Gateways registered");
         Ok(())
     }
 
     pub async fn await_all_peers(&self) -> Result<()> {
-        cmd!(
-            self.client,
-            "dev",
-            "api",
-            "module_{LEGACY_HARDCODED_INSTANCE_ID_WALLET}_block_count"
-        )
-        .run()
-        .await?;
-        Ok(())
+        poll("Waiting for all peers to be online", || async {
+            cmd!(
+                self.internal_client()
+                    .await
+                    .map_err(ControlFlow::Continue)?,
+                "dev",
+                "api",
+                "module_{LEGACY_HARDCODED_INSTANCE_ID_WALLET}_block_count"
+            )
+            .run()
+            .await
+            .map_err(ControlFlow::Continue)?;
+            Ok(())
+        })
+        .await
     }
 
     /// Mines enough blocks to finalize mempool transactions, then waits for
@@ -367,6 +558,10 @@ impl Federation {
         self.await_block_sync().await?;
         Ok(())
     }
+
+    pub fn num_members(&self) -> usize {
+        self.members.len()
+    }
 }
 
 #[derive(Clone)]
@@ -382,7 +577,7 @@ impl Fedimintd {
         peer_id: usize,
         env: &vars::Fedimintd,
     ) -> Result<Self> {
-        info!("fedimintd-{peer_id} started");
+        debug!("Starting fedimintd-{peer_id}");
         let process = process_mgr
             .spawn_daemon(
                 &format!("fedimintd-{peer_id}"),
@@ -402,13 +597,12 @@ impl Fedimintd {
 }
 
 pub async fn run_dkg(
-    admin_clients: BTreeMap<PeerId, WsAdminClient>,
+    admin_clients: BTreeMap<PeerId, DynGlobalApi>,
     params: HashMap<PeerId, ConfigGenParams>,
 ) -> Result<()> {
     let auth_for = |peer: &PeerId| -> ApiAuth { params[peer].local.api_auth.clone() };
     for (peer_id, client) in &admin_clients {
-        const MAX_RETRIES: usize = 20;
-        super::poll("trying-to-connect-to-peers", MAX_RETRIES, || async {
+        poll("trying-to-connect-to-peers", || async {
             client
                 .status()
                 .await
@@ -416,7 +610,7 @@ pub async fn run_dkg(
                 .map_err(ControlFlow::Continue)
         })
         .await?;
-        info!("Connected to {peer_id}")
+        debug!("Connected to {peer_id}")
     }
     for (peer_id, client) in &admin_clients {
         assert_eq!(
@@ -435,7 +629,9 @@ pub async fn run_dkg(
         .filter(|(id, _)| *id != leader_id)
         .collect::<BTreeMap<_, _>>();
 
-    let leader_name = "leader".to_string();
+    // Note: names prefixed by peerid, as DKG sort peers by submitted name
+    // by default.
+    let leader_name = format!("{}-leader", leader_id);
     leader
         .set_config_gen_connections(
             ConfigGenConnectionsRequest {
@@ -461,7 +657,7 @@ pub async fn run_dkg(
                     .take(5)
                     .map(char::from)
                     .collect::<String>();
-                format!("random-{random_string}{peer_id}")
+                format!("{peer_id}-random-{random_string}{peer_id}")
             })
         })
         .collect::<BTreeMap<_, _>>();
@@ -469,12 +665,22 @@ pub async fn run_dkg(
         let name = followers_names
             .get(peer_id)
             .context("missing follower name")?;
-        info!("calling set_config_gen_connections for {peer_id} {name}");
+        debug!("calling set_config_gen_connections for {peer_id} {name}");
         client
             .set_config_gen_connections(
                 ConfigGenConnectionsRequest {
                     our_name: name.clone(),
-                    leader_api_url: Some(leader.url.clone()),
+                    leader_api_url: Some(
+                        params
+                            .get(leader_id)
+                            .expect("Must have leader configs")
+                            .consensus
+                            .peers
+                            .get(leader_id)
+                            .expect("Must have leader api_endpoint")
+                            .api_url
+                            .clone(),
+                    ),
                 },
                 auth_for(peer_id),
             )
@@ -512,7 +718,7 @@ pub async fn run_dkg(
     let dkg_results = admin_clients
         .iter()
         .map(|(peer_id, client)| client.run_dkg(auth_for(peer_id)));
-    info!("Running DKG...");
+    info!(target: LOG_DEVIMINT, "Running DKG");
     let (dkg_results, leader_wait_result) = tokio::join!(
         join_all(dkg_results),
         wait_server_status(leader, ServerStatus::VerifyingConfigs)
@@ -529,24 +735,24 @@ pub async fn run_dkg(
         hashes.insert(client.get_verify_config_hash(auth_for(peer_id)).await?);
     }
     assert_eq!(hashes.len(), 1);
-    info!("DKG successfully complete. Starting consensus...");
+    debug!(target: LOG_DEVIMINT, "DKG ready");
+    info!(target: LOG_DEVIMINT, "Starting consensus");
     for (peer_id, client) in &admin_clients {
         if let Err(e) = client.start_consensus(auth_for(peer_id)).await {
-            tracing::info!("Error calling start_consensus: {e:?}, trying to continue...")
+            tracing::debug!("Error calling start_consensus: {e:?}, trying to continue...")
         }
-
         wait_server_status(client, ServerStatus::ConsensusRunning).await?;
     }
-    info!("Consensus is running");
+    debug!("Consensus is running");
     Ok(())
 }
 
 async fn set_config_gen_params(
-    client: &WsAdminClient,
+    client: &DynGlobalApi,
     auth: ApiAuth,
     mut server_gen_params: ServerModuleConfigGenParamsRegistry,
 ) -> Result<()> {
-    attach_default_module_init_params(
+    self::config::attach_default_module_init_params(
         BitcoinRpcConfig::from_env_vars()?,
         &mut server_gen_params,
         Network::Regtest,
@@ -555,11 +761,11 @@ async fn set_config_gen_params(
     // Since we are not actually calling `fedimintd` binary, parse and handle
     // `FM_EXTRA_META_DATA` like it would do.
     let mut extra_meta_data = parse_map(
-        &std::env::var(FM_EXTRA_DKG_META_VAR)
+        &std::env::var(FM_EXTRA_DKG_META_ENV)
             .ok()
             .unwrap_or_default(),
     )
-    .with_context(|| format!("Failed to parse {FM_EXTRA_DKG_META_VAR}"))
+    .with_context(|| format!("Failed to parse {FM_EXTRA_DKG_META_ENV}"))
     .expect("Failed");
     let mut meta = BTreeMap::from([("federation_name".to_string(), "testfed".to_string())]);
     meta.append(&mut extra_meta_data);
@@ -572,23 +778,25 @@ async fn set_config_gen_params(
     Ok(())
 }
 
-async fn wait_server_status(client: &WsAdminClient, expected_status: ServerStatus) -> Result<()> {
-    const RETRIES: usize = 60;
-    super::poll("waiting-server-status", RETRIES, || async {
-        let server_status = client
-            .status()
-            .await
-            .context("server status")
-            .map_err(ControlFlow::Continue)?
-            .server;
-        if server_status == expected_status {
-            Ok(())
-        } else {
-            Err(ControlFlow::Continue(anyhow!(
-                "expected status: {expected_status:?} current status: {server_status:?}"
-            )))
-        }
-    })
+async fn wait_server_status(client: &DynGlobalApi, expected_status: ServerStatus) -> Result<()> {
+    poll(
+        &format!("waiting-server-status: {expected_status:?}"),
+        || async {
+            let server_status = client
+                .status()
+                .await
+                .context("server status")
+                .map_err(ControlFlow::Continue)?
+                .server;
+            if server_status == expected_status {
+                Ok(())
+            } else {
+                Err(ControlFlow::Continue(anyhow!(
+                    "expected status: {expected_status:?} current status: {server_status:?}"
+                )))
+            }
+        },
+    )
     .await?;
     Ok(())
 }

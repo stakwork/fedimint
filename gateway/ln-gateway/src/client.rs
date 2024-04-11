@@ -1,10 +1,12 @@
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use fedimint_client::module::init::ClientModuleInitRegistry;
 use fedimint_client::secret::{PlainRootSecretStrategy, RootSecretStrategy};
-use fedimint_client::{Client, FederationInfo};
+use fedimint_client::Client;
+use fedimint_core::config::ClientConfig;
 use fedimint_core::core::ModuleInstanceId;
 use fedimint_core::db::{
     Committable, Database, DatabaseTransaction, IDatabaseTransactionOpsCoreTyped,
@@ -15,6 +17,7 @@ use rand::thread_rng;
 use tracing::info;
 
 use crate::db::{FederationConfig, FederationIdKey, FederationIdKeyPrefix};
+use crate::gateway_module_v2::GatewayClientInitV2;
 use crate::state_machine::GatewayClientInit;
 use crate::{Gateway, GatewayError, Result};
 
@@ -40,12 +43,11 @@ impl GatewayClientBuilder {
 }
 
 impl GatewayClientBuilder {
-    #[allow(clippy::too_many_arguments)]
     pub async fn build(
         &self,
         config: FederationConfig,
         gateway: Gateway,
-    ) -> Result<fedimint_client::ClientArc> {
+    ) -> Result<fedimint_client::ClientHandleArc> {
         let FederationConfig {
             invite_code,
             mint_channel_id,
@@ -55,11 +57,13 @@ impl GatewayClientBuilder {
         let federation_id = invite_code.federation_id();
 
         let mut registry = self.registry.clone();
+
         registry.attach(GatewayClientInit {
             timelock_delta,
             mint_channel_id,
-            gateway,
+            gateway: gateway.clone(),
         });
+        registry.attach(GatewayClientInitV2 { gateway });
 
         let db_path = self.work_dir.join(format!("{federation_id}.db"));
 
@@ -73,12 +77,14 @@ impl GatewayClientBuilder {
         client_builder.with_primary_module(self.primary_module);
 
         let client_secret =
-            match Client::load_decodable_client_secret::<[u8; 64]>(client_builder.db()).await {
+            match Client::load_decodable_client_secret::<[u8; 64]>(client_builder.db_no_decoders())
+                .await
+            {
                 Ok(secret) => secret,
                 Err(_) => {
                     info!("Generating secret and writing to client storage");
                     let secret = PlainRootSecretStrategy::random(&mut thread_rng());
-                    Client::store_encodable_client_secret(client_builder.db(), secret)
+                    Client::store_encodable_client_secret(client_builder.db_no_decoders(), secret)
                         .await
                         .map_err(GatewayError::ClientStateMachineError)?;
                     secret
@@ -86,22 +92,19 @@ impl GatewayClientBuilder {
             };
 
         let root_secret = PlainRootSecretStrategy::to_root_secret(&client_secret);
-        if Client::is_initialized(client_builder.db()).await {
+        if Client::is_initialized(client_builder.db_no_decoders()).await {
             client_builder
                 // TODO: make this configurable?
                 .open(root_secret)
                 .await
         } else {
-            let federation_info = FederationInfo::from_invite_code(invite_code.clone()).await?;
+            let client_config = ClientConfig::download_from_invite_code(&invite_code).await?;
             client_builder
                 // TODO: make this configurable?
-                .join(
-                    root_secret,
-                    federation_info.config().to_owned(),
-                    invite_code,
-                )
+                .join(root_secret, client_config.to_owned())
                 .await
         }
+        .map(Arc::new)
         .map_err(GatewayError::ClientStateMachineError)
     }
 

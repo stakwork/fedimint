@@ -8,6 +8,21 @@ rules:
 
   severity: WARNING
 
+- id: ban-system-time-elapsed
+  languages:
+    - rust
+  message: Use fedimint_core::time::now and std::time::duration_since to compare an elapsed time for better wasm compatibility.
+  pattern: $SYSTEM_TIME.elapsed()
+  paths:
+    exclude:
+      # server only
+      - fedimint-server/
+      # doesn't run in wasm
+      - fedimint-load-test-tool/
+      # doesn't run in wasm
+      - devimint/
+  severity: WARNING
+
 - id: ban-instant-now
   languages:
     - rust
@@ -46,15 +61,33 @@ rules:
 - id: ban-tokio-spawn
   languages:
     - rust
-  message: "`tokio::spawn` won't set task name by default. use `fedimint_core::task::spawn` instead"
+  message: "`tokio::spawn` won't set task name by default. use `fedimint_core::runtime::spawn` instead"
   pattern: tokio::spawn
   severity: WARNING
 
 - id: ban-tokio-sleep
   languages:
     - rust
-  message: "`tokio::time::sleep` doesn't work in WASM. Use `fedimint_core::task::sleep` instead."
+  message: "`tokio::time::sleep` doesn't work in WASM. Use `fedimint_core::runtime::sleep` instead."
   pattern: tokio::time::sleep
+  severity: WARNING
+
+- id: ban-raw-block-on
+  languages:
+    - rust
+  message: Use `fedimint_core::runtime::block_on()` instead.
+  pattern-either:
+    - pattern: futures::executor::block_on
+    - pattern: tokio::runtime::Handle::block_on
+    - pattern: tokio::runtime::Handle::current
+  severity: WARNING
+
+- id: ban-raw-block-in-place
+  languages:
+    - rust
+  message: Use `fedimint_core::runtime::block_in_place()` instead.
+  pattern-either:
+    - pattern: tokio::task::block_in_place
   severity: WARNING
 
 - id: ban-raw-url
@@ -79,9 +112,70 @@ rules:
       - fedimint-server/
       - fedimint-core/
 
+- id: use-client-log-targets
+  languages:
+    - rust
+  message: Log statements in clients should have static target prefixed with `LOG_CLIENT_` (`client::`)
+  patterns:
+    # semgrep struggles with finding boundaries of rust macro invocation when ellipsis (`...`) is used
+    # so matching this one with raw regexes instead
+    - pattern-regex: '(error|warn|info|debug|trace)!\(\s*target: [^;]*?\);'
+    - pattern-not-regex: '(error|warn|info|debug|trace)!\(\s*target: LOG_CLIENT[^;]*?\);'
+  severity: WARNING
+  paths:
+    include:
+      - fedimint-client/
+      - fedimint-cli/
+      - modules/*-client/
+
 - id: ban-wildcard-imports
   languages:
     - rust
   message: "Wildcard imports make it unclear which items are being used. Avoid using `use ...::*;` except in sub-modules of a file such as `use super::*;` in a test module."
   pattern-regex: '^use .*::\*;$'
   severity: WARNING
+
+- id: ban-direct-sleep-in-tests
+  languages:
+    - rust
+  patterns:
+    - pattern-either:
+      - pattern: sleep(...)
+      - pattern: fedimint_core::task::sleep(...)
+      - pattern: fedimint_core::runtime::sleep(...)
+  paths:
+    include:
+      - fedimint-testing/
+      - fedimint-wasm-testing/
+      - fedimint-wasm-tests/
+      - modules/fedimint-dummy-tests/
+      - modules/fedimint-wallet-tests/
+      - modules/fedimint-ln-tests/
+      - modules/fedimint-mint-tests/
+      - gateway/ln-gateway/tests/
+      - fedimint-client/src/backup/tests.rs
+      - devimint/src/tests.rs
+  message: "Direct use of fedimint_core::runtime::sleep in tests is discouraged. Use fedimint_core::task::sleep_in_test instead."
+  severity: WARNING
+
+- id: ban-sleep-in-test-scripts
+  languages:
+     - bash
+  patterns:
+    - pattern: sleep $X
+  paths:
+    include:
+      - scripts/tests/
+  message: "Sleeping in test scripts is discouraged. Sleep in rust using fedimint_core::task::sleep_in_test instead."
+  severity: WARNING
+
+- id: ban-version-req-in-devimint
+  languages:
+    - rust
+  pattern: semver::VersionReq::parse
+  paths:
+    include:
+      - devimint/
+  message: "semver::VersionReq doesn't work for comparing prereleases. Compare with semver::Version instead. For context, see https://github.com/fedimint/fedimint/pull/4804"
+  severity: WARNING
+

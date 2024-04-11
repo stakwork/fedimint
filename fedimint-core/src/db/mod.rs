@@ -34,6 +34,7 @@
 //! Prevented      | Prevented   | | Sqlite   | Prevented          | Prevented
 //! | Prevented           | Prevented      | Prevented   |
 
+use std::any;
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{self, Debug};
@@ -162,7 +163,7 @@ pub enum AutocommitError<E> {
 #[apply(async_trait_maybe_send!)]
 pub trait IRawDatabase: Debug + MaybeSend + MaybeSync + 'static {
     /// A raw database transaction type
-    type Transaction<'a>: IRawDatabaseTransaction;
+    type Transaction<'a>: IRawDatabaseTransaction + Debug;
 
     /// Start a database transaction
     async fn begin_transaction<'a>(&'a self) -> Self::Transaction<'a>;
@@ -279,6 +280,16 @@ impl<RawDatabase: IRawDatabase + MaybeSend + 'static> IDatabase for BaseDatabase
 pub struct Database {
     inner: Arc<dyn IDatabase + 'static>,
     module_decoders: ModuleDecoderRegistry,
+}
+
+impl Database {
+    pub fn strong_count(&self) -> usize {
+        Arc::strong_count(&self.inner)
+    }
+
+    pub fn into_inner(self) -> Arc<dyn IDatabase + 'static> {
+        self.inner
+    }
 }
 
 impl Database {
@@ -447,24 +458,32 @@ impl Database {
                     return Ok(val);
                 }
                 Err(err) => {
-                    warn!(
-                        target: LOG_DB,
-                        curr_attempts, "Database commit failed in an autocommit block"
-                    );
                     if max_attempts
                         .map(|max_att| max_att <= curr_attempts)
                         .unwrap_or(false)
                     {
+                        warn!(
+                            target: LOG_DB,
+                            curr_attempts,
+                            "Database commit failed in an autocommit block - terminating"
+                        );
                         return Err(AutocommitError::CommitFailed {
                             attempts: curr_attempts,
                             last_error: err,
                         });
                     }
+
+                    let delay = (2u64.pow(curr_attempts.min(7) as u32) * 10).min(1000);
+                    let delay = rand::thread_rng().gen_range(delay..(2 * delay));
+                    warn!(
+                        target: LOG_DB,
+                        curr_attempts,
+                        delay_ms = %delay,
+                        "Database commit failed in an autocommit block - retrying"
+                    );
+                    crate::runtime::sleep(Duration::from_millis(delay)).await;
                 }
             }
-            let delay = (2u64.pow(curr_attempts.min(7) as u32) * 10).min(1000);
-            let delay = rand::thread_rng().gen_range(delay..(2 * delay));
-            crate::task::sleep(Duration::from_millis(delay)).await;
         }
     }
 
@@ -493,13 +512,7 @@ impl Database {
                 .await
                 .expect("Unrecoverable error when reading from database")
                 .map(|value_bytes| {
-                    trace!(
-                        "get_value: Decoding {} from bytes {:?}",
-                        std::any::type_name::<K::Value>(),
-                        value_bytes
-                    );
-                    K::Value::from_bytes(&value_bytes, &self.module_decoders)
-                        .expect("Unrecoverable error when decoding the database value")
+                    decode_value_expect(&value_bytes, &self.module_decoders, &key_bytes)
                 });
 
             if let Some(value) = checker(maybe_value_bytes) {
@@ -586,6 +599,7 @@ where
 /// operations, effectively creating an isolated partition.
 ///
 /// Produced by [`PrefixDatabase`].
+#[derive(Debug)]
 struct PrefixDatabaseTransaction<Inner> {
     inner: Inner,
     prefix: Vec<u8>,
@@ -901,13 +915,13 @@ where
     where
         K: DatabaseKey + DatabaseRecord + MaybeSend + MaybeSync,
     {
+        let key_bytes = key.to_bytes();
         let raw = self
-            .raw_get_bytes(&key.to_bytes())
+            .raw_get_bytes(&key_bytes)
             .await
             .expect("Unrecoverable error occurred while reading and entry from the database");
         raw.map(|value_bytes| {
-            decode_value::<K::Value>(&value_bytes, self.decoders())
-                .expect("Unrecoverable error when decoding the database value")
+            decode_value_expect::<K::Value>(&value_bytes, self.decoders(), &key_bytes)
         })
     }
 
@@ -916,12 +930,12 @@ where
         K: DatabaseKey + DatabaseRecord + MaybeSend + MaybeSync,
         K::Value: MaybeSend + MaybeSync,
     {
-        self.raw_insert_bytes(&key.to_bytes(), &value.to_bytes())
+        let key_bytes = key.to_bytes();
+        self.raw_insert_bytes(&key_bytes, &value.to_bytes())
             .await
             .expect("Unrecoverable error occurred while inserting entry into the database")
             .map(|value_bytes| {
-                decode_value::<K::Value>(&value_bytes, self.decoders())
-                    .expect("Unrecoverable error when decoding the database value")
+                decode_value_expect::<K::Value>(&value_bytes, self.decoders(), &key_bytes)
             })
     }
 
@@ -965,12 +979,8 @@ where
                 .await
                 .expect("Unrecoverable error occurred while listing entries from the database")
                 .map(move |(key_bytes, value_bytes)| {
-                    let key = KP::Record::from_bytes(&key_bytes, &decoders)
-                        .with_context(|| anyhow::anyhow!("key: {}", AbbreviateHexBytes(&key_bytes)))
-                        .expect("Unrecoverable error reading DatabaseKey");
-                    let value = decode_value(&value_bytes, &decoders)
-                        .with_context(|| anyhow::anyhow!("key: {}", AbbreviateHexBytes(&key_bytes)))
-                        .expect("Unrecoverable decoding DatabaseValue");
+                    let key = decode_key_expect(&key_bytes, &decoders);
+                    let value = decode_value_expect(&value_bytes, &decoders, &key_bytes);
                     (key, value)
                 }),
         )
@@ -1001,12 +1011,8 @@ where
                 .await
                 .expect("Unrecoverable error occurred while listing entries from the database")
                 .map(move |(key_bytes, value_bytes)| {
-                    let key = KP::Record::from_bytes(&key_bytes, &decoders)
-                        .with_context(|| anyhow::anyhow!("key: {}", AbbreviateHexBytes(&key_bytes)))
-                        .expect("Unrecoverable error reading DatabaseKey");
-                    let value = decode_value(&value_bytes, &decoders)
-                        .with_context(|| anyhow::anyhow!("key: {}", AbbreviateHexBytes(&key_bytes)))
-                        .expect("Unrecoverable decoding DatabaseValue");
+                    let key = decode_key_expect(&key_bytes, &decoders);
+                    let value = decode_value_expect(&value_bytes, &decoders, &key_bytes);
                     (key, value)
                 }),
         )
@@ -1015,12 +1021,12 @@ where
     where
         K: DatabaseKey + DatabaseRecord + MaybeSend + MaybeSync,
     {
-        self.raw_remove_entry(&key.to_bytes())
+        let key_bytes = key.to_bytes();
+        self.raw_remove_entry(&key_bytes)
             .await
             .expect("Unrecoverable error occurred while inserting removing entry from the database")
             .map(|value_bytes| {
-                decode_value::<K::Value>(&value_bytes, self.decoders())
-                    .expect("Unrecoverable error when decoding the database value")
+                decode_value_expect::<K::Value>(&value_bytes, self.decoders(), &key_bytes)
             })
     }
     async fn remove_by_prefix<KP>(&mut self, key_prefix: &KP)
@@ -1049,7 +1055,7 @@ pub trait IRawDatabaseTransaction: MaybeSend + IDatabaseTransactionOps {
 ///
 /// See [`IDatabase`] for more info.
 #[apply(async_trait_maybe_send!)]
-pub trait IDatabaseTransaction: MaybeSend + IDatabaseTransactionOps {
+pub trait IDatabaseTransaction: MaybeSend + IDatabaseTransactionOps + fmt::Debug {
     /// Commit the transaction
     async fn commit_tx(&mut self) -> Result<()>;
 
@@ -1092,6 +1098,17 @@ struct BaseDatabaseTransaction<Tx> {
     notifications: Arc<Notifications>,
 }
 
+impl<Tx> fmt::Debug for BaseDatabaseTransaction<Tx>
+where
+    Tx: fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_fmt(format_args!(
+            "BaseDatabaseTransaction{{ raw={:?} }}",
+            self.raw
+        ))
+    }
+}
 impl<Tx> BaseDatabaseTransaction<Tx>
 where
     Tx: IRawDatabaseTransaction,
@@ -1191,7 +1208,10 @@ impl<Tx: IRawDatabaseTransaction> IDatabaseTransactionOps for BaseDatabaseTransa
 }
 
 #[apply(async_trait_maybe_send!)]
-impl<Tx: IRawDatabaseTransaction> IDatabaseTransaction for BaseDatabaseTransaction<Tx> {
+impl<Tx: IRawDatabaseTransaction> IDatabaseTransaction for BaseDatabaseTransaction<Tx>
+where
+    Tx: fmt::Debug,
+{
     async fn commit_tx(&mut self) -> Result<()> {
         self.raw
             .take()
@@ -1227,7 +1247,7 @@ impl Drop for CommitTracker {
     fn drop(&mut self) {
         if self.has_writes && !self.is_committed {
             if self.ignore_uncommitted {
-                debug!(
+                trace!(
                     target: LOG_DB,
                     "DatabaseTransaction has writes and has not called commit, but that's expected."
                 );
@@ -1288,6 +1308,15 @@ pub struct DatabaseTransaction<'tx, Cap = NonCommittable> {
     capability: marker::PhantomData<Cap>,
 }
 
+impl<'tx, Cap> fmt::Debug for DatabaseTransaction<'tx, Cap> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_fmt(format_args!(
+            "DatabaseTransaction {{ tx: {:?}, decoders={:?} }}",
+            self.tx, self.decoders
+        ))
+    }
+}
+
 impl<'tx, Cap> WithDecoders for DatabaseTransaction<'tx, Cap> {
     fn decoders(&self) -> &ModuleDecoderRegistry {
         &self.decoders
@@ -1304,6 +1333,37 @@ fn decode_value<V: DatabaseValue>(
         "decoding value",
     );
     V::from_bytes(value_bytes, decoders)
+}
+
+fn decode_value_expect<V: DatabaseValue>(
+    value_bytes: &[u8],
+    decoders: &ModuleDecoderRegistry,
+    key_bytes: &[u8],
+) -> V {
+    decode_value(value_bytes, decoders).unwrap_or_else(|err| {
+        panic!(
+            "Unrecoverable decoding DatabaseValue as {}; err={}, bytes={}; key_bytes={}",
+            any::type_name::<V>(),
+            err,
+            AbbreviateHexBytes(value_bytes),
+            AbbreviateHexBytes(key_bytes),
+        )
+    })
+}
+
+fn decode_key_expect<K: DatabaseKey>(key_bytes: &[u8], decoders: &ModuleDecoderRegistry) -> K {
+    trace!(
+        bytes = %AbbreviateHexBytes(key_bytes),
+        "decoding key",
+    );
+    K::from_bytes(key_bytes, decoders).unwrap_or_else(|err| {
+        panic!(
+            "Unrecoverable decoding DatabaseKey as {}; err={}; bytes={}",
+            any::type_name::<K>(),
+            err,
+            AbbreviateHexBytes(key_bytes)
+        )
+    })
 }
 
 impl<'tx, Cap> DatabaseTransaction<'tx, Cap> {
@@ -1689,11 +1749,21 @@ macro_rules! impl_db_lookup{
     };
 }
 
+/// Deprecated: Use `DatabaseVersionKey(ModuleInstanceId)` instead.
 #[derive(Debug, Encodable, Decodable, Serialize)]
-pub struct DatabaseVersionKey;
+pub struct DatabaseVersionKeyV0;
 
-#[derive(Debug, Encodable, Decodable, Serialize, Clone, PartialOrd, Ord, PartialEq, Eq)]
+#[derive(Debug, Encodable, Decodable, Serialize)]
+pub struct DatabaseVersionKey(pub ModuleInstanceId);
+
+#[derive(Debug, Encodable, Decodable, Serialize, Clone, PartialOrd, Ord, PartialEq, Eq, Copy)]
 pub struct DatabaseVersion(pub u64);
+
+impl_db_record!(
+    key = DatabaseVersionKeyV0,
+    value = DatabaseVersion,
+    db_prefix = DbKeyPrefix::DatabaseVersion
+);
 
 impl_db_record!(
     key = DatabaseVersionKey,
@@ -1802,32 +1872,59 @@ macro_rules! push_db_key_items {
     };
 }
 
-/// MigrationMap is a BTreeMap that maps DatabaseVersions to async functions.
-/// These functions are expected to "migrate" the database from the keyed
-/// DatabaseVersion to DatabaseVersion + 1.
-pub type MigrationMap = BTreeMap<
-    DatabaseVersion,
+/// `ServerMigrationFn` that modules can implement to "migrate" the database
+/// to the next database version.
+pub type ServerMigrationFn =
     for<'r, 'tx> fn(
         &'r mut DatabaseTransaction<'tx>,
-    ) -> Pin<Box<dyn futures::Future<Output = anyhow::Result<()>> + Send + 'r>>,
->;
+    ) -> Pin<Box<dyn futures::Future<Output = anyhow::Result<()>> + Send + 'r>>;
+
+/// Applies the database migrations to a non-isolated database.
+pub async fn apply_migrations_server(
+    db: &Database,
+    kind: String,
+    target_db_version: DatabaseVersion,
+    migrations: BTreeMap<DatabaseVersion, ServerMigrationFn>,
+) -> Result<(), anyhow::Error> {
+    apply_migrations(db, kind, target_db_version, migrations, None).await
+}
 
 /// `apply_migrations` iterates from the on disk database version for the module
 /// up to `target_db_version` and executes all of the migrations that exist in
-/// the `MigrationMap`. Each migration in `MigrationMap` updates the database to
-/// have the correct on-disk structures that the code is expecting. The entire
-/// migration process is atomic (i.e migration from 0->1 and 1->2 happen
-/// atomically). This function is called before the module is initialized and as
-/// long as the correct migrations are supplied in `MigrationMap`, the module
-/// will be able to read and write from the database successfully.
+/// the migrations map. Each migration in migrations map updates the
+/// database to have the correct on-disk structures that the code is expecting.
+/// The entire migration process is atomic (i.e migration from 0->1 and 1->2
+/// happen atomically). This function is called before the module is initialized
+/// and as long as the correct migrations are supplied in the migrations map,
+/// the module will be able to read and write from the database successfully.
 pub async fn apply_migrations(
     db: &Database,
     kind: String,
     target_db_version: DatabaseVersion,
-    migrations: MigrationMap,
+    migrations: BTreeMap<DatabaseVersion, ServerMigrationFn>,
+    module_instance_id: Option<ModuleInstanceId>,
 ) -> Result<(), anyhow::Error> {
-    let mut dbtx = db.begin_transaction().await;
-    let disk_version = dbtx.get_value(&DatabaseVersionKey).await;
+    // Newly created databases will not have any data since they have just been
+    // instantiated.
+    let mut dbtx = db.begin_transaction_nc().await;
+    let is_new_db = dbtx.raw_find_by_prefix(&[]).await?.next().await.is_none();
+
+    // First write the database version to disk if it does not exist.
+    create_database_version(
+        db,
+        target_db_version,
+        module_instance_id,
+        kind.clone(),
+        is_new_db,
+    )
+    .await?;
+
+    let mut global_dbtx = db.begin_transaction().await;
+    let module_instance_id_key = module_instance_id_or_global(module_instance_id);
+
+    let disk_version = global_dbtx
+        .get_value(&DatabaseVersionKey(module_instance_id_key))
+        .await;
 
     let db_version = if let Some(disk_version) = disk_version {
         let mut current_db_version = disk_version;
@@ -1840,47 +1937,152 @@ pub async fn apply_migrations(
 
         while current_db_version < target_db_version {
             if let Some(migration) = migrations.get(&current_db_version) {
-                info!(target: LOG_DB, "Migrating module {kind} from {current_db_version} to {target_db_version}");
-                migration(&mut dbtx.to_ref_nc()).await?;
+                info!(target: LOG_DB, ?kind, ?current_db_version, ?target_db_version, "Migrating module...");
+                if let Some(module_instance_id) = module_instance_id {
+                    migration(
+                        &mut global_dbtx
+                            .to_ref_with_prefix_module_id(module_instance_id)
+                            .into_nc(),
+                    )
+                    .await?;
+                } else {
+                    migration(&mut global_dbtx.to_ref_nc()).await?;
+                }
             } else {
-                panic!("Missing migration for version {current_db_version}");
+                warn!(target: LOG_DB, ?current_db_version, "Missing server db migration");
             }
 
             current_db_version.increment();
-            dbtx.insert_entry(&DatabaseVersionKey, &current_db_version)
+            global_dbtx
+                .insert_entry(
+                    &DatabaseVersionKey(module_instance_id_key),
+                    &current_db_version,
+                )
                 .await;
         }
 
         current_db_version
     } else {
-        dbtx.insert_entry(&DatabaseVersionKey, &target_db_version)
-            .await;
         target_db_version
     };
 
-    dbtx.commit_tx_result().await?;
-    info!(target: LOG_DB, "{} module db version: {}", kind, db_version);
+    global_dbtx.commit_tx_result().await?;
+    info!(target: LOG_DB, ?kind, ?db_version, "Migration complete");
     Ok(())
+}
+
+/// Creates the `DatabaseVersion` inside the database if it does not exist. If
+/// necessary, this function will migrate the legacy database version to the
+/// expected `DatabaseVersionKey`.
+pub async fn create_database_version(
+    db: &Database,
+    target_db_version: DatabaseVersion,
+    module_instance_id: Option<ModuleInstanceId>,
+    kind: String,
+    is_new_db: bool,
+) -> Result<(), anyhow::Error> {
+    let key_module_instance_id = module_instance_id_or_global(module_instance_id);
+
+    // First check if the module has a `DatabaseVersion` written to
+    // `DatabaseVersionKey`. If `DatabaseVersion` already exists, there is
+    // nothing to do.
+    let mut global_dbtx = db.begin_transaction().await;
+    if global_dbtx
+        .get_value(&DatabaseVersionKey(key_module_instance_id))
+        .await
+        .is_none()
+    {
+        // If it exists, read and remove the legacy `DatabaseVersion`, which used to be
+        // in the module's isolated namespace (but not for fedimint-server).
+        //
+        // Otherwise, if the previous database contains data and no legacy database
+        // version, use `DatabaseVersion(0)` so that all database migrations are
+        // run. Otherwise, this database can assumed to be new and can use
+        // `target_db_version` to skip the database migrations.
+        let current_version_in_module = if let Some(module_instance_id) = module_instance_id {
+            remove_current_db_version_if_exists(
+                &mut global_dbtx
+                    .to_ref_with_prefix_module_id(module_instance_id)
+                    .into_nc(),
+                is_new_db,
+                target_db_version,
+            )
+            .await
+        } else {
+            remove_current_db_version_if_exists(
+                &mut global_dbtx.to_ref().into_nc(),
+                is_new_db,
+                target_db_version,
+            )
+            .await
+        };
+
+        // Write the previous `DatabaseVersion` to the new `DatabaseVersionKey`
+        info!(target: LOG_DB, ?kind, ?current_version_in_module, ?target_db_version, ?is_new_db, "Creating DatabaseVersionKey...");
+        global_dbtx
+            .insert_new_entry(
+                &DatabaseVersionKey(key_module_instance_id),
+                &current_version_in_module,
+            )
+            .await;
+        global_dbtx.commit_tx_result().await?;
+    }
+
+    Ok(())
+}
+
+/// Removes `DatabaseVersion` from `DatabaseVersionKeyV0` if it exists and
+/// returns the current database version. If the current version does not
+/// exist, use `target_db_version` if the database is new. Otherwise, return
+/// `DatabaseVersion(0)` to ensure all migrations are run.
+async fn remove_current_db_version_if_exists(
+    version_dbtx: &mut DatabaseTransaction<'_>,
+    is_new_db: bool,
+    target_db_version: DatabaseVersion,
+) -> DatabaseVersion {
+    // Remove the previous `DatabaseVersion` in the isolated database. If it doesn't
+    // exist, just use the 0 for the version so that all of the migrations are
+    // executed.
+    let current_version_in_module = version_dbtx.remove_entry(&DatabaseVersionKeyV0).await;
+    match current_version_in_module {
+        Some(database_version) => database_version,
+        None if is_new_db => target_db_version,
+        None => DatabaseVersion(0),
+    }
+}
+
+/// Helper function to retrieve the `module_instance_id` for modules, otherwise
+/// return 0xff for the global namespace.
+fn module_instance_id_or_global(module_instance_id: Option<ModuleInstanceId>) -> ModuleInstanceId {
+    // Use 0xff for fedimint-server and the `module_instance_id` for each module
+    if let Some(module_instance_id) = module_instance_id {
+        module_instance_id
+    } else {
+        MODULE_GLOBAL_PREFIX.into()
+    }
 }
 
 #[allow(unused_imports)]
 mod test_utils {
+    use std::collections::BTreeMap;
     use std::time::Duration;
 
     use futures::{Future, FutureExt, StreamExt};
 
     use super::{
         apply_migrations, Database, DatabaseTransaction, DatabaseVersion, DatabaseVersionKey,
-        MigrationMap,
+        DatabaseVersionKeyV0, ServerMigrationFn,
     };
     use crate::core::ModuleKind;
     use crate::db::mem_impl::MemDatabase;
-    use crate::db::{IDatabaseTransactionOps, IDatabaseTransactionOpsCoreTyped};
+    use crate::db::{
+        IDatabaseTransactionOps, IDatabaseTransactionOpsCoreTyped, MODULE_GLOBAL_PREFIX,
+    };
     use crate::encoding::{Decodable, Encodable};
     use crate::module::registry::ModuleDecoderRegistry;
 
     pub async fn future_returns_shortly<F: Future>(fut: F) -> Option<F::Output> {
-        crate::task::timeout(Duration::from_millis(10), fut)
+        crate::runtime::timeout(Duration::from_millis(10), fut)
             .await
             .ok()
     }
@@ -2459,11 +2661,12 @@ mod test_utils {
                 .await;
         }
 
-        dbtx.insert_new_entry(&DatabaseVersionKey, &DatabaseVersion(0))
+        // Will also be migrated to `DatabaseVersionKey`
+        dbtx.insert_new_entry(&DatabaseVersionKeyV0, &DatabaseVersion(0))
             .await;
         dbtx.commit_tx().await;
 
-        let mut migrations = MigrationMap::new();
+        let mut migrations: BTreeMap<DatabaseVersion, ServerMigrationFn> = BTreeMap::new();
 
         migrations.insert(DatabaseVersion(0), move |dbtx| {
             migrate_test_db_version_0(dbtx).boxed()
@@ -2474,12 +2677,20 @@ mod test_utils {
             "TestModule".to_string(),
             DatabaseVersion(1),
             migrations,
+            None,
         )
         .await
         .expect("Error applying migrations for TestModule");
 
         // Verify that the migrations completed successfully
         let mut dbtx = db.begin_transaction().await;
+
+        // Verify that the old `DatabaseVersion` under `DatabaseVersionKeyV0` migrated
+        // to `DatabaseVersionKey`
+        assert!(dbtx
+            .get_value(&DatabaseVersionKey(MODULE_GLOBAL_PREFIX.into()))
+            .await
+            .is_some());
 
         // Verify Dummy module migration
         let test_keys = dbtx
@@ -2634,12 +2845,8 @@ where
         .await
         .expect("Error doing prefix search in database")
         .map(move |(key_bytes, value_bytes)| {
-            let key = KP::Record::from_bytes(&key_bytes, &decoders)
-                .with_context(|| anyhow::anyhow!("key: {}", AbbreviateHexBytes(&key_bytes)))
-                .expect("Unrecoverable error reading DatabaseKey");
-            let value = decode_value(&value_bytes, &decoders)
-                .with_context(|| anyhow::anyhow!("key: {}", AbbreviateHexBytes(&key_bytes)))
-                .expect("Unrecoverable decoding DatabaseValue");
+            let key = decode_key_expect(&key_bytes, &decoders);
+            let value = decode_value_expect(&value_bytes, &decoders, &key_bytes);
             (key, value)
         })
 }
@@ -2650,7 +2857,7 @@ mod tests {
 
     use super::mem_impl::MemDatabase;
     use super::*;
-    use crate::task::spawn;
+    use crate::runtime::spawn;
 
     async fn waiter(db: &Database, key: TestKey) -> tokio::task::JoinHandle<TestVal> {
         let db = db.clone();
@@ -2659,8 +2866,7 @@ mod tests {
             let sub = db.wait_key_exists(&key);
             tx.send(()).unwrap();
             sub.await
-        })
-        .expect("some handle on non-wasm");
+        });
         rx.await.unwrap();
         join_handle
     }

@@ -54,7 +54,7 @@
 //!
 //! [`ApiVersion`] and [`MultiApiVersion`] is used for API versioning.
 use std::collections::BTreeMap;
-use std::result;
+use std::{cmp, result};
 
 use serde::{Deserialize, Serialize};
 
@@ -149,6 +149,32 @@ pub struct ApiVersion {
     /// * For servers this means *maximum* supported minor version of the
     ///   `major` version implemented by the server implementation
     pub minor: u32,
+}
+
+impl ApiVersion {
+    pub const fn new(major: u32, minor: u32) -> Self {
+        Self { major, minor }
+    }
+}
+
+/// ```
+/// use fedimint_core::module::ApiVersion;
+/// assert!(ApiVersion { major: 3, minor: 3 } < ApiVersion { major: 4, minor: 0 });
+/// assert!(ApiVersion { major: 3, minor: 3 } < ApiVersion { major: 3, minor: 5 });
+/// assert!(ApiVersion { major: 3, minor: 3 } == ApiVersion { major: 3, minor: 3 });
+/// ```
+impl cmp::PartialOrd for ApiVersion {
+    fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl cmp::Ord for ApiVersion {
+    fn cmp(&self, other: &Self) -> cmp::Ordering {
+        self.major
+            .cmp(&other.major)
+            .then(self.minor.cmp(&other.minor))
+    }
 }
 
 /// Multiple, disjoint, minimum required or maximum supported, [`ApiVersion`]s.
@@ -342,6 +368,24 @@ pub struct SupportedCoreApiVersions {
     pub api: MultiApiVersion,
 }
 
+impl SupportedCoreApiVersions {
+    /// Get minor supported version by consensus and major numbers
+    pub fn get_minor_api_version(
+        &self,
+        core_consensus: CoreConsensusVersion,
+        major: u32,
+    ) -> Option<u32> {
+        if self.core_consensus.major != core_consensus.major {
+            return None;
+        }
+
+        self.api.get_by_major(major).map(|v| {
+            debug_assert_eq!(v.major, major);
+            v.minor
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupportedModuleApiVersions {
     pub core_consensus: CoreConsensusVersion,
@@ -369,6 +413,27 @@ impl SupportedModuleApiVersions {
                 "overlapping (conflicting) api versions when declaring SupportedModuleApiVersions",
             ),
         }
+    }
+
+    /// Get minor supported version by consensus and major numbers
+    pub fn get_minor_api_version(
+        &self,
+        core_consensus: CoreConsensusVersion,
+        module_consensus: ModuleConsensusVersion,
+        major: u32,
+    ) -> Option<u32> {
+        if self.core_consensus.major != core_consensus.major {
+            return None;
+        }
+
+        if self.module_consensus.major != module_consensus.major {
+            return None;
+        }
+
+        self.api.get_by_major(major).map(|v| {
+            debug_assert_eq!(v.major, major);
+            v.minor
+        })
     }
 }
 

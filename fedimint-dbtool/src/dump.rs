@@ -11,14 +11,12 @@ use fedimint_core::db::{
     Database, DatabaseVersionKey, IDatabaseTransactionOpsCore, IDatabaseTransactionOpsCoreTyped,
 };
 use fedimint_core::encoding::Encodable;
-use fedimint_core::module::__reexports::serde_json;
 use fedimint_core::module::registry::ModuleDecoderRegistry;
 use fedimint_core::push_db_pair_items_no_serde;
 use fedimint_rocksdb::RocksDbReadOnly;
 use fedimint_server::config::io::read_server_config;
 use fedimint_server::config::ServerConfig;
 use fedimint_server::db as ConsensusRange;
-use fedimint_server::db::DbKeyPrefix;
 use futures::StreamExt;
 use ln_gateway::Gateway;
 use strum::IntoEnumIterator;
@@ -136,6 +134,7 @@ impl DatabaseDump {
             return Ok(());
         }
         let mut dbtx = self.read_only.begin_transaction().await;
+        let db_version = dbtx.get_value(&DatabaseVersionKey(*module_id)).await;
         let mut isolated_dbtx = dbtx.to_ref_with_prefix_module_id(*module_id);
 
         match inits.get(kind) {
@@ -174,7 +173,6 @@ impl DatabaseDump {
                     .await
                     .collect::<BTreeMap<String, _>>();
 
-                let db_version = isolated_dbtx.get_value(&DatabaseVersionKey).await;
                 if let Some(db_version) = db_version {
                     module_serialized.insert("Version".to_string(), Box::new(db_version));
                 } else {
@@ -293,16 +291,6 @@ impl DatabaseDump {
                         Vec<u8>,
                         consensus,
                         "Aleph Units"
-                    );
-                }
-                DbKeyPrefix::SignedSessionOutcomeCount => {
-                    push_db_pair_items_no_serde!(
-                        dbtx,
-                        ConsensusRange::SignedSessionOutcomeCountKey,
-                        ConsensusRange::SignedSessionOutcomeCountKey,
-                        u64,
-                        consensus,
-                        "Signed Session Count"
                     );
                 }
                 // Module is a global prefix for all module data

@@ -11,7 +11,6 @@ use fedimint_core::encoding::{Decodable, Encodable};
 use fedimint_core::task::sleep;
 use fedimint_core::time::duration_since_epoch;
 use fedimint_core::{Amount, OutPoint, TransactionId};
-use fedimint_ln_common::api::LnFederationApi;
 use fedimint_ln_common::contracts::outgoing::OutgoingContractData;
 use fedimint_ln_common::contracts::{ContractId, IdentifiableContract};
 use fedimint_ln_common::route_hints::RouteHint;
@@ -23,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::{debug, error, warn};
 
+use crate::api::LnFederationApi;
 use crate::{set_payment_result, LightningClientStateMachines, PayType};
 
 const GATEWAY_API_TIMEOUT: Duration = Duration::from_secs(30);
@@ -46,7 +46,7 @@ const RETRY_DELAY: Duration = Duration::from_secs(1);
 ///  Refund -- await transaction rejected --> Failure
 /// ```
 #[allow(clippy::large_enum_variant)]
-#[derive(Debug, Clone, Eq, PartialEq, Decodable, Encodable)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Decodable, Encodable)]
 pub enum LightningPayStates {
     CreatedOutgoingLnContract(LightningPayCreatedOutgoingLnContract),
     Canceled,
@@ -58,7 +58,7 @@ pub enum LightningPayStates {
     Failure(String),
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Decodable, Encodable)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Decodable, Encodable)]
 pub struct LightningPayCommon {
     pub operation_id: OperationId,
     pub federation_id: FederationId,
@@ -68,7 +68,7 @@ pub struct LightningPayCommon {
     pub invoice: lightning_invoice::Bolt11Invoice,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Decodable, Encodable)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Decodable, Encodable)]
 pub struct LightningPayStateMachine {
     pub common: LightningPayCommon,
     pub state: LightningPayStates,
@@ -76,12 +76,11 @@ pub struct LightningPayStateMachine {
 
 impl State for LightningPayStateMachine {
     type ModuleContext = LightningClientContext;
-    type GlobalContext = DynGlobalClientContext;
 
     fn transitions(
         &self,
         context: &Self::ModuleContext,
-        global_context: &Self::GlobalContext,
+        global_context: &DynGlobalClientContext,
     ) -> Vec<StateTransition<Self>> {
         match &self.state {
             LightningPayStates::CreatedOutgoingLnContract(created_outgoing_ln_contract) => {
@@ -97,7 +96,7 @@ impl State for LightningPayStateMachine {
             LightningPayStates::Refundable(refundable) => {
                 refundable.transitions(self.common.clone(), global_context.clone())
             }
-            LightningPayStates::Refund(refund) => refund.transitions(&self.common, global_context),
+            LightningPayStates::Refund(refund) => refund.transitions(global_context),
             LightningPayStates::Refunded(_) => {
                 vec![]
             }
@@ -112,7 +111,7 @@ impl State for LightningPayStateMachine {
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Decodable, Encodable)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Decodable, Encodable)]
 pub struct LightningPayCreatedOutgoingLnContract {
     pub funding_txid: TransactionId,
     pub contract_id: ContractId,
@@ -170,8 +169,12 @@ impl LightningPayCreatedOutgoingLnContract {
                 }
                 Err(e) => {
                     e.report_if_important();
+
                     debug!(
-                        "Awaiting output outcome failed, retrying in {}s",
+                        error = e.to_string(),
+                        transaction_id = txid.to_string(),
+                        contract_id = contract_id.to_string(),
+                        "Retrying in {}s",
                         RETRY_DELAY.as_secs_f64()
                     );
                     sleep(RETRY_DELAY).await;
@@ -240,14 +243,16 @@ impl LightningPayCreatedOutgoingLnContract {
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Decodable, Encodable)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Decodable, Encodable)]
 pub struct LightningPayFunded {
     payload: PayInvoicePayload,
     gateway: LightningGateway,
     timelock: u32,
 }
 
-#[derive(Error, Debug, Serialize, Deserialize, Encodable, Decodable, Clone, Eq, PartialEq)]
+#[derive(
+    Error, Debug, Hash, Serialize, Deserialize, Encodable, Decodable, Clone, Eq, PartialEq,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum GatewayPayError {
     #[error("Lightning Gateway failed to pay invoice. ErrorCode: {error_code:?} ErrorMessage: {error_message}")]
@@ -386,7 +391,7 @@ impl LightningPayFunded {
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Decodable, Encodable)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Decodable, Encodable)]
 pub struct LightningPayRefundable {
     contract_id: ContractId,
     pub block_timelock: u32,
@@ -500,7 +505,7 @@ impl LightningPayRefundable {
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Decodable, Encodable)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Decodable, Encodable)]
 pub struct LightningPayRefund {
     txid: TransactionId,
     out_points: Vec<OutPoint>,
@@ -509,12 +514,11 @@ pub struct LightningPayRefund {
 impl LightningPayRefund {
     fn transitions(
         &self,
-        common: &LightningPayCommon,
         global_context: &DynGlobalClientContext,
     ) -> Vec<StateTransition<LightningPayStateMachine>> {
         let refund_out_points = self.out_points.clone();
         vec![StateTransition::new(
-            Self::await_refund_success(common.clone(), global_context.clone(), self.txid),
+            Self::await_refund_success(global_context.clone(), self.txid),
             move |_dbtx, result, old_state| {
                 let refund_out_points = refund_out_points.clone();
                 Box::pin(Self::transition_refund_success(
@@ -527,15 +531,12 @@ impl LightningPayRefund {
     }
 
     async fn await_refund_success(
-        common: LightningPayCommon,
         global_context: DynGlobalClientContext,
         refund_txid: TransactionId,
     ) -> Result<(), String> {
         // No network calls are done here, we just await other state machines, so no
         // retry logic is needed
-        global_context
-            .await_tx_accepted(common.operation_id, refund_txid)
-            .await
+        global_context.await_tx_accepted(refund_txid).await
     }
 
     async fn transition_refund_success(
@@ -564,7 +565,7 @@ impl LightningPayRefund {
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Decodable, Encodable)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize, Decodable, Encodable)]
 pub struct PayInvoicePayload {
     pub federation_id: FederationId,
     pub contract_id: ContractId,
@@ -597,7 +598,7 @@ impl PayInvoicePayload {
 
 /// Data needed to pay an invoice, may be the whole invoice or only the required
 /// parts of it.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Decodable, Encodable)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize, Decodable, Encodable)]
 #[serde(rename_all = "snake_case")]
 pub enum PaymentData {
     Invoice(Bolt11Invoice),

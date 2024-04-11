@@ -9,30 +9,31 @@ mod oob;
 /// State machines for mint outputs
 pub mod output;
 
-use std::cmp::{self, Ordering};
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
+use std::ffi;
 use std::fmt::{Display, Formatter};
 use std::io::Read;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use std::{ffi, ops};
 
 use anyhow::{anyhow, bail, ensure, Context as _};
 use async_stream::stream;
+use backup::recovery::MintRecovery;
+use base64::Engine as _;
 use bitcoin_hashes::{sha256, sha256t, Hash, HashEngine as BitcoinHashEngine};
 use client_db::DbKeyPrefix;
 use fedimint_client::module::init::{
     ClientModuleInit, ClientModuleInitArgs, ClientModuleRecoverArgs,
 };
-use fedimint_client::module::recovery::RecoveryProgress;
 use fedimint_client::module::{ClientContext, ClientModule, IClientModule};
 use fedimint_client::oplog::{OperationLogEntry, UpdateStreamOrOutcome};
 use fedimint_client::sm::util::MapStateTransitions;
 use fedimint_client::sm::{Context, DynState, ModuleNotifier, State, StateTransition};
 use fedimint_client::transaction::{ClientInput, ClientOutput, TransactionBuilder};
 use fedimint_client::{sm_enum_variant_translation, DynGlobalClientContext};
-use fedimint_core::api::DynGlobalApi;
+use fedimint_core::api::InviteCode;
 use fedimint_core::config::{FederationId, FederationIdPrefix};
 use fedimint_core::core::{Decoder, IntoDynInstance, ModuleInstanceId, OperationId};
 use fedimint_core::db::{
@@ -44,31 +45,29 @@ use fedimint_core::module::registry::ModuleDecoderRegistry;
 use fedimint_core::module::{
     ApiVersion, CommonModuleInit, ModuleCommon, ModuleInit, MultiApiVersion, TransactionItemAmount,
 };
-use fedimint_core::session_outcome::SessionOutcome;
-use fedimint_core::util::{BoxFuture, BoxStream, NextOrPending};
+use fedimint_core::util::{BoxFuture, BoxStream, NextOrPending, SafeUrl};
 use fedimint_core::{
     apply, async_trait_maybe_send, push_db_pair_items, Amount, OutPoint, PeerId, Tiered,
     TieredMulti, TieredSummary, TransactionId,
 };
 use fedimint_derive_secret::{ChildId, DerivableSecret};
-use fedimint_logging::LOG_CLIENT_RECOVERY_MINT;
+use fedimint_logging::LOG_CLIENT_MODULE_MINT;
 pub use fedimint_mint_common as common;
 use fedimint_mint_common::config::MintClientConfig;
 pub use fedimint_mint_common::*;
 use futures::{pin_mut, StreamExt};
-use rand::{thread_rng, Rng};
+use hex::ToHex;
 use secp256k1::{All, KeyPair, Secp256k1};
 use serde::{Deserialize, Serialize};
 use strum::IntoEnumIterator;
 use tbs::AggregatePublicKey;
 use thiserror::Error;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
-use crate::backup::recovery::MintRecoveryState;
-use crate::backup::{EcashBackup, EcashBackupV0};
+use crate::backup::EcashBackup;
 use crate::client_db::{
     CancelledOOBSpendKey, CancelledOOBSpendKeyPrefix, NextECashNoteIndexKey,
-    NextECashNoteIndexKeyPrefix, NoteKey, NoteKeyPrefix, RestoreStateKey,
+    NextECashNoteIndexKeyPrefix, NoteKey, NoteKeyPrefix,
 };
 use crate::input::{
     MintInputCommon, MintInputStateCreated, MintInputStateMachine, MintInputStates,
@@ -90,13 +89,21 @@ pub const LOG_TARGET: &str = "client::module::mint";
 /// ## Invariants
 /// * Has to contain at least one `Notes` item
 /// * Has to contain at least one `FederationIdPrefix` item
-#[derive(Clone, Debug, Encodable)]
+#[derive(Clone, Debug, Encodable, PartialEq, Eq)]
 pub struct OOBNotes(Vec<OOBNotesData>);
 
-#[derive(Clone, Debug, Decodable, Encodable)]
+#[derive(Clone, Debug, Decodable, Encodable, PartialEq, Eq)]
 enum OOBNotesData {
     Notes(TieredMulti<SpendableNote>),
     FederationIdPrefix(FederationIdPrefix),
+    /// Invite code to join the federation by which the e-cash was issued
+    ///
+    /// Introduce in 0.3.0
+    Invite {
+        // This is a vec for future-proofness, in case we want to include multiple guardian APIs
+        peer_apis: Vec<(PeerId, SafeUrl)>,
+        federation_id: FederationId,
+    },
     #[encodable_default]
     Default {
         variant: u64,
@@ -115,11 +122,25 @@ impl OOBNotes {
         ])
     }
 
+    pub fn new_with_invite(notes: TieredMulti<SpendableNote>, invite: InviteCode) -> Self {
+        Self(vec![
+            // FIXME: once we can break compatibility with 0.2 we can remove the prefix in case an
+            // invite is present
+            OOBNotesData::FederationIdPrefix(invite.federation_id().to_prefix()),
+            OOBNotesData::Notes(notes),
+            OOBNotesData::Invite {
+                peer_apis: vec![(invite.peer(), invite.url())],
+                federation_id: invite.federation_id(),
+            },
+        ])
+    }
+
     pub fn federation_id_prefix(&self) -> FederationIdPrefix {
         self.0
             .iter()
             .find_map(|data| match data {
                 OOBNotesData::FederationIdPrefix(prefix) => Some(*prefix),
+                OOBNotesData::Invite { federation_id, .. } => Some(federation_id.to_prefix()),
                 _ => None,
             })
             .expect("Invariant violated: OOBNotes does not contain a FederationIdPrefix")
@@ -133,6 +154,61 @@ impl OOBNotes {
                 _ => None,
             })
             .expect("Invariant violated: OOBNotes does not contain any notes")
+    }
+
+    pub fn notes_json(&self) -> Result<serde_json::Value, serde_json::Error> {
+        let mut notes_map = serde_json::Map::new();
+        for notes in self.0.iter() {
+            match notes {
+                OOBNotesData::Notes(notes) => {
+                    let notes_json = serde_json::to_value(notes)?;
+                    notes_map.insert("notes".to_string(), notes_json);
+                }
+                OOBNotesData::FederationIdPrefix(prefix) => {
+                    notes_map.insert(
+                        "federation_id_prefix".to_string(),
+                        serde_json::to_value(prefix.to_string())?,
+                    );
+                }
+                OOBNotesData::Invite {
+                    peer_apis,
+                    federation_id,
+                } => {
+                    let (peer_id, api) = peer_apis
+                        .first()
+                        .cloned()
+                        .expect("Decoding makes sure peer_apis isn't empty");
+                    notes_map.insert(
+                        "invite".to_string(),
+                        serde_json::to_value(InviteCode::new(api, peer_id, *federation_id))?,
+                    );
+                }
+                OOBNotesData::Default { variant, bytes } => {
+                    notes_map.insert(
+                        format!("default_{}", variant),
+                        serde_json::to_value(bytes.encode_hex::<String>())?,
+                    );
+                }
+            }
+        }
+        Ok(serde_json::Value::Object(notes_map))
+    }
+
+    pub fn federation_invite(&self) -> Option<InviteCode> {
+        self.0.iter().find_map(|data| {
+            let OOBNotesData::Invite {
+                peer_apis,
+                federation_id,
+            } = data
+            else {
+                return None;
+            };
+            let (peer_id, api) = peer_apis
+                .first()
+                .cloned()
+                .expect("Decoding makes sure peer_apis isn't empty");
+            Some(InviteCode::new(api, peer_id, *federation_id))
+        })
     }
 }
 
@@ -153,25 +229,60 @@ impl Decodable for OOBNotes {
             ));
         }
 
-        if !inner
-            .iter()
-            .any(|data| matches!(data, OOBNotesData::FederationIdPrefix(_)))
-        {
-            return Err(DecodeError::from_str(
-                "No Federation ID provided in OOBNotes data",
-            ));
+        let maybe_federation_id_prefix = inner.iter().find_map(|data| match data {
+            OOBNotesData::FederationIdPrefix(prefix) => Some(*prefix),
+            _ => None,
+        });
+
+        let maybe_invite = inner.iter().find_map(|data| match data {
+            OOBNotesData::Invite {
+                federation_id,
+                peer_apis,
+            } => Some((federation_id, peer_apis)),
+            _ => None,
+        });
+
+        match (maybe_federation_id_prefix, maybe_invite) {
+            (Some(p), Some((ip, _))) => {
+                if p != ip.to_prefix() {
+                    return Err(DecodeError::from_str(
+                        "Inconsistent Federation ID provided in OOBNotes data",
+                    ));
+                }
+            }
+            (None, None) => {
+                return Err(DecodeError::from_str(
+                    "No Federation ID provided in OOBNotes data",
+                ));
+            }
+            _ => {}
+        }
+
+        if let Some((_, invite)) = maybe_invite {
+            if invite.is_empty() {
+                return Err(DecodeError::from_str("Invite didn't contain API endpoints"));
+            }
         }
 
         Ok(OOBNotes(inner))
     }
 }
 
+const BASE64_URL_SAFE: base64::engine::GeneralPurpose = base64::engine::GeneralPurpose::new(
+    &base64::alphabet::URL_SAFE,
+    base64::engine::general_purpose::PAD,
+);
+
 impl FromStr for OOBNotes {
     type Err = anyhow::Error;
 
     /// Decode a set of out-of-band e-cash notes from a base64 string.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let bytes = base64::decode(s)?;
+        let bytes = if let Ok(bytes) = BASE64_URL_SAFE.decode(s) {
+            bytes
+        } else {
+            base64::engine::general_purpose::STANDARD.decode(s)?
+        };
         let oob_notes: OOBNotes = Decodable::consensus_decode(
             &mut std::io::Cursor::new(bytes),
             &ModuleDecoderRegistry::default(),
@@ -188,7 +299,7 @@ impl Display for OOBNotes {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let mut bytes = Vec::new();
         Encodable::consensus_encode(self, &mut bytes).expect("encodes correctly");
-        f.write_str(&base64::encode(&bytes))
+        f.write_str(&base64::engine::general_purpose::STANDARD.encode(&bytes))
     }
 }
 
@@ -266,11 +377,22 @@ pub struct MintOperationMeta {
     pub extra_meta: serde_json::Value,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum MintOperationMetaVariant {
+    // TODO: add migrations for operation log and clean up schema
+    /// Either `legacy_out_point` or both `txid` and `out_point_indices` will be
+    /// present.
     Reissuance {
-        out_point: OutPoint,
+        // Removed in 0.3.0:
+        #[serde(skip_serializing, default, rename = "out_point")]
+        legacy_out_point: Option<OutPoint>,
+        // Introduced in 0.3.0:
+        #[serde(default)]
+        txid: Option<TransactionId>,
+        // Introduced in 0.3.0:
+        #[serde(default)]
+        out_point_indices: Vec<u64>,
     },
     SpendOOB {
         requested_amount: Amount,
@@ -281,9 +403,9 @@ pub enum MintOperationMetaVariant {
 #[derive(Debug, Clone)]
 pub struct MintClientInit;
 
-#[apply(async_trait_maybe_send!)]
 impl ModuleInit for MintClientInit {
     type Common = MintCommonInit;
+    const DATABASE_VERSION: DatabaseVersion = DatabaseVersion(0);
 
     async fn dump_database(
         &self,
@@ -328,7 +450,8 @@ impl ModuleInit for MintClientInit {
                         "CancelledOOBSpendKey"
                     );
                 }
-                DbKeyPrefix::RestoreState => {}
+                DbKeyPrefix::RecoveryState => {}
+                DbKeyPrefix::RecoveryFinalized => {}
             }
         }
 
@@ -339,7 +462,6 @@ impl ModuleInit for MintClientInit {
 #[apply(async_trait_maybe_send!)]
 impl ClientModuleInit for MintClientInit {
     type Module = MintClientModule;
-    const DATABASE_VERSION: DatabaseVersion = DatabaseVersion(0);
 
     fn supported_api_versions(&self) -> MultiApiVersion {
         MultiApiVersion::try_from_iter([ApiVersion { major: 0, minor: 0 }])
@@ -347,11 +469,6 @@ impl ClientModuleInit for MintClientInit {
     }
 
     async fn init(&self, args: &ClientModuleInitArgs<Self>) -> anyhow::Result<Self::Module> {
-        assert!(
-            Self::load_recovery_state(args.db()).await.is_none(),
-            "recovery state must be empty on mint init"
-        );
-
         Ok(MintClientModule {
             federation_id: *args.federation_id(),
             cfg: args.cfg().clone(),
@@ -367,225 +484,7 @@ impl ClientModuleInit for MintClientInit {
         args: &ClientModuleRecoverArgs<Self>,
         snapshot: Option<&<Self::Module as ClientModule>::Backup>,
     ) -> anyhow::Result<()> {
-        let snapshot_v0 = match snapshot {
-            Some(EcashBackup::V0(snapshot_v0)) => Some(snapshot_v0),
-            Some(EcashBackup::Default { variant, .. }) => {
-                return Err(anyhow!("Unsupported backup variant: {variant}"))
-            }
-            None => None,
-        };
-
-        Self::recover_inner(args, snapshot_v0.cloned()).await
-    }
-}
-
-impl MintClientInit {
-    async fn load_recovery_state(db: &Database) -> Option<MintRecoveryState> {
-        db.begin_transaction_nc()
-            .await
-            .get_value(&RestoreStateKey)
-            .await
-    }
-
-    async fn recover_inner(
-        args: &ClientModuleRecoverArgs<Self>,
-        snapshot: Option<EcashBackupV0>,
-    ) -> anyhow::Result<()> {
-        let snapshot = snapshot.unwrap_or(EcashBackupV0::new_empty());
-        let client_ctx = args.context();
-        let config = args.cfg();
-        let db = args.db().clone();
-
-        let current_session_count = client_ctx.global_api().session_count().await?;
-        let secret = args.module_root_secret().clone();
-
-        let mut state = if let Some(state) = Self::load_recovery_state(&db).await {
-            state
-        } else {
-            MintRecoveryState::from_backup(
-                current_session_count,
-                snapshot,
-                30,
-                config.tbs_pks.clone(),
-                config.peer_tbs_pks.clone(),
-                &secret,
-            )
-        };
-
-        debug!(target: LOG_TARGET, "Creating MintRestoreStateMachine");
-
-        let mut block_stream = Self::fetch_block_stream(
-            args.api().clone(),
-            client_ctx.decoders(),
-            state.next_epoch..state.end_epoch,
-        );
-
-        while !state.is_done() {
-            state = state.make_progress(secret.clone(), &mut block_stream).await;
-
-            let mut dbtx = db.begin_transaction().await;
-
-            dbtx.insert_entry(&RestoreStateKey, &state).await;
-            dbtx.commit_tx().await;
-            args.update_recovery_progress(RecoveryProgress {
-                complete: (state.next_epoch - state.start_epoch)
-                    .try_into()
-                    .unwrap_or(u32::MAX),
-                total: (state.end_epoch - state.start_epoch)
-                    .try_into()
-                    .unwrap_or(u32::MAX),
-            })
-            .await
-        }
-
-        Self::finalize_state_restore(state, client_ctx).await?;
-
-        Ok(())
-    }
-
-    async fn finalize_state_restore(
-        state: MintRecoveryState,
-        client_ctx: ClientContext<MintClientModule>,
-    ) -> Result<(), anyhow::Error> {
-        debug!(
-            target: LOG_CLIENT_RECOVERY_MINT,
-            ?state,
-            "Finalizing restore"
-        );
-
-        let finalized = state.finalize();
-
-        let restored_amount = finalized
-            .unconfirmed_notes
-            .iter()
-            .map(|entry| entry.1)
-            .sum::<Amount>()
-            + finalized.spendable_notes.total_amount();
-
-        info!(amount = %restored_amount, "Finalizing mint recovery");
-
-        let finalized = &finalized;
-
-        client_ctx
-            .clone()
-            .module_autocommit_2(
-                move |dbtx, _| {
-                    Box::pin(async move {
-                        let finalized = finalized.clone();
-                        dbtx.module_dbtx().remove_entry(&RestoreStateKey).await;
-
-                        debug!(
-                            target: LOG_CLIENT_RECOVERY_MINT,
-                            len = finalized.spendable_notes.count_items(),
-                            "Restoring spendable notes"
-                        );
-                        for (amount, note) in finalized.spendable_notes {
-                            let key = NoteKey {
-                                amount,
-                                nonce: note.nonce(),
-                            };
-                            dbtx.module_dbtx().insert_new_entry(&key, &note).await;
-                        }
-
-                        for (amount, note_idx) in finalized.next_note_idx.iter() {
-                            debug!(
-                                target: LOG_CLIENT_RECOVERY_MINT,
-                                %amount,
-                                %note_idx,
-                                "Restoring NextECashNodeIndex"
-                            );
-                            dbtx.module_dbtx()
-                                .insert_entry(&NextECashNoteIndexKey(amount), &note_idx.as_u64())
-                                .await;
-                        }
-
-                        debug!(
-                            target: LOG_CLIENT_RECOVERY_MINT,
-                            len = finalized.unconfirmed_notes.len(),
-                            "Restoring unconfigured notes state machines"
-                        );
-
-                        for (out_point, amount, issuance_request) in finalized.unconfirmed_notes {
-                            let client_ctx = dbtx.client_ctx();
-                            dbtx.add_state_machines(
-                                client_ctx
-                                    .map_dyn(vec![MintClientStateMachines::Output(
-                                        MintOutputStateMachine {
-                                            common: MintOutputCommon {
-                                                operation_id: OperationId::new_random(),
-                                                out_point,
-                                            },
-                                            state: crate::output::MintOutputStates::Created(
-                                                MintOutputStatesCreated {
-                                                    amount,
-                                                    issuance_request,
-                                                },
-                                            ),
-                                        },
-                                    )])
-                                    .collect(),
-                            )
-                            .await?;
-                        }
-
-                        debug!(
-                            target: LOG_CLIENT_RECOVERY_MINT,
-                            "Mint module recovery finalized"
-                        );
-
-                        Ok(())
-                    })
-                },
-                None,
-            )
-            .await?;
-        Ok(())
-    }
-
-    /// Fetch epochs in a given range and send them over `sender`
-    ///
-    /// Since WASM's `spawn` does not support join handles, we indicate
-    /// errors via `sender` itself.
-    ///
-    /// TODO: could be internal to recovery_loop?
-    fn fetch_block_stream<'a>(
-        api: DynGlobalApi,
-        decoders: ModuleDecoderRegistry,
-        epoch_range: ops::Range<u64>,
-    ) -> impl futures::Stream<Item = (u64, SessionOutcome)> + 'a {
-        // How many request for blocks to run in parallel (streaming).
-        const PARALLISM_LEVEL: usize = 8;
-
-        futures::stream::iter(epoch_range)
-            .map(move |block_idx| {
-                let api = api.clone();
-                let decoders = decoders.clone();
-                Box::pin(async move {
-                    info!(block_idx, "Fetching epoch");
-
-                    let mut retry_sleep = Duration::from_millis(10);
-                    let block = loop {
-                        info!(target: LOG_CLIENT_RECOVERY_MINT, block_idx, "Awaiting signed block");
-                        match api.await_block(block_idx, &decoders).await {
-                            Ok(block) => break block,
-                            Err(e) => {
-                                info!(e = %e, block_idx, "Error trying to fetch signed block");
-                                // We don't want PARALLISM_LEVEL tasks hammering Federation
-                                // with requests, so max sleep is significant
-                                const MAX_SLEEP: Duration = Duration::from_secs(120);
-                                if retry_sleep <= MAX_SLEEP {
-                                    retry_sleep = retry_sleep
-                                        + thread_rng().gen_range(Duration::ZERO..=retry_sleep);
-                                }
-                                fedimint_core::task::sleep(cmp::min(retry_sleep, MAX_SLEEP)).await;
-                            }
-                        }
-                    };
-
-                    (block_idx, block)
-                })
-            })
-            .buffered(PARALLISM_LEVEL)
+        args.recover_from_history::<MintRecovery>(snapshot).await
     }
 }
 
@@ -620,7 +519,7 @@ pub struct MintClientModule {
     cfg: MintClientConfig,
     secret: DerivableSecret,
     secp: Secp256k1<All>,
-    notifier: ModuleNotifier<DynGlobalClientContext, MintClientStateMachines>,
+    notifier: ModuleNotifier<MintClientStateMachines>,
     client_ctx: ClientContext<Self>,
 }
 
@@ -729,7 +628,7 @@ impl ClientModule for MintClientModule {
                         bail!("Reissue failed: {e}");
                     }
 
-                    info!("Update: {:?}", update);
+                    debug!(target: LOG_CLIENT_MODULE_MINT, ?update, "Reissue external notes update");
                 }
 
                 Ok(serde_json::to_value(amount).unwrap())
@@ -957,10 +856,15 @@ impl MintClientModule {
             "zero-amount inputs are not supported"
         );
 
-        let spendable_selected_notes =
-            Self::select_notes(dbtx, &SelectNotesWithAtleastAmount, min_amount).await?;
+        let selected_notes = Self::select_notes(
+            dbtx,
+            &SelectNotesWithAtleastAmount,
+            min_amount,
+            self.cfg.fee_consensus.note_spend_abs,
+        )
+        .await?;
 
-        for (amount, note) in spendable_selected_notes.iter_items() {
+        for (amount, note) in selected_notes.iter_items() {
             dbtx.remove_entry(&NoteKey {
                 amount,
                 nonce: note.nonce(),
@@ -968,7 +872,7 @@ impl MintClientModule {
             .await;
         }
 
-        self.create_input_from_notes(operation_id, spendable_selected_notes)
+        self.create_input_from_notes(operation_id, selected_notes)
             .await
     }
 
@@ -1021,7 +925,7 @@ impl MintClientModule {
         &self,
         dbtx: &mut DatabaseTransaction<'_>,
         notes_selector: &impl NotesSelector<SpendableNote>,
-        requested_amount: Amount,
+        amount: Amount,
         try_cancel_after: Duration,
     ) -> anyhow::Result<(
         OperationId,
@@ -1029,16 +933,15 @@ impl MintClientModule {
         TieredMulti<SpendableNote>,
     )> {
         ensure!(
-            requested_amount > Amount::ZERO,
+            amount > Amount::ZERO,
             "zero-amount out-of-band spends are not supported"
         );
 
-        let spendable_selected_notes =
-            Self::select_notes(dbtx, notes_selector, requested_amount).await?;
+        let selected_notes = Self::select_notes(dbtx, notes_selector, amount, Amount::ZERO).await?;
 
-        let operation_id = spendable_notes_to_operation_id(&spendable_selected_notes);
+        let operation_id = spendable_notes_to_operation_id(&selected_notes);
 
-        for (amount, note) in spendable_selected_notes.iter_items() {
+        for (amount, note) in selected_notes.iter_items() {
             dbtx.remove_entry(&NoteKey {
                 amount,
                 nonce: note.nonce(),
@@ -1048,7 +951,7 @@ impl MintClientModule {
 
         let mut state_machines = Vec::new();
 
-        for (amount, spendable_note) in spendable_selected_notes.clone() {
+        for (amount, spendable_note) in selected_notes.clone() {
             state_machines.push(MintClientStateMachines::OOB(MintOOBStateMachine {
                 operation_id,
                 state: MintOOBStates::Created(MintOOBStatesCreated {
@@ -1059,7 +962,7 @@ impl MintClientModule {
             }));
         }
 
-        Ok((operation_id, state_machines, spendable_selected_notes))
+        Ok((operation_id, state_machines, selected_notes))
     }
 
     pub async fn await_spend_oob_refund(&self, operation_id: OperationId) -> SpendOOBRefund {
@@ -1094,13 +997,15 @@ impl MintClientModule {
         dbtx: &mut DatabaseTransaction<'_>,
         notes_selector: &impl NotesSelector<SpendableNote>,
         requested_amount: Amount,
+        fee_per_note_input: Amount,
     ) -> anyhow::Result<TieredMulti<SpendableNote>> {
         let note_stream = dbtx
             .find_by_prefix_sorted_descending(&NoteKeyPrefix)
             .await
             .map(|(key, note)| (key.amount, note));
+
         notes_selector
-            .select_notes(note_stream, requested_amount)
+            .select_notes(note_stream, requested_amount, fee_per_note_input)
             .await
     }
 
@@ -1215,16 +1120,27 @@ impl MintClientModule {
 
         let extra_meta = serde_json::to_value(extra_meta)
             .expect("MintClientModule::reissue_external_notes extra_meta is serializable");
-        let operation_meta_gen = move |txid, _| MintOperationMeta {
-            variant: MintOperationMetaVariant::Reissuance {
-                out_point: OutPoint { txid, out_idx: 0 },
-            },
-            amount,
-            extra_meta: extra_meta.clone(),
+        let operation_meta_gen = move |txid, out_points: Vec<OutPoint>| {
+            assert!(
+                out_points.iter().all(|out_point| out_point.txid == txid),
+                "Change outpoints didn't all have consistent transaction id."
+            );
+
+            MintOperationMeta {
+                variant: MintOperationMetaVariant::Reissuance {
+                    legacy_out_point: None,
+                    txid: Some(txid),
+                    out_point_indices: out_points
+                        .iter()
+                        .map(|out_point| out_point.out_idx)
+                        .collect(),
+                },
+                amount,
+                extra_meta: extra_meta.clone(),
+            }
         };
 
-        let change = self
-            .client_ctx
+        self.client_ctx
             .finalize_and_submit_transaction(
                 operation_id,
                 MintCommonInit::KIND.as_str(),
@@ -1232,12 +1148,7 @@ impl MintClientModule {
                 tx,
             )
             .await
-            .context("We already reissued these notes")?
-            .1;
-
-        self.client_ctx
-            .await_primary_module_outputs(operation_id, change)
-            .await?;
+            .context("We already reissued these notes")?;
 
         Ok(operation_id)
     }
@@ -1249,8 +1160,26 @@ impl MintClientModule {
         operation_id: OperationId,
     ) -> anyhow::Result<UpdateStreamOrOutcome<ReissueExternalNotesState>> {
         let operation = self.mint_operation(operation_id).await?;
-        let out_point = match operation.meta::<MintOperationMeta>().variant {
-            MintOperationMetaVariant::Reissuance { out_point } => out_point,
+        let (txid, out_points) = match operation.meta::<MintOperationMeta>().variant {
+            MintOperationMetaVariant::Reissuance {
+                legacy_out_point,
+                txid,
+                out_point_indices,
+            } => {
+                // Either txid or legacy_out_point will be present, so we should always
+                // have a source for the txid
+                let txid = txid
+                    .or(legacy_out_point.map(|out_point| out_point.txid))
+                    .context("Empty reissuance not permitted, this should never happen")?;
+
+                let out_points = out_point_indices
+                    .into_iter()
+                    .map(|out_idx| OutPoint { txid, out_idx })
+                    .chain(legacy_out_point)
+                    .collect::<Vec<_>>();
+
+                (txid, out_points)
+            }
             _ => bail!("Operation is not a reissuance"),
         };
 
@@ -1263,7 +1192,7 @@ impl MintClientModule {
                 match client_ctx
                     .transaction_updates(operation_id)
                     .await
-                    .await_tx_accepted(out_point.txid)
+                    .await_tx_accepted(txid)
                     .await
                 {
                     Ok(()) => {
@@ -1271,17 +1200,17 @@ impl MintClientModule {
                     }
                     Err(e) => {
                         yield ReissueExternalNotesState::Failed(format!("Transaction not accepted {e:?}"));
+                        return;
                     }
                 }
 
-                match client_ctx.self_ref().await_output_finalized(operation_id, out_point).await {
-                    Ok(_) => {
-                        yield ReissueExternalNotesState::Done;
-                    },
-                    Err(e) => {
+                for out_point in out_points {
+                    if let Err(e) = client_ctx.self_ref().await_output_finalized(operation_id, out_point).await {
                         yield ReissueExternalNotesState::Failed(e.to_string());
-                    },
+                        return;
+                    }
                 }
+                yield ReissueExternalNotesState::Done;
             }}
         ))
     }
@@ -1301,12 +1230,14 @@ impl MintClientModule {
         &self,
         min_amount: Amount,
         try_cancel_after: Duration,
+        include_invite: bool,
         extra_meta: M,
     ) -> anyhow::Result<(OperationId, OOBNotes)> {
         self.spend_notes_with_selector(
             &SelectNotesWithAtleastAmount,
             min_amount,
             try_cancel_after,
+            include_invite,
             extra_meta,
         )
         .await
@@ -1318,6 +1249,7 @@ impl MintClientModule {
         notes_selector: &impl NotesSelector<SpendableNote>,
         requested_amount: Amount,
         try_cancel_after: Duration,
+        include_invite: bool,
         extra_meta: M,
     ) -> anyhow::Result<(OperationId, OOBNotes)> {
         let federation_id_prefix = self.federation_id.to_prefix();
@@ -1337,7 +1269,12 @@ impl MintClientModule {
                                 try_cancel_after,
                             )
                             .await?;
-                        let oob_notes = OOBNotes::new(federation_id_prefix, notes);
+
+                        let oob_notes = if include_invite {
+                            OOBNotes::new_with_invite(notes, self.client_ctx.get_invite_code())
+                        } else {
+                            OOBNotes::new(federation_id_prefix, notes)
+                        };
 
                         dbtx.add_state_machines(self.client_ctx.map_dyn(states).collect())
                             .await?;
@@ -1516,6 +1453,7 @@ pub trait NotesSelector<Note>: Send + Sync {
         #[cfg(not(target_family = "wasm"))] stream: impl futures::Stream<Item = (Amount, Note)> + Send,
         #[cfg(target_family = "wasm")] stream: impl futures::Stream<Item = (Amount, Note)>,
         requested_amount: Amount,
+        fee_per_note_input: Amount,
     ) -> anyhow::Result<TieredMulti<Note>>;
 }
 
@@ -1533,8 +1471,9 @@ impl<Note: Send> NotesSelector<Note> for SelectNotesWithAtleastAmount {
         #[cfg(not(target_family = "wasm"))] stream: impl futures::Stream<Item = (Amount, Note)> + Send,
         #[cfg(target_family = "wasm")] stream: impl futures::Stream<Item = (Amount, Note)>,
         requested_amount: Amount,
+        fee_per_note_input: Amount,
     ) -> anyhow::Result<TieredMulti<Note>> {
-        Ok(select_notes_from_stream(stream, requested_amount).await?)
+        Ok(select_notes_from_stream(stream, requested_amount, fee_per_note_input).await?)
     }
 }
 
@@ -1550,8 +1489,9 @@ impl<Note: Send> NotesSelector<Note> for SelectNotesWithExactAmount {
         #[cfg(not(target_family = "wasm"))] stream: impl futures::Stream<Item = (Amount, Note)> + Send,
         #[cfg(target_family = "wasm")] stream: impl futures::Stream<Item = (Amount, Note)>,
         requested_amount: Amount,
+        note_fee: Amount,
     ) -> anyhow::Result<TieredMulti<Note>> {
-        let notes = select_notes_from_stream(stream, requested_amount).await?;
+        let notes = select_notes_from_stream(stream, requested_amount, note_fee).await?;
 
         if notes.total_amount() != requested_amount {
             bail!(
@@ -1573,6 +1513,7 @@ impl<Note: Send> NotesSelector<Note> for SelectNotesWithExactAmount {
 async fn select_notes_from_stream<Note>(
     stream: impl futures::Stream<Item = (Amount, Note)>,
     requested_amount: Amount,
+    fee_per_note_input: Amount,
 ) -> Result<TieredMulti<Note>, InsufficientBalanceError> {
     if requested_amount == Amount::ZERO {
         return Ok(TieredMulti::default());
@@ -1593,9 +1534,15 @@ async fn select_notes_from_stream<Note>(
                 "notes are not sorted in descending order"
             );
             previous_amount = Some(note_amount);
-            match note_amount.cmp(&pending_amount) {
+
+            if note_amount <= fee_per_note_input {
+                continue;
+            }
+
+            match note_amount.cmp(&(pending_amount + fee_per_note_input)) {
                 Ordering::Less => {
                     // keep adding notes until we have enough
+                    pending_amount += fee_per_note_input;
                     pending_amount -= note_amount;
                     selected.push((note_amount, note))
                 }
@@ -1608,7 +1555,16 @@ async fn select_notes_from_stream<Note>(
                 Ordering::Equal => {
                     // exactly enough notes, return
                     selected.push((note_amount, note));
-                    return Ok(selected.into_iter().collect());
+
+                    let notes: TieredMulti<Note> = selected.into_iter().collect();
+
+                    assert!(
+                        notes.total_amount().msats
+                            >= requested_amount.msats
+                                + notes.count_items() as u64 * fee_per_note_input.msats
+                    );
+
+                    return Ok(notes);
                 }
             }
         } else {
@@ -1619,8 +1575,17 @@ async fn select_notes_from_stream<Note>(
                 selected.truncate(checkpoint);
                 // and use the big note to cover it
                 selected.push((big_note_amount, big_note));
+
+                let notes: TieredMulti<Note> = selected.into_iter().collect();
+
+                assert!(
+                    notes.total_amount().msats
+                        >= requested_amount.msats
+                            + notes.count_items() as u64 * fee_per_note_input.msats
+                );
+
                 // so now we have enough to cover the requested amount, return
-                return Ok(selected.into_iter().collect());
+                return Ok(notes);
             } else {
                 let total_amount = requested_amount - pending_amount;
                 // not enough notes, return
@@ -1649,15 +1614,31 @@ impl std::fmt::Display for InsufficientBalanceError {
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Decodable, Encodable)]
+/// Old and no longer used, will be deleted in the future
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Decodable, Encodable)]
+enum MintRestoreStates {
+    #[encodable_default]
+    Default { variant: u64, bytes: Vec<u8> },
+}
+
+/// Old and no longer used, will be deleted in the future
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Decodable, Encodable)]
+pub struct MintRestoreStateMachine {
+    operation_id: OperationId,
+    state: MintRestoreStates,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Decodable, Encodable)]
 pub enum MintClientStateMachines {
     Output(MintOutputStateMachine),
     Input(MintInputStateMachine),
     OOB(MintOOBStateMachine),
+    // Removed in https://github.com/fedimint/fedimint/pull/4035 , now ignored
+    Restore(MintRestoreStateMachine),
 }
 
 impl IntoDynInstance for MintClientStateMachines {
-    type DynType = DynState<DynGlobalClientContext>;
+    type DynType = DynState;
 
     fn into_dyn(self, instance_id: ModuleInstanceId) -> Self::DynType {
         DynState::from_typed(instance_id, self)
@@ -1666,7 +1647,6 @@ impl IntoDynInstance for MintClientStateMachines {
 
 impl State for MintClientStateMachines {
     type ModuleContext = MintClientContext;
-    type GlobalContext = DynGlobalClientContext;
 
     fn transitions(
         &self,
@@ -1692,6 +1672,9 @@ impl State for MintClientStateMachines {
                     MintClientStateMachines::OOB
                 )
             }
+            MintClientStateMachines::Restore(_) => {
+                sm_enum_variant_translation!(vec![], MintClientStateMachines::Restore)
+            }
         }
     }
 
@@ -1700,6 +1683,7 @@ impl State for MintClientStateMachines {
             MintClientStateMachines::Output(issuance_state) => issuance_state.operation_id(),
             MintClientStateMachines::Input(redemption_state) => redemption_state.operation_id(),
             MintClientStateMachines::OOB(oob_state) => oob_state.operation_id(),
+            MintClientStateMachines::Restore(r) => r.operation_id,
         }
     }
 }
@@ -1796,11 +1780,22 @@ impl sha256t::Tag for OOBReissueTag {
 
 #[cfg(test)]
 mod tests {
-    use fedimint_core::config::FederationId;
-    use fedimint_core::{Amount, Tiered, TieredMulti, TieredSummary};
-    use itertools::Itertools;
+    use std::fmt::Display;
+    use std::str::FromStr;
 
-    use crate::{select_notes_from_stream, OOBNotes};
+    use bitcoin_hashes::Hash;
+    use fedimint_core::api::InviteCode;
+    use fedimint_core::config::FederationId;
+    use fedimint_core::encoding::Decodable;
+    use fedimint_core::{
+        Amount, OutPoint, PeerId, Tiered, TieredMulti, TieredSummary, TransactionId,
+    };
+    use itertools::Itertools;
+    use serde_json::json;
+
+    use crate::{
+        select_notes_from_stream, MintOperationMetaVariant, OOBNotes, OOBNotesData, SpendableNote,
+    };
 
     #[test_log::test(tokio::test)]
     async fn select_notes_avg_test() {
@@ -1812,8 +1807,12 @@ mod tests {
         let mut total_notes = 0;
         for multiplier in 1..100 {
             let stream = reverse_sorted_note_stream(tiered.iter().collect());
-            let select =
-                select_notes_from_stream(stream, Amount::from_sats(multiplier * 1000)).await;
+            let select = select_notes_from_stream(
+                stream,
+                Amount::from_sats(multiplier * 1000),
+                Amount::ZERO,
+            )
+            .await;
             total_notes += select.unwrap().into_iter_items().count();
         }
         assert_eq!(total_notes / 100, 10);
@@ -1829,13 +1828,13 @@ mod tests {
             ])
         };
         assert_eq!(
-            select_notes_from_stream(f(), Amount::from_sats(7))
+            select_notes_from_stream(f(), Amount::from_sats(7), Amount::ZERO)
                 .await
                 .unwrap(),
             notes(vec![(Amount::from_sats(1), 2), (Amount::from_sats(5), 1)])
         );
         assert_eq!(
-            select_notes_from_stream(f(), Amount::from_sats(20))
+            select_notes_from_stream(f(), Amount::from_sats(20), Amount::ZERO)
                 .await
                 .unwrap(),
             notes(vec![(Amount::from_sats(20), 1)])
@@ -1850,7 +1849,7 @@ mod tests {
             (Amount::from_sats(20), 5),
         ]);
         assert_eq!(
-            select_notes_from_stream(stream, Amount::from_sats(7))
+            select_notes_from_stream(stream, Amount::from_sats(7), Amount::ZERO)
                 .await
                 .unwrap(),
             notes(vec![(Amount::from_sats(5), 2)])
@@ -1865,7 +1864,7 @@ mod tests {
             (Amount::from_sats(20), 2),
         ]);
         assert_eq!(
-            select_notes_from_stream(stream, Amount::from_sats(39))
+            select_notes_from_stream(stream, Amount::from_sats(39), Amount::ZERO)
                 .await
                 .unwrap(),
             notes(vec![(Amount::from_sats(20), 2)])
@@ -1875,7 +1874,7 @@ mod tests {
     #[test_log::test(tokio::test)]
     async fn select_notes_returns_error_if_amount_is_too_large() {
         let stream = reverse_sorted_note_stream(vec![(Amount::from_sats(10), 1)]);
-        let error = select_notes_from_stream(stream, Amount::from_sats(100))
+        let error = select_notes_from_stream(stream, Amount::from_sats(100), Amount::ZERO)
             .await
             .unwrap_err();
         assert_eq!(error.total_amount, Amount::from_sats(10));
@@ -1909,5 +1908,120 @@ mod tests {
         let res = oob_notes_string.parse::<OOBNotes>();
 
         assert!(res.is_err(), "An empty OOB notes string should not parse");
+    }
+
+    fn test_roundtrip_serialize_str<T, F>(data: T, assertions: F)
+    where
+        T: FromStr + Display,
+        <T as FromStr>::Err: std::fmt::Debug,
+        F: Fn(T),
+    {
+        let data_str = data.to_string();
+        assertions(data);
+        let data_parsed = data_str.parse().expect("Deserialization failed");
+        assertions(data_parsed);
+    }
+
+    #[test]
+    fn notes_encode_decode() {
+        let federation_id_1 = FederationId(bitcoin_hashes::sha256::Hash::from_inner([0x21; 32]));
+        let federation_id_prefix_1 = federation_id_1.to_prefix();
+        let federation_id_2 = FederationId(bitcoin_hashes::sha256::Hash::from_inner([0x42; 32]));
+        let federation_id_prefix_2 = federation_id_2.to_prefix();
+
+        let notes = vec![(
+            Amount::from_sats(1),
+            SpendableNote::consensus_decode_hex("a5dd3ebacad1bc48bd8718eed5a8da1d68f91323bef2848ac4fa2e6f8eed710f3178fd4aef047cc234e6b1127086f33cc408b39818781d9521475360de6b205f3328e490a6d99d5e2553a4553207c8bd", &Default::default()).unwrap(),
+        )]
+        .into_iter()
+        .collect::<TieredMulti<_>>();
+
+        // Can decode inviteless notes
+        let notes_no_invite = OOBNotes::new(federation_id_prefix_1, notes.clone());
+        test_roundtrip_serialize_str(notes_no_invite, |oob_notes| {
+            assert_eq!(oob_notes.notes(), &notes);
+            assert_eq!(oob_notes.federation_id_prefix(), federation_id_prefix_1);
+            assert_eq!(oob_notes.federation_invite(), None);
+        });
+
+        // Can decode notes with invite
+        let invite = InviteCode::new(
+            "wss://foo.bar".parse().unwrap(),
+            PeerId::from(0),
+            federation_id_1,
+        );
+        let notes_invite = OOBNotes::new_with_invite(notes.clone(), invite.clone());
+        test_roundtrip_serialize_str(notes_invite, |oob_notes| {
+            assert_eq!(oob_notes.notes(), &notes);
+            assert_eq!(oob_notes.federation_id_prefix(), federation_id_prefix_1);
+            assert_eq!(oob_notes.federation_invite(), Some(invite.clone()));
+        });
+
+        // Can decode notes without federation id prefix, so we can optionally remove it
+        // in the future
+        let notes_no_prefix = OOBNotes(vec![
+            OOBNotesData::Notes(notes.clone()),
+            OOBNotesData::Invite {
+                peer_apis: vec![(PeerId::from(0), "wss://foo.bar".parse().unwrap())],
+                federation_id: federation_id_1,
+            },
+        ]);
+        test_roundtrip_serialize_str(notes_no_prefix, |oob_notes| {
+            assert_eq!(oob_notes.notes(), &notes);
+            assert_eq!(oob_notes.federation_id_prefix(), federation_id_prefix_1);
+        });
+
+        // Rejects notes with inconsistent federation id
+        let notes_inconsistent = OOBNotes(vec![
+            OOBNotesData::Notes(notes),
+            OOBNotesData::Invite {
+                peer_apis: vec![(PeerId::from(0), "wss://foo.bar".parse().unwrap())],
+                federation_id: federation_id_1,
+            },
+            OOBNotesData::FederationIdPrefix(federation_id_prefix_2),
+        ]);
+        let notes_inconsistent_str = notes_inconsistent.to_string();
+        assert!(notes_inconsistent_str.parse::<OOBNotes>().is_err());
+    }
+
+    #[test]
+    fn reissuance_meta_compatibility_02_03() {
+        let dummy_outpoint = OutPoint {
+            txid: TransactionId::all_zeros(),
+            out_idx: 0,
+        };
+
+        let old_meta_json = json!({
+            "reissuance": {
+                "out_point": dummy_outpoint
+            }
+        });
+
+        let old_meta: MintOperationMetaVariant =
+            serde_json::from_value(old_meta_json).expect("parsing old reissuance meta failed");
+        assert_eq!(
+            old_meta,
+            MintOperationMetaVariant::Reissuance {
+                legacy_out_point: Some(dummy_outpoint),
+                txid: None,
+                out_point_indices: vec![],
+            }
+        );
+
+        let new_meta_json = serde_json::to_value(MintOperationMetaVariant::Reissuance {
+            legacy_out_point: None,
+            txid: Some(dummy_outpoint.txid),
+            out_point_indices: vec![0],
+        })
+        .expect("serializing always works");
+        assert_eq!(
+            new_meta_json,
+            json!({
+                "reissuance": {
+                    "txid": dummy_outpoint.txid,
+                    "out_point_indices": [dummy_outpoint.out_idx],
+                }
+            })
+        );
     }
 }

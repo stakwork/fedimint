@@ -5,14 +5,15 @@ use std::time::Duration;
 
 use anyhow::ensure;
 use async_trait::async_trait;
-use bitcoin_hashes::hex::ToHex;
 use fedimint_core::task::{sleep, TaskGroup};
 use fedimint_core::Amount;
 use fedimint_ln_common::PrunedInvoice;
+use hex::ToHex;
 use secp256k1::PublicKey;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Status;
+use tonic_lnd::invoicesrpc::AddHoldInvoiceRequest;
 use tonic_lnd::lnrpc::failure::FailureCode;
 use tonic_lnd::lnrpc::payment::PaymentStatus;
 use tonic_lnd::lnrpc::{ChanInfoRequest, GetInfoRequest, ListChannelsRequest};
@@ -29,8 +30,9 @@ use super::{ILnRpcClient, LightningRpcError, MAX_LIGHTNING_RETRIES};
 use crate::gateway_lnrpc::get_route_hints_response::{RouteHint, RouteHintHop};
 use crate::gateway_lnrpc::intercept_htlc_response::{Action, Cancel, Forward, Settle};
 use crate::gateway_lnrpc::{
-    EmptyResponse, GetNodeInfoResponse, GetRouteHintsResponse, InterceptHtlcRequest,
-    InterceptHtlcResponse, PayInvoiceRequest, PayInvoiceResponse,
+    CreateInvoiceRequest, CreateInvoiceResponse, EmptyResponse, GetNodeInfoResponse,
+    GetRouteHintsResponse, InterceptHtlcRequest, InterceptHtlcResponse, PayInvoiceRequest,
+    PayInvoiceResponse,
 };
 
 type HtlcSubscriptionSender = mpsc::Sender<Result<InterceptHtlcRequest, Status>>;
@@ -113,8 +115,7 @@ impl GatewayLndClient {
                 failure_reason: format!("Failed to get node info {status:?}"),
             })?;
 
-        task_group
-            .spawn("LND HTLC Subscription", move |handle| async move {
+        task_group.spawn("LND HTLC Subscription", move |handle| async move {
                 let future_stream = client
                     .router()
                     .htlc_interceptor(ReceiverStream::new(lnd_rx));
@@ -194,8 +195,7 @@ impl GatewayLndClient {
                         }
                     }
                 }
-            })
-            .await;
+            });
 
         Ok(())
     }
@@ -403,117 +403,15 @@ impl ILnRpcClient for GatewayLndClient {
 
     async fn pay(
         &self,
-        request: PayInvoiceRequest,
+        _request: PayInvoiceRequest,
     ) -> Result<PayInvoiceResponse, LightningRpcError> {
-        let PayInvoiceRequest {
-            invoice,
-            max_fee_msat,
-            payment_hash,
-            ..
-        } = request;
-        info!("LND Paying invoice {invoice:?}");
-        let mut client = Self::connect(
-            self.address.clone(),
-            self.tls_cert.clone(),
-            self.macaroon.clone(),
-        )
-        .await?;
-
-        debug!("LND got client to pay invoice {invoice:?}, will check if payment already exists");
-
-        // If the payment exists, that means we've already tried to pay the invoice
-        let preimage: Vec<u8> = if let Some(preimage) = self
-            .lookup_payment(payment_hash.clone(), &mut client)
-            .await?
-        {
-            info!("LND payment already exists for invoice {invoice:?}");
-            bitcoin_hashes::hex::FromHex::from_hex(preimage.as_str()).map_err(|error| {
-                LightningRpcError::FailedPayment {
-                    failure_reason: format!("Failed to convert preimage {error:?}"),
-                }
-            })?
-        } else {
-            // LND API allows fee limits in the `i64` range, but we use `u64` for
-            // max_fee_msat. This means we can only set an enforceable fee limit
-            // between 0 and i64::MAX
-            let fee_limit_msat: i64 =
-                max_fee_msat
-                    .try_into()
-                    .map_err(|error| LightningRpcError::FailedPayment {
-                        failure_reason: format!(
-                            "max_fee_msat exceeds valid LND fee limit ranges {error:?}"
-                        ),
-                    })?;
-            debug!("LND payment does not exist for invoice {invoice:?}, will attempt to pay");
-            let payments = client
-                .router()
-                .send_payment_v2(SendPaymentRequest {
-                    payment_request: invoice.clone(),
-                    no_inflight_updates: false,
-                    timeout_seconds: LND_PAYMENT_TIMEOUT_SECONDS,
-                    fee_limit_msat,
-                    ..Default::default()
-                })
-                .await
-                .map_err(|status| {
-                    info!("LND payment request failed for invoice {invoice:?} with {status:?}");
-                    LightningRpcError::FailedPayment {
-                        failure_reason: format!("Failed to make outgoing payment {status:?}"),
-                    }
-                })?;
-
-            debug!(
-                "LND payment request sent for invoice {invoice:?}, waiting for payment status..."
-            );
-            let mut messages = payments.into_inner();
-            loop {
-                match messages
-                    .message()
-                    .await
-                    .map_err(|error| LightningRpcError::FailedPayment {
-                        failure_reason: format!("Failed to get payment status {error:?}"),
-                    }) {
-                    Ok(Some(payment)) if payment.status() == PaymentStatus::Succeeded => {
-                        info!("LND payment succeeded for invoice {invoice:?}");
-                        break bitcoin_hashes::hex::FromHex::from_hex(
-                            payment.payment_preimage.as_str(),
-                        )
-                        .map_err(|error| {
-                            LightningRpcError::FailedPayment {
-                                failure_reason: format!("Failed to convert preimage {error:?}"),
-                            }
-                        })?;
-                    }
-                    Ok(Some(payment)) if payment.status() == PaymentStatus::InFlight => {
-                        debug!("LND payment is inflight");
-                        continue;
-                    }
-                    Ok(Some(payment)) => {
-                        info!("LND payment failed for invoice {invoice:?} with {payment:?}");
-                        let failure_reason = payment.failure_reason();
-                        return Err(LightningRpcError::FailedPayment {
-                            failure_reason: format!("{failure_reason:?}"),
-                        });
-                    }
-                    Ok(None) => {
-                        info!("LND payment failed for invoice {invoice:?} with no payment status");
-                        return Err(LightningRpcError::FailedPayment {
-                            failure_reason: format!(
-                                "Failed to get payment status for payment hash {payment_hash:?}"
-                            ),
-                        });
-                    }
-                    Err(e) => {
-                        info!("LND payment failed for invoice {invoice:?} with {e:?}");
-                        return Err(e);
-                    }
-                }
-            }
-        };
-        Ok(PayInvoiceResponse { preimage })
+        error!("LND supports private payments, legacy `pay` should not be used.");
+        Err(LightningRpcError::FailedPayment {
+            failure_reason: "LND supports private payments, legacy `pay` should not be used."
+                .to_string(),
+        })
     }
 
-    // FIXME: deduplicate implementation with pay
     async fn pay_private(
         &self,
         invoice: PrunedInvoice,
@@ -536,7 +434,7 @@ impl ILnRpcClient for GatewayLndClient {
             .await?
         {
             info!("LND payment already exists for invoice {invoice:?}");
-            bitcoin_hashes::hex::FromHex::from_hex(preimage.as_str()).map_err(|error| {
+            hex::FromHex::from_hex(preimage.as_str()).map_err(|error| {
                 LightningRpcError::FailedPayment {
                     failure_reason: format!("Failed to convert preimage {error:?}"),
                 }
@@ -615,14 +513,11 @@ impl ILnRpcClient for GatewayLndClient {
                     }) {
                     Ok(Some(payment)) if payment.status() == PaymentStatus::Succeeded => {
                         info!("LND payment succeeded for invoice {invoice:?}");
-                        break bitcoin_hashes::hex::FromHex::from_hex(
-                            payment.payment_preimage.as_str(),
-                        )
-                        .map_err(|error| {
-                            LightningRpcError::FailedPayment {
+                        break hex::FromHex::from_hex(payment.payment_preimage.as_str()).map_err(
+                            |error| LightningRpcError::FailedPayment {
                                 failure_reason: format!("Failed to convert preimage {error:?}"),
-                            }
-                        })?;
+                            },
+                        )?;
                     }
                     Ok(Some(payment)) if payment.status() == PaymentStatus::InFlight => {
                         debug!("LND payment is inflight");
@@ -734,6 +629,33 @@ impl ILnRpcClient for GatewayLndClient {
             failure_reason: "Gatewayd has not started to route HTLCs".to_string(),
         })
     }
+
+    async fn create_invoice(
+        &self,
+        create_invoice_request: CreateInvoiceRequest,
+    ) -> Result<CreateInvoiceResponse, LightningRpcError> {
+        let mut client = Self::connect(
+            self.address.clone(),
+            self.tls_cert.clone(),
+            self.macaroon.clone(),
+        )
+        .await?;
+        let hold_invoice_response = client
+            .invoices()
+            .add_hold_invoice(AddHoldInvoiceRequest {
+                memo: create_invoice_request.description,
+                hash: create_invoice_request.payment_hash,
+                value_msat: create_invoice_request.amount_msat as i64,
+                expiry: create_invoice_request.expiry as i64,
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| LightningRpcError::FailedToGetInvoice {
+                failure_reason: e.to_string(),
+            })?;
+        let invoice = hold_invoice_response.into_inner().payment_request;
+        Ok(CreateInvoiceResponse { invoice })
+    }
 }
 
 fn route_hints_to_lnd(
@@ -746,7 +668,7 @@ fn route_hints_to_lnd(
                 .0
                 .iter()
                 .map(|hop| tonic_lnd::lnrpc::HopHint {
-                    node_id: hop.src_node_id.serialize().to_hex(),
+                    node_id: hop.src_node_id.serialize().encode_hex(),
                     chan_id: hop.short_channel_id,
                     fee_base_msat: hop.base_msat,
                     fee_proportional_millionths: hop.proportional_millionths,
@@ -786,7 +708,7 @@ fn wire_features_to_lnd_feature_vec(features_wire_encoded: &[u8]) -> anyhow::Res
 
 #[cfg(test)]
 mod tests {
-    use bitcoin_hashes::hex::FromHex;
+    use hex::FromHex;
     use lightning::ln::features::Bolt11InvoiceFeatures;
     use lightning::util::ser::{WithoutLength, Writeable};
 

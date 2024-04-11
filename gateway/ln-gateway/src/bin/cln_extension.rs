@@ -7,21 +7,24 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::anyhow;
-use bitcoin_hashes::hex::ToHex;
 use clap::Parser;
 use cln_plugin::{options, Builder, Plugin};
 use cln_rpc::model;
 use cln_rpc::primitives::ShortChannelId;
 use fedimint_core::task::TaskGroup;
-use fedimint_core::Amount;
+use fedimint_core::util::handle_version_hash_command;
+use fedimint_core::{fedimint_build_code_version_env, Amount};
+use hex::ToHex;
+use ln_gateway::envs::FM_CLN_EXTENSION_LISTEN_ADDRESS_ENV;
 use ln_gateway::gateway_lnrpc::gateway_lightning_server::{
     GatewayLightning, GatewayLightningServer,
 };
 use ln_gateway::gateway_lnrpc::get_route_hints_response::{RouteHint, RouteHintHop};
 use ln_gateway::gateway_lnrpc::intercept_htlc_response::{Action, Cancel, Forward, Settle};
 use ln_gateway::gateway_lnrpc::{
-    EmptyRequest, EmptyResponse, GetNodeInfoResponse, GetRouteHintsRequest, GetRouteHintsResponse,
-    InterceptHtlcRequest, InterceptHtlcResponse, PayInvoiceRequest, PayInvoiceResponse,
+    CreateInvoiceRequest, CreateInvoiceResponse, EmptyRequest, EmptyResponse, GetNodeInfoResponse,
+    GetRouteHintsRequest, GetRouteHintsResponse, InterceptHtlcRequest, InterceptHtlcResponse,
+    PayInvoiceRequest, PayInvoiceResponse,
 };
 use secp256k1::PublicKey;
 use serde::{Deserialize, Serialize};
@@ -36,22 +39,16 @@ use tracing::{debug, error, info, warn};
 const MAX_HTLC_PROCESSING_DURATION: Duration = Duration::MAX;
 
 #[derive(Parser)]
-pub struct ClnExtensionOpts {
+#[command(version)]
+struct ClnExtensionOpts {
     /// Gateway CLN extension service listen address
-    #[arg(long = "fm-gateway-listen", env = "FM_CLN_EXTENSION_LISTEN_ADDRESS")]
-    pub fm_gateway_listen: SocketAddr,
+    #[arg(long = "fm-gateway-listen", env = FM_CLN_EXTENSION_LISTEN_ADDRESS_ENV)]
+    fm_gateway_listen: SocketAddr,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
-    let mut args = std::env::args();
-
-    if let Some(ref arg) = args.nth(1) {
-        if arg.as_str() == "version-hash" {
-            println!("{}", env!("FEDIMINT_BUILD_CODE_VERSION"));
-            return Ok(());
-        }
-    }
+    handle_version_hash_command(fedimint_build_code_version_env!());
 
     let (service, listen, plugin) = ClnRpcService::new()
         .await
@@ -81,45 +78,43 @@ async fn main() -> Result<(), anyhow::Error> {
 // TODO: upstream these structs to cln-plugin
 // See: https://github.com/ElementsProject/lightning/blob/master/doc/PLUGINS.md#htlc_accepted
 #[derive(Clone, Serialize, Deserialize, Debug)]
-pub struct Htlc {
-    pub amount_msat: Amount,
+struct Htlc {
+    amount_msat: Amount,
     // TODO: use these to validate we can actually redeem the HTLC in time
-    pub cltv_expiry: u32,
-    pub cltv_expiry_relative: u32,
-    pub payment_hash: bitcoin_hashes::sha256::Hash,
+    cltv_expiry: u32,
+    cltv_expiry_relative: u32,
+    payment_hash: bitcoin_hashes::sha256::Hash,
     // The short channel id of the incoming channel
-    pub short_channel_id: String,
+    short_channel_id: String,
     // The ID of the HTLC
-    pub id: u64,
+    id: u64,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
-pub struct Onion {
+struct Onion {
     #[serde(default)]
-    pub short_channel_id: Option<String>,
-    pub forward_msat: Option<Amount>,
+    short_channel_id: Option<String>,
+    forward_msat: Amount,
     #[serde(default)]
     pub next_onion: String,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
-pub struct HtlcAccepted {
-    pub htlc: Htlc,
-    pub onion: Onion,
+struct HtlcAccepted {
+    htlc: Htlc,
+    onion: Onion,
 }
 
-pub struct ClnRpcClient {}
-
 #[allow(dead_code)]
-pub struct ClnRpcService {
+struct ClnRpcService {
     socket: PathBuf,
     interceptor: Arc<ClnHtlcInterceptor>,
     task_group: TaskGroup,
 }
 
 impl ClnRpcService {
-    pub async fn new(
-    ) -> Result<(Self, SocketAddr, Plugin<Arc<ClnHtlcInterceptor>>), ClnExtensionError> {
+    async fn new() -> Result<(Self, SocketAddr, Plugin<Arc<ClnHtlcInterceptor>>), ClnExtensionError>
+    {
         let interceptor = Arc::new(ClnHtlcInterceptor::new());
 
         if let Some(plugin) = Builder::new(stdin(), stdout())
@@ -166,8 +161,8 @@ impl ClnRpcService {
                 Err(_) => {
 
                     let listen_val = plugin.option("fm-gateway-listen")
-                        .expect("Gateway CLN extension is missing a listen address configuration. 
-                        You can set it via FM_CLN_EXTENSION_LISTEN_ADDRESS env variable, or by adding 
+                        .expect("Gateway CLN extension is missing a listen address configuration.
+                        You can set it via FM_CLN_EXTENSION_LISTEN_ADDRESS env variable, or by adding
                         a --fm-gateway-listen config option to the CLN plugin.");
                     let listen = listen_val.as_str()
                         .expect("fm-gateway-listen isn't a string");
@@ -205,7 +200,7 @@ impl ClnRpcService {
         })
     }
 
-    pub async fn info(&self) -> Result<(PublicKey, String, String), ClnExtensionError> {
+    async fn info(&self) -> Result<(PublicKey, String, String), ClnExtensionError> {
         self.rpc_client()
             .await?
             .call(cln_rpc::Request::Getinfo(
@@ -458,7 +453,7 @@ impl GatewayLightning for ClnRpcService {
                     let assert_pk: Result<[u8; 32], TryFromSliceError> =
                         preimage.as_slice().try_into();
                     if let Ok(pk) = assert_pk {
-                        serde_json::json!({ "result": "resolve", "payment_key": pk.to_hex() })
+                        serde_json::json!({ "result": "resolve", "payment_key": pk.encode_hex::<String>() })
                     } else {
                         htlc_processing_failure()
                     }
@@ -507,10 +502,19 @@ impl GatewayLightning for ClnRpcService {
         }
         Ok(tonic::Response::new(EmptyResponse {}))
     }
+
+    async fn create_invoice(
+        &self,
+        _create_invoice_request: tonic::Request<CreateInvoiceRequest>,
+    ) -> Result<tonic::Response<CreateInvoiceResponse>, Status> {
+        Err(Status::internal(
+            "Invoice creation is not implemented for CLN",
+        ))
+    }
 }
 
 #[derive(Debug, Error)]
-pub enum ClnExtensionError {
+enum ClnExtensionError {
     #[error("Gateway CLN Extension Error : {0:?}")]
     Error(#[from] anyhow::Error),
     #[error("Gateway CLN Extension Error : {0:?}")]
@@ -545,8 +549,8 @@ type HtlcOutcomeSender = oneshot::Sender<serde_json::Value>;
 /// Functional structure to filter intercepted HTLCs into subscription streams.
 /// Used as a CLN plugin
 #[derive(Clone)]
-pub struct ClnHtlcInterceptor {
-    pub outcomes: Arc<Mutex<BTreeMap<(u64, u64), HtlcOutcomeSender>>>,
+struct ClnHtlcInterceptor {
+    outcomes: Arc<Mutex<BTreeMap<(u64, u64), HtlcOutcomeSender>>>,
     sender: Arc<Mutex<Option<HtlcInterceptionSender>>>,
 }
 

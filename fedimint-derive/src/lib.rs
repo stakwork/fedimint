@@ -14,7 +14,7 @@ fn do_not_ignore(field: &Field) -> bool {
     !field
         .attrs
         .iter()
-        .any(|attr| attr.path.is_ident("encodable_ignore"))
+        .any(|attr| attr.path().is_ident("encodable_ignore"))
 }
 
 fn panic_if_ignored(field: &Field) -> bool {
@@ -28,7 +28,7 @@ fn is_default_variant_enforce_valid(variant: &Variant) -> bool {
     let is_default = variant
         .attrs
         .iter()
-        .any(|attr| attr.path.is_ident("encodable_default"));
+        .any(|attr| attr.path().is_ident("encodable_default"));
 
     if is_default {
         assert_eq!(
@@ -199,7 +199,7 @@ pub fn derive_decodable(input: TokenStream) -> TokenStream {
 
     let output = quote! {
         impl ::fedimint_core::encoding::Decodable for #ident {
-            fn consensus_decode<D: std::io::Read>(d: &mut D, modules: &::fedimint_core::module::registry::ModuleDecoderRegistry) -> std::result::Result<Self, ::fedimint_core::encoding::DecodeError> {
+            fn consensus_decode_from_finite_reader<D: std::io::Read>(d: &mut D, modules: &::fedimint_core::module::registry::ModuleDecoderRegistry) -> std::result::Result<Self, ::fedimint_core::encoding::DecodeError> {
                 #decode_inner
             }
         }
@@ -248,7 +248,7 @@ fn derive_enum_decode(ident: &Ident, variants: &Punctuated<Variant, Comma>) -> T
             // FIXME: make sure we read all bytes
             quote! {
                 #variant_idx => {
-                    let bytes: Vec<u8> = ::fedimint_core::encoding::Decodable::consensus_decode(d, modules)?;
+                    let bytes: Vec<u8> = ::fedimint_core::encoding::Decodable::consensus_decode_from_finite_reader(d, modules)?;
                     let mut cursor = std::io::Cursor::new(&bytes);
 
                     let decoded = #decode_block;
@@ -269,7 +269,7 @@ fn derive_enum_decode(ident: &Ident, variants: &Punctuated<Variant, Comma>) -> T
     let default_match_arm = if variants.iter().any(is_default_variant_enforce_valid) {
         quote! {
             variant => {
-                let bytes: Vec<u8> = ::fedimint_core::encoding::Decodable::consensus_decode(d, modules)?;
+                let bytes: Vec<u8> = ::fedimint_core::encoding::Decodable::consensus_decode_from_finite_reader(d, modules)?;
                 #ident::Default {
                     variant,
                     bytes
@@ -278,14 +278,14 @@ fn derive_enum_decode(ident: &Ident, variants: &Punctuated<Variant, Comma>) -> T
         }
     } else {
         quote! {
-            _ => {
-                return Err(::fedimint_core::encoding::DecodeError::from_str("invalid enum variant"));
+            variant => {
+                return Err(::fedimint_core::encoding::DecodeError::new_custom(anyhow::anyhow!("Invalid enum variant {} while decoding {}", variant, stringify!(#ident))));
             }
         }
     };
 
     quote! {
-        let variant = <u64 as ::fedimint_core::encoding::Decodable>::consensus_decode(d, modules)?;
+        let variant = <u64 as ::fedimint_core::encoding::Decodable>::consensus_decode_from_finite_reader(d, modules)?;
         let decoded = match variant {
             #(#non_default_match_arms)*
             #default_match_arm
@@ -327,7 +327,7 @@ fn derive_tuple_decode_block(
         .collect::<Vec<_>>();
     quote! {
         {
-            #(let #field_names = ::fedimint_core::encoding::Decodable::consensus_decode(#reader, modules)?;)*
+            #(let #field_names = ::fedimint_core::encoding::Decodable::consensus_decode_from_finite_reader(#reader, modules)?;)*
             #constructor(#(#field_names,)*)
         }
     }
@@ -345,7 +345,7 @@ fn derive_named_decode_block(
         .collect::<Vec<_>>();
     quote! {
         {
-            #(let #variant_fields = ::fedimint_core::encoding::Decodable::consensus_decode(#reader, modules)?;)*
+            #(let #variant_fields = ::fedimint_core::encoding::Decodable::consensus_decode_from_finite_reader(#reader, modules)?;)*
             #constructor{
                 #(#variant_fields,)*
             }

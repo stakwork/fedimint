@@ -1,3 +1,6 @@
+pub mod recovery;
+
+use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::marker;
 use std::sync::Arc;
@@ -5,21 +8,21 @@ use std::sync::Arc;
 use fedimint_core::api::{DynGlobalApi, DynModuleApi};
 use fedimint_core::config::{ClientModuleConfig, FederationId, ModuleInitRegistry};
 use fedimint_core::core::{Decoder, ModuleInstanceId, ModuleKind};
-use fedimint_core::db::{Database, DatabaseVersion, MigrationMap};
+use fedimint_core::db::{Database, DatabaseVersion};
 use fedimint_core::module::{
-    ApiVersion, CommonModuleInit, IDynCommonModuleInit, ModuleInit, MultiApiVersion,
+    ApiAuth, ApiVersion, CommonModuleInit, IDynCommonModuleInit, ModuleInit, MultiApiVersion,
 };
-use fedimint_core::task::{MaybeSend, MaybeSync};
-use fedimint_core::{apply, async_trait_maybe_send, dyn_newtype_define};
+use fedimint_core::task::{MaybeSend, MaybeSync, TaskGroup};
+use fedimint_core::{apply, async_trait_maybe_send, dyn_newtype_define, NumPeers};
 use fedimint_derive_secret::DerivableSecret;
 use tokio::sync::watch;
 use tracing::warn;
 
 use super::recovery::{DynModuleBackup, RecoveryProgress};
 use super::{ClientContext, FinalClient};
+use crate::db::ClientMigrationFn;
 use crate::module::{ClientModule, DynClientModule};
 use crate::sm::{ModuleNotifier, Notifier};
-use crate::DynGlobalClientContext;
 
 pub type ClientModuleInitRegistry = ModuleInitRegistry<DynClientModuleInit>;
 
@@ -28,17 +31,18 @@ where
     C: ClientModuleInit,
 {
     federation_id: FederationId,
+    peer_num: usize,
     cfg: <<C as ModuleInit>::Common as CommonModuleInit>::ClientConfig,
     db: Database,
-    api_version: ApiVersion,
+    core_api_version: ApiVersion,
+    module_api_version: ApiVersion,
     module_root_secret: DerivableSecret,
-    notifier: ModuleNotifier<
-        DynGlobalClientContext,
-        <<C as ClientModuleInit>::Module as ClientModule>::States,
-    >,
+    notifier: ModuleNotifier<<<C as ClientModuleInit>::Module as ClientModule>::States>,
     api: DynGlobalApi,
+    admin_auth: Option<ApiAuth>,
     module_api: DynModuleApi,
     context: ClientContext<<C as ClientModuleInit>::Module>,
+    task_group: TaskGroup,
 }
 
 impl<C> ClientModuleInitArgs<C>
@@ -49,6 +53,10 @@ where
         &self.federation_id
     }
 
+    pub fn peer_num(&self) -> usize {
+        self.peer_num
+    }
+
     pub fn cfg(&self) -> &<<C as ModuleInit>::Common as CommonModuleInit>::ClientConfig {
         &self.cfg
     }
@@ -57,8 +65,17 @@ where
         &self.db
     }
 
+    pub fn core_api_version(&self) -> &ApiVersion {
+        &self.core_api_version
+    }
+
+    pub fn module_api_version(&self) -> &ApiVersion {
+        &self.module_api_version
+    }
+
+    // TODO: deprecate, use `module_api_version` instead
     pub fn api_version(&self) -> &ApiVersion {
-        &self.api_version
+        &self.module_api_version
     }
 
     pub fn module_root_secret(&self) -> &DerivableSecret {
@@ -67,15 +84,16 @@ where
 
     pub fn notifier(
         &self,
-    ) -> &ModuleNotifier<
-        DynGlobalClientContext,
-        <<C as ClientModuleInit>::Module as ClientModule>::States,
-    > {
+    ) -> &ModuleNotifier<<<C as ClientModuleInit>::Module as ClientModule>::States> {
         &self.notifier
     }
 
     pub fn api(&self) -> &DynGlobalApi {
         &self.api
+    }
+
+    pub fn admin_auth(&self) -> Option<&ApiAuth> {
+        self.admin_auth.as_ref()
     }
 
     pub fn module_api(&self) -> &DynModuleApi {
@@ -91,6 +109,10 @@ where
     pub fn context(&self) -> ClientContext<<C as ClientModuleInit>::Module> {
         self.context.clone()
     }
+
+    pub fn task_group(&self) -> &TaskGroup {
+        &self.task_group
+    }
 }
 
 // TODO: remove
@@ -100,15 +122,15 @@ where
     C: ClientModuleInit,
 {
     federation_id: FederationId,
+    num_peers: NumPeers,
     cfg: <<C as ModuleInit>::Common as CommonModuleInit>::ClientConfig,
     db: Database,
-    api_version: ApiVersion,
+    core_api_version: ApiVersion,
+    module_api_version: ApiVersion,
     module_root_secret: DerivableSecret,
-    notifier: ModuleNotifier<
-        DynGlobalClientContext,
-        <<C as ClientModuleInit>::Module as ClientModule>::States,
-    >,
+    notifier: ModuleNotifier<<<C as ClientModuleInit>::Module as ClientModule>::States>,
     api: DynGlobalApi,
+    admin_auth: Option<ApiAuth>,
     module_api: DynModuleApi,
     context: ClientContext<<C as ClientModuleInit>::Module>,
     progress_tx: tokio::sync::watch::Sender<RecoveryProgress>,
@@ -122,6 +144,10 @@ where
         &self.federation_id
     }
 
+    pub fn num_peers(&self) -> NumPeers {
+        self.num_peers
+    }
+
     pub fn cfg(&self) -> &<<C as ModuleInit>::Common as CommonModuleInit>::ClientConfig {
         &self.cfg
     }
@@ -130,8 +156,17 @@ where
         &self.db
     }
 
+    pub fn core_api_version(&self) -> &ApiVersion {
+        &self.core_api_version
+    }
+
+    pub fn module_api_version(&self) -> &ApiVersion {
+        &self.module_api_version
+    }
+
+    // TODO: deprecate, use module_api_version instead
     pub fn api_version(&self) -> &ApiVersion {
-        &self.api_version
+        &self.module_api_version
     }
 
     pub fn module_root_secret(&self) -> &DerivableSecret {
@@ -140,15 +175,16 @@ where
 
     pub fn notifier(
         &self,
-    ) -> &ModuleNotifier<
-        DynGlobalClientContext,
-        <<C as ClientModuleInit>::Module as ClientModule>::States,
-    > {
+    ) -> &ModuleNotifier<<<C as ClientModuleInit>::Module as ClientModule>::States> {
         &self.notifier
     }
 
     pub fn api(&self) -> &DynGlobalApi {
         &self.api
+    }
+
+    pub fn admin_auth(&self) -> Option<&ApiAuth> {
+        self.admin_auth.as_ref()
     }
 
     pub fn module_api(&self) -> &DynModuleApi {
@@ -182,18 +218,6 @@ where
 pub trait ClientModuleInit: ModuleInit + Sized {
     type Module: ClientModule;
 
-    /// Represents the version of the database, used to determine
-    /// if a database migration is needed when the client is created.
-    const DATABASE_VERSION: DatabaseVersion;
-
-    /// Returns a map of database migrations functions that are applied
-    /// to the database. The functions represent mappings between database
-    /// breaking changes and how to derive the new database structures from
-    /// the old ones.
-    fn get_database_migrations(&self) -> MigrationMap {
-        MigrationMap::new()
-    }
-
     /// Api versions of the corresponding server side module's API
     /// that this client module implementation can use.
     fn supported_api_versions(&self) -> MultiApiVersion;
@@ -217,6 +241,13 @@ pub trait ClientModuleInit: ModuleInit + Sized {
 
     /// Initialize a [`ClientModule`] instance from its config
     async fn init(&self, args: &ClientModuleInitArgs<Self>) -> anyhow::Result<Self::Module>;
+
+    /// Retrieves the database migrations from the module to be applied to the
+    /// database before the module is initialized. The database migrations map
+    /// is indexed on the "from" version.
+    fn get_database_migrations(&self) -> BTreeMap<DatabaseVersion, ClientMigrationFn> {
+        BTreeMap::new()
+    }
 }
 
 #[apply(async_trait_maybe_send!)]
@@ -224,10 +255,6 @@ pub trait IClientModuleInit: IDynCommonModuleInit + Debug + MaybeSend + MaybeSyn
     fn decoder(&self) -> Decoder;
 
     fn module_kind(&self) -> ModuleKind;
-
-    fn database_version(&self) -> DatabaseVersion;
-
-    fn get_database_migrations(&self) -> MigrationMap;
 
     fn as_common(&self) -> &(dyn IDynCommonModuleInit + Send + Sync + 'static);
 
@@ -239,13 +266,16 @@ pub trait IClientModuleInit: IDynCommonModuleInit + Debug + MaybeSend + MaybeSyn
         &self,
         final_client: FinalClient,
         federation_id: FederationId,
+        num_peers: NumPeers,
         cfg: ClientModuleConfig,
         db: Database,
         instance_id: ModuleInstanceId,
-        api_version: ApiVersion,
+        core_api_version: ApiVersion,
+        module_api_version: ApiVersion,
         module_root_secret: DerivableSecret,
-        notifier: Notifier<DynGlobalClientContext>,
+        notifier: Notifier,
         api: DynGlobalApi,
+        admin_auth: Option<ApiAuth>,
         snapshot: Option<&DynModuleBackup>,
         progress_tx: watch::Sender<RecoveryProgress>,
     ) -> anyhow::Result<()>;
@@ -255,14 +285,20 @@ pub trait IClientModuleInit: IDynCommonModuleInit + Debug + MaybeSend + MaybeSyn
         &self,
         final_client: FinalClient,
         federation_id: FederationId,
+        peer_num: usize,
         cfg: ClientModuleConfig,
         db: Database,
         instance_id: ModuleInstanceId,
-        api_version: ApiVersion,
+        core_api_version: ApiVersion,
+        module_api_version: ApiVersion,
         module_root_secret: DerivableSecret,
-        notifier: Notifier<DynGlobalClientContext>,
+        notifier: Notifier,
         api: DynGlobalApi,
+        admin_auth: Option<ApiAuth>,
+        task_group: TaskGroup,
     ) -> anyhow::Result<DynClientModule>;
+
+    fn get_database_migrations(&self) -> BTreeMap<DatabaseVersion, ClientMigrationFn>;
 }
 
 #[apply(async_trait_maybe_send!)]
@@ -271,19 +307,11 @@ where
     T: ClientModuleInit + 'static + MaybeSend + Sync,
 {
     fn decoder(&self) -> Decoder {
-        T::Module::decoder()
+        <<T as ClientModuleInit>::Module as ClientModule>::decoder()
     }
 
     fn module_kind(&self) -> ModuleKind {
         <Self as ModuleInit>::Common::KIND
-    }
-
-    fn database_version(&self) -> DatabaseVersion {
-        <Self as ClientModuleInit>::DATABASE_VERSION
-    }
-
-    fn get_database_migrations(&self) -> MigrationMap {
-        <Self as ClientModuleInit>::get_database_migrations(self)
     }
 
     fn as_common(&self) -> &(dyn IDynCommonModuleInit + Send + Sync + 'static) {
@@ -298,14 +326,17 @@ where
         &self,
         final_client: FinalClient,
         federation_id: FederationId,
+        num_peers: NumPeers,
         cfg: ClientModuleConfig,
         db: Database,
         instance_id: ModuleInstanceId,
-        api_version: ApiVersion,
+        core_api_version: ApiVersion,
+        module_api_version: ApiVersion,
         module_root_secret: DerivableSecret,
         // TODO: make dyn type for notifier
-        notifier: Notifier<DynGlobalClientContext>,
+        notifier: Notifier,
         api: DynGlobalApi,
+        admin_auth: Option<ApiAuth>,
         snapshot: Option<&DynModuleBackup>,
         progress_tx: watch::Sender<RecoveryProgress>,
     ) -> anyhow::Result<()> {
@@ -321,12 +352,15 @@ where
             .recover(
                 &ClientModuleRecoverArgs {
                     federation_id,
+                    num_peers,
                     cfg: typed_cfg.clone(),
                     db: db.with_prefix_module_id(instance_id),
-                    api_version,
+                    core_api_version,
+                    module_api_version,
                     module_root_secret,
                     notifier: notifier.module_notifier(instance_id),
                     api: api.clone(),
+                    admin_auth,
                     module_api: api.with_module(instance_id),
                     context: ClientContext {
                         client: final_client,
@@ -345,25 +379,32 @@ where
         &self,
         final_client: FinalClient,
         federation_id: FederationId,
+        peer_num: usize,
         cfg: ClientModuleConfig,
         db: Database,
         instance_id: ModuleInstanceId,
-        api_version: ApiVersion,
+        core_api_version: ApiVersion,
+        module_api_version: ApiVersion,
         module_root_secret: DerivableSecret,
         // TODO: make dyn type for notifier
-        notifier: Notifier<DynGlobalClientContext>,
+        notifier: Notifier,
         api: DynGlobalApi,
+        admin_auth: Option<ApiAuth>,
+        task_group: TaskGroup,
     ) -> anyhow::Result<DynClientModule> {
         let typed_cfg: &<<T as fedimint_core::module::ModuleInit>::Common as CommonModuleInit>::ClientConfig = cfg.cast()?;
         Ok(self
             .init(&ClientModuleInitArgs {
                 federation_id,
+                peer_num,
                 cfg: typed_cfg.clone(),
                 db: db.with_prefix_module_id(instance_id),
-                api_version,
+                core_api_version,
+                module_api_version,
                 module_root_secret,
                 notifier: notifier.module_notifier(instance_id),
                 api: api.clone(),
+                admin_auth,
                 module_api: api.with_module(instance_id),
                 context: ClientContext {
                     client: final_client,
@@ -371,9 +412,14 @@ where
                     module_db: db.with_prefix_module_id(instance_id),
                     _marker: marker::PhantomData,
                 },
+                task_group,
             })
             .await?
             .into())
+    }
+
+    fn get_database_migrations(&self) -> BTreeMap<DatabaseVersion, ClientMigrationFn> {
+        <Self as ClientModuleInit>::get_database_migrations(self)
     }
 }
 

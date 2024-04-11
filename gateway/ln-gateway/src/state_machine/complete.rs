@@ -17,7 +17,7 @@ use crate::gateway_lnrpc::intercept_htlc_response::{Action, Cancel, Settle};
 use crate::gateway_lnrpc::InterceptHtlcResponse;
 
 #[derive(Error, Debug, Serialize, Deserialize, Encodable, Decodable, Clone, Eq, PartialEq)]
-pub enum CompleteHtlcError {
+enum CompleteHtlcError {
     #[error("Incoming contract was not funded")]
     IncomingContractNotFunded,
     #[error("Failed to complete HTLC")]
@@ -38,7 +38,7 @@ pub enum CompleteHtlcError {
 ///    CompleteHtlc -- successfully completed or canceled htlc --> HtlcFinished
 ///    CompleteHtlc -- failed to finish htlc --> Failure
 /// ```
-#[derive(Debug, Clone, Eq, PartialEq, Decodable, Encodable)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Decodable, Encodable)]
 pub enum GatewayCompleteStates {
     WaitForPreimage(WaitForPreimageState),
     CompleteHtlc(CompleteHtlcState),
@@ -46,14 +46,14 @@ pub enum GatewayCompleteStates {
     Failure,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Decodable, Encodable)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Decodable, Encodable)]
 pub struct GatewayCompleteCommon {
     pub operation_id: OperationId,
     pub incoming_chan_id: u64,
     pub htlc_id: u64,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Decodable, Encodable)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Decodable, Encodable)]
 pub struct GatewayCompleteStateMachine {
     pub common: GatewayCompleteCommon,
     pub state: GatewayCompleteStates,
@@ -61,12 +61,11 @@ pub struct GatewayCompleteStateMachine {
 
 impl State for GatewayCompleteStateMachine {
     type ModuleContext = GatewayClientContext;
-    type GlobalContext = DynGlobalClientContext;
 
     fn transitions(
         &self,
         context: &Self::ModuleContext,
-        _global_context: &Self::GlobalContext,
+        _global_context: &DynGlobalClientContext,
     ) -> Vec<fedimint_client::sm::StateTransition<Self>> {
         match &self.state {
             GatewayCompleteStates::WaitForPreimage(state) => {
@@ -84,7 +83,7 @@ impl State for GatewayCompleteStateMachine {
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Decodable, Encodable)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Decodable, Encodable)]
 pub struct WaitForPreimageState;
 
 impl WaitForPreimageState {
@@ -149,13 +148,13 @@ impl WaitForPreimageState {
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Decodable, Encodable)]
-pub enum HtlcOutcome {
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Decodable, Encodable)]
+enum HtlcOutcome {
     Success(Preimage),
     Failure(String),
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Decodable, Encodable)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Decodable, Encodable)]
 pub struct CompleteHtlcState {
     outcome: HtlcOutcome,
 }

@@ -26,41 +26,6 @@ pub trait QueryStrategy<IR, OR = IR> {
         None
     }
     fn process(&mut self, peer_id: PeerId, response: api::PeerResult<IR>) -> QueryStep<OR>;
-
-    fn with_request_timeout(
-        self,
-        timeout: Duration,
-    ) -> QueryStrategyWithRequestTimeout<Self, IR, OR>
-    where
-        Self: Sized,
-    {
-        QueryStrategyWithRequestTimeout {
-            inner: self,
-            timeout,
-            _ir: std::marker::PhantomData,
-            _or: std::marker::PhantomData,
-        }
-    }
-}
-
-/// Wraps a strategy `S` and adds a timeout to each call
-pub struct QueryStrategyWithRequestTimeout<S, IR, OR> {
-    inner: S,
-    timeout: Duration,
-    _ir: std::marker::PhantomData<IR>,
-    _or: std::marker::PhantomData<OR>,
-}
-
-impl<IR, OR, S> QueryStrategy<IR, OR> for QueryStrategyWithRequestTimeout<S, IR, OR>
-where
-    S: QueryStrategy<IR, OR>,
-{
-    fn process(&mut self, peer_id: PeerId, response: api::PeerResult<IR>) -> QueryStep<OR> {
-        self.inner.process(peer_id, response)
-    }
-    fn request_timeout(&self) -> Option<Duration> {
-        Some(self.timeout)
-    }
 }
 
 /// Results from the strategy handling a response from a peer
@@ -217,7 +182,7 @@ impl<R: Eq + Clone + Debug, T> QueryStrategy<R, BTreeMap<PeerId, T>> for FilterM
     }
 }
 
-/// Returns when a threshold of responses are equal
+/// Returns when we obtain a threshold of identical responses
 pub struct ThresholdConsensus<R> {
     error_strategy: ErrorStrategy,
     responses: BTreeMap<PeerId, R>,
@@ -226,9 +191,7 @@ pub struct ThresholdConsensus<R> {
 }
 
 impl<R> ThresholdConsensus<R> {
-    // Require that enough participants return the same message to ensure that we
-    // overcome the threshold for malicious nodes
-    pub fn overcome_evil(total_peers: usize) -> Self {
+    pub fn new(total_peers: usize) -> Self {
         let max_evil = (total_peers - 1) / 3;
         let threshold = total_peers - max_evil;
 
@@ -237,16 +200,6 @@ impl<R> ThresholdConsensus<R> {
             responses: BTreeMap::new(),
             retry: BTreeSet::new(),
             threshold,
-        }
-    }
-
-    // Require that all participants return the same message
-    pub fn full_participation(total_peers: usize) -> Self {
-        Self {
-            error_strategy: ErrorStrategy::new(1),
-            responses: BTreeMap::new(),
-            retry: BTreeSet::new(),
-            threshold: total_peers,
         }
     }
 }
@@ -384,24 +337,24 @@ impl<R: Debug + Eq + Clone> QueryStrategy<R, Vec<R>> for UnionResponsesSingle<R>
     }
 }
 
-/// Query strategy that returns when all peers responded or a deadline passed
-pub struct AllOrDeadline<R> {
+/// Query strategy that returns when enough peers responded or a deadline passed
+pub struct ThresholdOrDeadline<R> {
     deadline: SystemTime,
-    num_peers: usize,
+    threshold: usize,
     responses: BTreeMap<PeerId, R>,
 }
 
-impl<R> AllOrDeadline<R> {
-    pub fn new(num_peers: usize, deadline: SystemTime) -> Self {
+impl<R> ThresholdOrDeadline<R> {
+    pub fn new(threshold: usize, deadline: SystemTime) -> Self {
         Self {
             deadline,
-            num_peers,
+            threshold,
             responses: BTreeMap::default(),
         }
     }
 }
 
-impl<R> QueryStrategy<R, BTreeMap<PeerId, R>> for AllOrDeadline<R> {
+impl<R> QueryStrategy<R, BTreeMap<PeerId, R>> for ThresholdOrDeadline<R> {
     fn process(
         &mut self,
         peer: PeerId,
@@ -411,7 +364,7 @@ impl<R> QueryStrategy<R, BTreeMap<PeerId, R>> for AllOrDeadline<R> {
             Ok(response) => {
                 assert!(self.responses.insert(peer, response).is_none());
 
-                if self.responses.len() == self.num_peers || self.deadline <= now() {
+                if self.threshold <= self.responses.len() || self.deadline <= now() {
                     QueryStep::Success(mem::take(&mut self.responses))
                 } else {
                     QueryStep::Continue
@@ -432,18 +385,18 @@ impl<R> QueryStrategy<R, BTreeMap<PeerId, R>> for AllOrDeadline<R> {
 /// Query for supported api versions from all the guardians (with a deadline)
 /// and calculate the best versions to use for each component (core + modules).
 pub struct DiscoverApiVersionSet {
-    inner: AllOrDeadline<SupportedApiVersionsSummary>,
+    inner: ThresholdOrDeadline<SupportedApiVersionsSummary>,
     client_versions: SupportedApiVersionsSummary,
 }
 
 impl DiscoverApiVersionSet {
     pub fn new(
-        num_peers: usize,
+        threshold: usize,
         deadline: SystemTime,
         client_versions: SupportedApiVersionsSummary,
     ) -> Self {
         Self {
-            inner: AllOrDeadline::new(num_peers, deadline),
+            inner: ThresholdOrDeadline::new(threshold, deadline),
             client_versions,
         }
     }
@@ -488,20 +441,15 @@ fn discover_common_core_api_version(
     let mut best_major = None;
     let mut best_major_peer_num = 0;
 
+    // Find major api version with highest peer number supporting it
     for client_api_version in &client_versions.api {
         let peers_compatible_num = peer_versions
             .values()
-            .filter(|supported_versions| {
-                (supported_versions.core_consensus.major == client_versions.core_consensus.major)
-                    .then(|| {
-                        supported_versions
-                            .api
-                            .get_by_major(client_api_version.major)
-                    })
-                    .flatten()
-                    .map(|peer_version| client_api_version.minor <= peer_version.minor)
-                    .unwrap_or(false)
+            .filter_map(|supported_versions| {
+                supported_versions
+                    .get_minor_api_version(client_versions.core_consensus, client_api_version.major)
             })
+            .filter(|peer_minor| client_api_version.minor <= *peer_minor)
             .count();
 
         if best_major_peer_num < peers_compatible_num {
@@ -510,7 +458,23 @@ fn discover_common_core_api_version(
         }
     }
 
-    best_major
+    // Adjust the minor version to the smallest supported by all matching peers
+    best_major.map(
+        |ApiVersion {
+             major: best_major,
+             minor: best_major_minor,
+         }| ApiVersion {
+            major: best_major,
+            minor: peer_versions
+                .values()
+                .filter_map(|supported| {
+                    supported.get_minor_api_version(client_versions.core_consensus, best_major)
+                })
+                .filter(|peer_minor| best_major_minor <= *peer_minor)
+                .min()
+                .expect("We must have at least one"),
+        },
+    )
 }
 
 #[test]
@@ -535,7 +499,7 @@ fn discover_common_core_api_version_sanity() {
                 PeerId(0),
                 SupportedCoreApiVersions {
                     core_consensus: crate::module::CoreConsensusVersion::new(0, 0),
-                    api: MultiApiVersion::try_from_iter([ApiVersion { major: 2, minor: 4 }])
+                    api: MultiApiVersion::try_from_iter([ApiVersion { major: 2, minor: 3 }])
                         .unwrap(),
                 }
             )])
@@ -549,7 +513,7 @@ fn discover_common_core_api_version_sanity() {
                 PeerId(0),
                 SupportedCoreApiVersions {
                     core_consensus: crate::module::CoreConsensusVersion::new(0, 1), /* different minor consensus version, we don't care */
-                    api: MultiApiVersion::try_from_iter([ApiVersion { major: 2, minor: 4 }])
+                    api: MultiApiVersion::try_from_iter([ApiVersion { major: 2, minor: 3 }])
                         .unwrap(),
                 }
             )])
@@ -602,6 +566,30 @@ fn discover_common_core_api_version_sanity() {
         ),
         Some(ApiVersion { major: 3, minor: 1 })
     );
+    assert_eq!(
+        discover_common_core_api_version(
+            &client_versions,
+            BTreeMap::from([
+                (
+                    PeerId(0),
+                    SupportedCoreApiVersions {
+                        core_consensus,
+                        api: MultiApiVersion::try_from_iter([ApiVersion { major: 2, minor: 4 }])
+                            .unwrap(),
+                    }
+                ),
+                (
+                    PeerId(1),
+                    SupportedCoreApiVersions {
+                        core_consensus,
+                        api: MultiApiVersion::try_from_iter([ApiVersion { major: 2, minor: 5 }])
+                            .unwrap(),
+                    }
+                ),
+            ])
+        ),
+        Some(ApiVersion { major: 2, minor: 4 })
+    );
 }
 
 fn discover_common_module_api_version(
@@ -611,22 +599,18 @@ fn discover_common_module_api_version(
     let mut best_major = None;
     let mut best_major_peer_num = 0;
 
+    // Find major api version with highest peer number supporting it
     for client_api_version in &client_versions.api {
         let peers_compatible_num = peer_versions
             .values()
-            .filter(|supported_versions| {
-                (supported_versions.core_consensus.major == client_versions.core_consensus.major
-                    && supported_versions.module_consensus.major
-                        == client_versions.module_consensus.major)
-                    .then(|| {
-                        supported_versions
-                            .api
-                            .get_by_major(client_api_version.major)
-                    })
-                    .flatten()
-                    .map(|peer_version| client_api_version.minor <= peer_version.minor)
-                    .unwrap_or(false)
+            .filter_map(|supported_versions| {
+                supported_versions.get_minor_api_version(
+                    client_versions.core_consensus,
+                    client_versions.module_consensus,
+                    client_api_version.major,
+                )
             })
+            .filter(|peer_minor| client_api_version.minor <= *peer_minor)
             .count();
 
         if best_major_peer_num < peers_compatible_num {
@@ -635,7 +619,27 @@ fn discover_common_module_api_version(
         }
     }
 
-    best_major
+    // Adjust the minor version to the smallest supported by all matching peers
+    best_major.map(
+        |ApiVersion {
+             major: best_major,
+             minor: best_major_minor,
+         }| ApiVersion {
+            major: best_major,
+            minor: peer_versions
+                .values()
+                .filter_map(|supported| {
+                    supported.get_minor_api_version(
+                        client_versions.core_consensus,
+                        client_versions.module_consensus,
+                        best_major,
+                    )
+                })
+                .filter(|peer_minor| best_major_minor <= *peer_minor)
+                .min()
+                .expect("We must have at least one"),
+        },
+    )
 }
 
 fn discover_common_api_versions_set(

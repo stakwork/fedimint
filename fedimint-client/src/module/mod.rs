@@ -5,8 +5,8 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 use std::{ffi, marker, ops};
 
-use anyhow::bail;
-use fedimint_core::api::DynGlobalApi;
+use anyhow::{anyhow, bail};
+use fedimint_core::api::{DynGlobalApi, InviteCode};
 use fedimint_core::config::ClientConfig;
 use fedimint_core::core::{
     Decoder, DynInput, DynOutput, IntoDynInstance, ModuleInstanceId, ModuleKind, OperationId,
@@ -24,12 +24,9 @@ use secp256k1_zkp::PublicKey;
 
 use self::init::ClientModuleInit;
 use crate::module::recovery::{DynModuleBackup, ModuleBackup};
-use crate::sm::{self, ActiveState, Context, DynContext, DynState, State};
+use crate::sm::{self, ActiveStateMeta, Context, DynContext, DynState, State};
 use crate::transaction::{ClientInput, ClientOutput, TransactionBuilder};
-use crate::{
-    oplog, AddStateMachinesResult, ClientArc, ClientWeak, DynGlobalClientContext,
-    TransactionUpdates,
-};
+use crate::{oplog, AddStateMachinesResult, Client, ClientStrong, ClientWeak, TransactionUpdates};
 
 pub mod init;
 pub mod recovery;
@@ -45,12 +42,12 @@ pub type ClientModuleRegistry = ModuleRegistry<DynClientModule>;
 pub struct FinalClient(Arc<std::sync::OnceLock<ClientWeak>>);
 
 impl FinalClient {
-    /// Get a temporary [`ClientArc`]
+    /// Get a temporary [`ClientStrong`]
     ///
     /// Care must be taken to not let the user take ownership of this value,
     /// and not store it elsewhere permanently either, as it could prevent
     /// the cleanup of the Client.
-    pub(crate) fn get(&self) -> ClientArc {
+    pub(crate) fn get(&self) -> ClientStrong {
         self.0
             .get()
             .expect("client must be already set")
@@ -88,7 +85,9 @@ impl<M> Clone for ClientContext<M> {
 /// A reference back to itself that the module cacn get from the
 /// [`ClientContext`]
 pub struct ClientContextSelfRef<'s, M> {
-    client: ClientArc,
+    // we are OK storing `ClientStrong` here, because of the `'s` preventing `Self` from being
+    // stored permanently somewhere
+    client: ClientStrong,
     module_instance_id: ModuleInstanceId,
     _marker: marker::PhantomData<&'s M>,
 }
@@ -137,7 +136,7 @@ where
 
     pub async fn add_state_machines(
         &mut self,
-        dyn_states: Vec<DynState<DynGlobalClientContext>>,
+        dyn_states: Vec<DynState>,
     ) -> AddStateMachinesResult {
         self.client
             .client
@@ -166,7 +165,7 @@ where
 
     pub async fn add_state_machines_dbtx(
         &mut self,
-        states: Vec<DynState<DynGlobalClientContext>>,
+        states: Vec<DynState>,
     ) -> AddStateMachinesResult {
         self.client
             .client
@@ -208,6 +207,30 @@ where
         self.client.get().decoders().clone()
     }
 
+    pub fn input_from_dyn<'i>(
+        &self,
+        input: &'i DynInput,
+    ) -> Option<&'i <M::Common as ModuleCommon>::Input> {
+        (input.module_instance_id() == self.module_instance_id).then(|| {
+            input
+                .as_any()
+                .downcast_ref::<<M::Common as ModuleCommon>::Input>()
+                .expect("instance_id just checked")
+        })
+    }
+
+    pub fn output_from_dyn<'o>(
+        &self,
+        output: &'o DynOutput,
+    ) -> Option<&'o <M::Common as ModuleCommon>::Output> {
+        (output.module_instance_id() == self.module_instance_id).then(|| {
+            output
+                .as_any()
+                .downcast_ref::<<M::Common as ModuleCommon>::Output>()
+                .expect("instance_id just checked")
+        })
+    }
+
     pub fn map_dyn<'s, 'i, 'o, I>(
         &'s self,
         typed: impl IntoIterator<Item = I> + 'i,
@@ -242,7 +265,7 @@ where
     pub fn make_client_output<O, S>(&self, output: ClientOutput<O, S>) -> ClientOutput
     where
         O: IntoDynInstance<DynType = DynOutput> + 'static,
-        S: IntoDynInstance<DynType = DynState<DynGlobalClientContext>> + 'static,
+        S: IntoDynInstance<DynType = DynState> + 'static,
     {
         self.make_dyn(output)
     }
@@ -251,14 +274,14 @@ where
     pub fn make_client_input<O, S>(&self, input: ClientInput<O, S>) -> ClientInput
     where
         O: IntoDynInstance<DynType = DynInput> + 'static,
-        S: IntoDynInstance<DynType = DynState<DynGlobalClientContext>> + 'static,
+        S: IntoDynInstance<DynType = DynState> + 'static,
     {
         self.make_dyn(input)
     }
 
-    pub fn make_dyn_state<GC, S>(&self, sm: S) -> DynState<GC>
+    pub fn make_dyn_state<S>(&self, sm: S) -> DynState
     where
-        S: sm::IState<GC> + 'static,
+        S: sm::IState + 'static,
     {
         DynState::from_typed(self.module_instance_id, sm)
     }
@@ -386,7 +409,7 @@ where
         self.client.get().has_active_states(op_id).await
     }
 
-    pub async fn get_own_active_states(&self) -> Vec<(M::States, ActiveState)> {
+    pub async fn get_own_active_states(&self) -> Vec<(M::States, ActiveStateMeta)> {
         self.client
             .get()
             .executor
@@ -410,8 +433,60 @@ where
         self.client.get().get_config().clone()
     }
 
+    /// Returns an invite code for the federation that points to an arbitrary
+    /// guardian server for fetching the config
+    pub fn get_invite_code(&self) -> InviteCode {
+        let cfg = self.get_config().global;
+        let (any_guardian_id, any_guardian_url) = cfg
+            .api_endpoints
+            .iter()
+            .next()
+            .expect("A federation always has at least one guardian");
+        InviteCode::new(
+            any_guardian_url.url.clone(),
+            *any_guardian_id,
+            cfg.calculate_federation_id(),
+        )
+    }
+
     pub fn get_internal_payment_markers(&self) -> anyhow::Result<(PublicKey, u64)> {
         self.client.get().get_internal_payment_markers()
+    }
+
+    /// This method starts n state machines with given operation id without a
+    /// corresponding transaction
+    pub async fn manual_operation_start(
+        &self,
+        operation_id: OperationId,
+        op_type: &str,
+        operation_meta: impl serde::Serialize + Debug,
+        sms: Vec<DynState>,
+    ) -> anyhow::Result<()> {
+        let db = self.client.get().db().clone();
+        let mut dbtx = db.begin_transaction().await;
+
+        if Client::operation_exists_dbtx(&mut dbtx.to_ref_nc(), operation_id).await {
+            bail!("Operation with id {operation_id} already exists");
+        }
+
+        self.client
+            .get()
+            .operation_log
+            .add_operation_log_entry(&mut dbtx.to_ref_nc(), operation_id, op_type, operation_meta)
+            .await;
+
+        self.client
+            .get()
+            .executor
+            .add_state_machines_dbtx(&mut dbtx.to_ref_nc(), sms)
+            .await
+            .expect("State machine is valid");
+
+        dbtx.commit_tx_result()
+            .await
+            .map_err(|_| anyhow!("Operation with id {operation_id} already exists"))?;
+
+        Ok(())
     }
 }
 
@@ -432,10 +507,8 @@ pub trait ClientModule: Debug + MaybeSend + MaybeSync + 'static {
     type ModuleStateMachineContext: Context;
 
     /// All possible states this client can submit to the executor
-    type States: State<
-            GlobalContext = DynGlobalClientContext,
-            ModuleContext = Self::ModuleStateMachineContext,
-        > + IntoDynInstance<DynType = DynState<DynGlobalClientContext>>;
+    type States: State<ModuleContext = Self::ModuleStateMachineContext>
+        + IntoDynInstance<DynType = DynState>;
 
     fn decoder() -> Decoder {
         let mut decoder_builder = Self::Common::decoder_builder();

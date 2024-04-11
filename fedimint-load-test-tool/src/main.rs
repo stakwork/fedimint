@@ -8,21 +8,24 @@ use anyhow::{bail, Context};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use common::{
     cln_create_invoice, cln_pay_invoice, cln_wait_invoice_payment, gateway_pay_invoice,
-    get_note_summary, lnd_create_invoice, lnd_pay_invoice, lnd_wait_invoice_payment, reissue_notes,
+    get_note_summary, lnd_create_invoice, lnd_pay_invoice, lnd_wait_invoice_payment,
+    parse_gateway_id, reissue_notes,
 };
 use devimint::cmd;
 use devimint::util::{GatewayClnCli, GatewayLndCli};
-use fedimint_client::ClientArc;
-use fedimint_core::api::{DynGlobalApi, InviteCode};
+use fedimint_client::ClientHandleArc;
+use fedimint_core::api::InviteCode;
+use fedimint_core::config::ClientConfig;
 use fedimint_core::endpoint_constants::SESSION_COUNT_ENDPOINT;
 use fedimint_core::module::ApiRequestErased;
-use fedimint_core::task::spawn;
+use fedimint_core::runtime::spawn;
 use fedimint_core::util::{BoxFuture, SafeUrl};
 use fedimint_core::Amount;
 use fedimint_ln_client::{LightningClientModule, LnReceiveState};
+use fedimint_ln_common::LightningGateway;
 use fedimint_mint_client::OOBNotes;
 use futures::StreamExt;
-use lightning_invoice::Bolt11Invoice;
+use lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescription, Description};
 use serde::{Deserialize, Serialize};
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufWriter};
@@ -30,8 +33,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::common::{
-    build_client, do_spend_notes, get_invite_code_cli, remint_denomination, switch_default_gateway,
-    try_get_notes_cli,
+    build_client, do_spend_notes, get_invite_code_cli, remint_denomination, try_get_notes_cli,
 };
 pub mod common;
 
@@ -292,8 +294,7 @@ async fn main() -> anyhow::Result<()> {
     let summary_handle = spawn("handle metrics summary", {
         let opts = opts.clone();
         async move { handle_metrics_summary(opts, event_receiver).await }
-    })
-    .expect("some handle on non-wasm");
+    });
     let futures = match opts.command.clone() {
         Command::TestConnect {
             invite_code,
@@ -391,9 +392,8 @@ async fn main() -> anyhow::Result<()> {
     }
     if len_failures > 0 {
         bail!("Finished with failures");
-    } else {
-        info!("Finished successfully")
     }
+    info!("Finished successfully");
     Ok(())
 }
 
@@ -441,7 +441,7 @@ async fn run_load_test(
 
     print_coordinator_notes(&coordinator).await?;
 
-    let users_clients = get_users_clients(users, db_path, invite_code, gateway_id).await?;
+    let users_clients = get_users_clients(users, db_path, invite_code).await?;
 
     let mut users_notes =
         get_notes_for_users(users, notes_per_user, coordinator, note_denomination).await?;
@@ -475,6 +475,7 @@ async fn run_load_test(
                 invoices,
                 generate_invoice_with,
                 event_sender,
+                gateway_id.clone(),
             ));
             f
         })
@@ -486,7 +487,7 @@ async fn run_load_test(
 async fn get_notes_for_users(
     users: u16,
     notes_per_user: u16,
-    coordinator: ClientArc,
+    coordinator: ClientHandleArc,
     note_denomination: Amount,
 ) -> anyhow::Result<HashMap<u16, Vec<OOBNotes>>> {
     let mut users_notes = HashMap::new();
@@ -506,11 +507,10 @@ async fn get_users_clients(
     n: u16,
     db_path: Option<PathBuf>,
     invite_code: Option<InviteCode>,
-    gateway_id: Option<String>,
-) -> anyhow::Result<Vec<ClientArc>> {
+) -> anyhow::Result<Vec<ClientHandleArc>> {
     let mut users_clients = Vec::with_capacity(n.into());
     for u in 0..n {
-        let (client, _) = get_user_client(u, &db_path, &invite_code, &gateway_id).await?;
+        let (client, _) = get_user_client(u, &db_path, &invite_code).await?;
         users_clients.push(client);
     }
     Ok(users_clients)
@@ -520,8 +520,7 @@ async fn get_user_client(
     user_index: u16,
     db_path: &Option<PathBuf>,
     invite_code: &Option<InviteCode>,
-    gateway_id: &Option<String>,
-) -> anyhow::Result<(ClientArc, Option<InviteCode>)> {
+) -> anyhow::Result<(ClientHandleArc, Option<InviteCode>)> {
     let user_db = db_path
         .as_ref()
         .map(|db_path| db_path.join(format!("user_{user_index}.db")));
@@ -531,13 +530,10 @@ async fn get_user_client(
         invite_code.clone()
     };
     let (client, invite_code) = build_client(user_invite_code, user_db.as_ref()).await?;
-    if let Some(gateway_id) = gateway_id {
-        switch_default_gateway(&client, gateway_id).await?;
-    }
     Ok((client, invite_code))
 }
 
-async fn print_coordinator_notes(coordinator: &ClientArc) -> anyhow::Result<()> {
+async fn print_coordinator_notes(coordinator: &ClientHandleArc) -> anyhow::Result<()> {
     info!("Note summary:");
     let summary = get_note_summary(coordinator).await?;
     for (k, v) in summary.iter() {
@@ -547,7 +543,7 @@ async fn print_coordinator_notes(coordinator: &ClientArc) -> anyhow::Result<()> 
 }
 
 async fn get_required_notes(
-    coordinator: &ClientArc,
+    coordinator: &ClientHandleArc,
     minimum_amount_required: Amount,
     event_sender: &mpsc::UnboundedSender<MetricEvent>,
 ) -> anyhow::Result<()> {
@@ -571,7 +567,7 @@ async fn get_required_notes(
 
 async fn reissue_initial_notes(
     initial_notes: Option<OOBNotes>,
-    coordinator: &ClientArc,
+    coordinator: &ClientHandleArc,
     event_sender: &mpsc::UnboundedSender<MetricEvent>,
 ) -> anyhow::Result<()> {
     if let Some(notes) = initial_notes {
@@ -585,7 +581,7 @@ async fn reissue_initial_notes(
 async fn get_coordinator_client(
     db_path: &Option<PathBuf>,
     invite_code: &Option<InviteCode>,
-) -> anyhow::Result<(ClientArc, Option<InviteCode>)> {
+) -> anyhow::Result<(ClientHandleArc, Option<InviteCode>)> {
     let (client, invite_code) = if let Some(db_path) = db_path {
         let coordinator_db = db_path.join("coordinator.db");
         if coordinator_db.exists() {
@@ -618,10 +614,19 @@ fn get_db_path(archive_dir: Option<PathBuf>) -> Option<PathBuf> {
     archive_dir.as_ref().map(|p| p.join("db"))
 }
 
+async fn get_lightning_gateway(
+    client: &ClientHandleArc,
+    gateway_id: Option<String>,
+) -> Option<LightningGateway> {
+    let gateway_id = parse_gateway_id(gateway_id.or(None)?.as_str()).expect("Invalid gateway id");
+    let ln_module = client.get_first_module::<LightningClientModule>();
+    ln_module.select_gateway(&gateway_id).await
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn do_load_test_user_task(
     prefix: String,
-    client: ClientArc,
+    client: ClientHandleArc,
     oob_notes: Vec<OOBNotes>,
     generated_invoices_per_user: u16,
     ln_payment_sleep: Duration,
@@ -629,7 +634,9 @@ async fn do_load_test_user_task(
     additional_invoices: Vec<Bolt11Invoice>,
     generate_invoice_with: Option<LnInvoiceGeneration>,
     event_sender: mpsc::UnboundedSender<MetricEvent>,
+    gateway_id: Option<String>,
 ) -> anyhow::Result<()> {
+    let ln_gateway = get_lightning_gateway(&client, gateway_id).await;
     for oob_note in oob_notes {
         let amount = oob_note.total_amount();
         reissue_notes(&client, oob_note, &event_sender)
@@ -645,12 +652,28 @@ async fn do_load_test_user_task(
             match generate_invoice_with {
                 Some(LnInvoiceGeneration::ClnLightningCli) => {
                     let (invoice, label) = cln_create_invoice(invoice_amount).await?;
-                    gateway_pay_invoice(&prefix, "LND", &client, invoice, &event_sender).await?;
+                    gateway_pay_invoice(
+                        &prefix,
+                        "LND",
+                        &client,
+                        invoice,
+                        &event_sender,
+                        ln_gateway.clone(),
+                    )
+                    .await?;
                     cln_wait_invoice_payment(&label).await?;
                 }
                 Some(LnInvoiceGeneration::LnCli) => {
                     let (invoice, r_hash) = lnd_create_invoice(invoice_amount).await?;
-                    gateway_pay_invoice(&prefix, "CLN", &client, invoice, &event_sender).await?;
+                    gateway_pay_invoice(
+                        &prefix,
+                        "CLN",
+                        &client,
+                        invoice,
+                        &event_sender,
+                        ln_gateway.clone(),
+                    )
+                    .await?;
                     lnd_wait_invoice_payment(r_hash).await?;
                 }
                 None if additional_invoices.is_empty() => {
@@ -677,7 +700,15 @@ async fn do_load_test_user_task(
         } else if invoice_amount == Amount::ZERO {
             warn!("Can't pay invoice {invoice}, amount is zero");
         } else {
-            gateway_pay_invoice(&prefix, "unknown", &client, invoice, &event_sender).await?;
+            gateway_pay_invoice(
+                &prefix,
+                "unknown",
+                &client,
+                invoice,
+                &event_sender,
+                ln_gateway.clone(),
+            )
+            .await?;
             if additional_invoices.peek().is_some() {
                 // Only sleep while there are more invoices to pay
                 fedimint_core::task::sleep(ln_payment_sleep).await;
@@ -714,7 +745,7 @@ async fn run_ln_circular_load_test(
 
     print_coordinator_notes(&coordinator).await?;
 
-    let users_clients = get_users_clients(users, db_path, invite_code.clone(), None).await?;
+    let users_clients = get_users_clients(users, db_path, invite_code.clone()).await?;
 
     let mut users_notes =
         get_notes_for_users(users, notes_per_user, coordinator, note_denomination).await?;
@@ -748,7 +779,7 @@ async fn run_ln_circular_load_test(
 #[allow(clippy::too_many_arguments)]
 async fn do_ln_circular_test_user_task(
     prefix: String,
-    client: ClientArc,
+    client: ClientHandleArc,
     invite_code: Option<InviteCode>,
     oob_notes: Vec<OOBNotes>,
     test_duration: Duration,
@@ -786,13 +817,14 @@ async fn do_ln_circular_test_user_task(
             };
             while still_ontime().await {
                 let gateway_id = get_gateway_id(invoice_generation).await?;
-                switch_default_gateway(&client, &gateway_id).await?;
+                let ln_gateway = get_lightning_gateway(&client, Some(gateway_id)).await;
                 run_two_gateways_strategy(
                     &prefix,
                     &mut invoice_generation,
                     &invoice_amount,
                     &event_sender,
                     &client,
+                    ln_gateway,
                 )
                 .await?;
                 sleep_a_bit().await;
@@ -823,7 +855,8 @@ async fn run_two_gateways_strategy(
     invoice_generation: &mut LnInvoiceGeneration,
     invoice_amount: &Amount,
     event_sender: &mpsc::UnboundedSender<MetricEvent>,
-    client: &ClientArc,
+    client: &ClientHandleArc,
+    ln_gateway: Option<LightningGateway>,
 ) -> Result<(), anyhow::Error> {
     let create_invoice_time = fedimint_core::time::now();
     match *invoice_generation {
@@ -835,10 +868,18 @@ async fn run_two_gateways_strategy(
                 name: GATEWAY_CREATE_INVOICE.into(),
                 duration: elapsed,
             })?;
-            gateway_pay_invoice(prefix, "LND", client, invoice, event_sender).await?;
+            gateway_pay_invoice(
+                prefix,
+                "LND",
+                client,
+                invoice,
+                event_sender,
+                ln_gateway.clone(),
+            )
+            .await?;
             cln_wait_invoice_payment(&label).await?;
             let (operation_id, invoice) =
-                client_create_invoice(client, *invoice_amount, event_sender).await?;
+                client_create_invoice(client, *invoice_amount, event_sender, ln_gateway).await?;
             let pay_invoice_time = fedimint_core::time::now();
             cln_pay_invoice(invoice).await?;
             wait_invoice_payment(
@@ -860,10 +901,18 @@ async fn run_two_gateways_strategy(
                 name: GATEWAY_CREATE_INVOICE.into(),
                 duration: elapsed,
             })?;
-            gateway_pay_invoice(prefix, "CLN", client, invoice, event_sender).await?;
+            gateway_pay_invoice(
+                prefix,
+                "CLN",
+                client,
+                invoice,
+                event_sender,
+                ln_gateway.clone(),
+            )
+            .await?;
             lnd_wait_invoice_payment(r_hash).await?;
             let (operation_id, invoice) =
-                client_create_invoice(client, *invoice_amount, event_sender).await?;
+                client_create_invoice(client, *invoice_amount, event_sender, ln_gateway).await?;
             let pay_invoice_time = fedimint_core::time::now();
             lnd_pay_invoice(invoice).await?;
             wait_invoice_payment(
@@ -883,17 +932,17 @@ async fn run_two_gateways_strategy(
 
 async fn do_self_payment(
     prefix: &str,
-    client: &ClientArc,
+    client: &ClientHandleArc,
     invoice_amount: Amount,
     event_sender: &mpsc::UnboundedSender<MetricEvent>,
 ) -> anyhow::Result<()> {
     let (operation_id, invoice) =
-        client_create_invoice(client, invoice_amount, event_sender).await?;
+        client_create_invoice(client, invoice_amount, event_sender, None).await?;
     let pay_invoice_time = fedimint_core::time::now();
     let lightning_module = client.get_first_module::<LightningClientModule>();
-    let gateway = lightning_module.select_active_gateway_opt().await;
+    //let gateway = lightning_module.select_active_gateway_opt().await;
     lightning_module
-        .pay_bolt11_invoice(gateway, invoice, ())
+        .pay_bolt11_invoice(None, invoice, ())
         .await?;
     wait_invoice_payment(
         prefix,
@@ -909,19 +958,20 @@ async fn do_self_payment(
 
 async fn do_partner_ping_pong(
     prefix: &str,
-    client: &ClientArc,
-    partner: &ClientArc,
+    client: &ClientHandleArc,
+    partner: &ClientHandleArc,
     invoice_amount: Amount,
     event_sender: &mpsc::UnboundedSender<MetricEvent>,
 ) -> anyhow::Result<()> {
     // Ping (partner creates invoice, client pays)
     let (operation_id, invoice) =
-        client_create_invoice(partner, invoice_amount, event_sender).await?;
+        client_create_invoice(partner, invoice_amount, event_sender, None).await?;
     let pay_invoice_time = fedimint_core::time::now();
     let lightning_module = client.get_first_module::<LightningClientModule>();
-    let gateway = lightning_module.select_active_gateway_opt().await;
+    // TODO: Select random gateway?
+    //let gateway = lightning_module.select_active_gateway_opt().await;
     lightning_module
-        .pay_bolt11_invoice(gateway, invoice, ())
+        .pay_bolt11_invoice(None, invoice, ())
         .await?;
     wait_invoice_payment(
         prefix,
@@ -934,12 +984,13 @@ async fn do_partner_ping_pong(
     .await?;
     // Pong (client creates invoice, partner pays)
     let (operation_id, invoice) =
-        client_create_invoice(client, invoice_amount, event_sender).await?;
+        client_create_invoice(client, invoice_amount, event_sender, None).await?;
     let pay_invoice_time = fedimint_core::time::now();
     let partner_lightning_module = partner.get_first_module::<LightningClientModule>();
-    let gateway = partner_lightning_module.select_active_gateway_opt().await;
+    //let gateway = partner_lightning_module.select_active_gateway_opt().await;
+    // TODO: Select random gateway?
     partner_lightning_module
-        .pay_bolt11_invoice(gateway, invoice, ())
+        .pay_bolt11_invoice(None, invoice, ())
         .await?;
     wait_invoice_payment(
         prefix,
@@ -956,7 +1007,7 @@ async fn do_partner_ping_pong(
 async fn wait_invoice_payment(
     prefix: &str,
     gateway_name: &str,
-    client: &ClientArc,
+    client: &ClientHandleArc,
     operation_id: fedimint_core::core::OperationId,
     event_sender: &mpsc::UnboundedSender<MetricEvent>,
     pay_invoice_time: std::time::SystemTime,
@@ -973,7 +1024,7 @@ async fn wait_invoice_payment(
         .await?
         .into_stream();
     while let Some(update) = updates.next().await {
-        info!("{prefix} Update: {update:?}");
+        debug!(%prefix, ?update, "Invoice payment update");
         match update {
             LnReceiveState::Claimed => {
                 let elapsed: Duration = pay_invoice_time.elapsed()?;
@@ -1004,14 +1055,22 @@ async fn wait_invoice_payment(
 }
 
 async fn client_create_invoice(
-    client: &ClientArc,
+    client: &ClientHandleArc,
     invoice_amount: Amount,
     event_sender: &mpsc::UnboundedSender<MetricEvent>,
+    ln_gateway: Option<LightningGateway>,
 ) -> anyhow::Result<(fedimint_core::core::OperationId, Bolt11Invoice)> {
     let create_invoice_time = fedimint_core::time::now();
     let lightning_module = client.get_first_module::<LightningClientModule>();
+    let desc = Description::new("test".to_string())?;
     let (operation_id, invoice, _) = lightning_module
-        .create_bolt11_invoice(invoice_amount, "".into(), None, ())
+        .create_bolt11_invoice(
+            invoice_amount,
+            Bolt11InvoiceDescription::Direct(&desc),
+            None,
+            (),
+            ln_gateway,
+        )
         .await?;
     let elapsed = create_invoice_time.elapsed()?;
     info!("Created invoice using gateway in {elapsed:?}");
@@ -1027,16 +1086,13 @@ async fn test_download_config(
     users: u16,
     event_sender: mpsc::UnboundedSender<MetricEvent>,
 ) -> anyhow::Result<Vec<BoxFuture<'static, anyhow::Result<()>>>> {
-    let api = DynGlobalApi::from_invite_code(&[invite_code.clone()]);
-
     Ok((0..users)
         .map(|_| {
-            let api = api.clone();
             let invite_code = invite_code.clone();
             let event_sender = event_sender.clone();
             let f: BoxFuture<_> = Box::pin(async move {
                 let m = fedimint_core::time::now();
-                let _ = api.download_client_config(&invite_code).await?;
+                let _ = ClientConfig::download_from_invite_code(&invite_code).await?;
                 event_sender.send(MetricEvent {
                     name: "download_client_config".into(),
                     duration: m.elapsed()?,
@@ -1056,8 +1112,7 @@ async fn test_connect_raw_client(
     limit_endpoints: Option<usize>,
     event_sender: mpsc::UnboundedSender<MetricEvent>,
 ) -> anyhow::Result<Vec<BoxFuture<'static, anyhow::Result<()>>>> {
-    let api = DynGlobalApi::from_invite_code(&[invite_code.clone()]);
-    let mut cfg = api.download_client_config(&invite_code).await?;
+    let mut cfg = ClientConfig::download_from_invite_code(&invite_code).await?;
 
     if let Some(limit_endpoints) = limit_endpoints {
         cfg.global.api_endpoints = cfg
@@ -1194,6 +1249,7 @@ async fn handle_metrics_summary(
             tokio::fs::OpenOptions::new()
                 .write(true)
                 .create(true)
+                .truncate(true)
                 .open(metrics_json_output)
                 .await?,
         ))

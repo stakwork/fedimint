@@ -17,6 +17,11 @@ on:
   # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
 
+# https://stackoverflow.com/questions/66335225/how-to-cancel-previous-runs-in-the-pr-when-you-push-new-commitsupdate-the-curre
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 # A workflow run is made up of one or more jobs that can run sequentially or in parallel
 jobs:
   self-care:
@@ -36,9 +41,12 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - uses: cachix/install-nix-action@v25
+      - uses: cachix/install-nix-action@v26
         with:
-          nix_path: nixpkgs=channel:nixos-22.05
+          nix_path: nixpkgs=channel:nixos-23.11
+          extra_nix_config: |
+            connect-timeout = 15
+            stalled-download-timeout = 15
       - uses: cachix/cachix-action@v14
         with:
           name: fedimint
@@ -62,6 +70,49 @@ jobs:
       - name: Check `nix flake show`
         run: nix flake show .#
 
+  shell:
+    if: github.repository == 'fedimint/fedimint'
+    strategy:
+      matrix:
+        host:
+          - linux
+          - macos
+        include:
+          - host: linux
+            runs-on: buildjet-4vcpu-ubuntu-2004
+            build-in-pr: false
+            timeout: 30
+          - host: macos
+            runs-on: macos-14
+            build-in-pr: false
+            timeout: 30
+
+    name: "Dev Shell on ${{ matrix.host }}"
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: ${{ matrix.timeout }}
+
+    steps:
+      - uses: actions/checkout@v4
+        if: github.event_name != 'pull_request' || matrix.build-in-pr
+
+      - uses: cachix/install-nix-action@v26
+        if: github.event_name != 'pull_request' || matrix.build-in-pr
+        with:
+          nix_path: nixpkgs=channel:nixos-23.11
+          extra_nix_config: |
+            connect-timeout = 15
+            stalled-download-timeout = 15
+      - uses: cachix/cachix-action@v14
+        if: github.event_name != 'pull_request' || matrix.build-in-pr
+        with:
+          name: fedimint
+          authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
+        continue-on-error: true
+
+      - name: Build dev shell
+        if: github.event_name != 'pull_request' || matrix.build-in-pr
+        run: nix develop -L -c true
+
   build:
     if: github.repository == 'fedimint/fedimint'
     strategy:
@@ -73,10 +124,10 @@ jobs:
           - host: linux
             runs-on: buildjet-8vcpu-ubuntu-2004
             build-in-pr: true
-            timeout: 60
+            timeout: 75
             run-tests: true
           - host: macos
-            runs-on: macos-12
+            runs-on: macos-14
             build-in-pr: false
             # TODO: Too slow; see https://github.com/actions/runner-images/issues/1336
             timeout: 60
@@ -90,10 +141,13 @@ jobs:
       - uses: actions/checkout@v4
         if: github.event_name != 'pull_request' || matrix.build-in-pr
 
-      - uses: cachix/install-nix-action@v25
+      - uses: cachix/install-nix-action@v26
         if: github.event_name != 'pull_request' || matrix.build-in-pr
         with:
-          nix_path: nixpkgs=channel:nixos-22.05
+          nix_path: nixpkgs=channel:nixos-23.11
+          extra_nix_config: |
+            connect-timeout = 15
+            stalled-download-timeout = 15
       - uses: cachix/cachix-action@v14
         if: github.event_name != 'pull_request' || matrix.build-in-pr
         with:
@@ -103,28 +157,33 @@ jobs:
 
       - name: Build workspace
         if: github.event_name != 'pull_request' || matrix.build-in-pr
-        run: nix build -L .#ci.workspaceBuild
+        run: nix run "github:Mic92/nix-fast-build?rev=4376b8a33b217ee2f78ba3dcff01a3e464d13a46" -- --skip-cached --no-nom --flake .#legacyPackages.$(nix eval --raw --impure --expr builtins.currentSystem).ci.workspaceBuild
 
       - name: Clippy workspace
         if: github.event_name != 'pull_request' || matrix.build-in-pr
-        run: nix build -L .#ci.workspaceClippy
+        run: nix run "github:Mic92/nix-fast-build?rev=4376b8a33b217ee2f78ba3dcff01a3e464d13a46" -- --skip-cached --no-nom --flake .#legacyPackages.$(nix eval --raw --impure --expr builtins.currentSystem).ci.workspaceClippy
 
       - name: Run cargo doc
         if: (github.event_name != 'pull_request' || matrix.build-in-pr) && (matrix.host != 'macos')
-        run: nix build -L .#ci.workspaceDoc
+        run: nix run "github:Mic92/nix-fast-build?rev=4376b8a33b217ee2f78ba3dcff01a3e464d13a46" -- --skip-cached --no-nom --flake .#legacyPackages.$(nix eval --raw --impure --expr builtins.currentSystem).ci.workspaceDoc
 
       - name: Test docs
         if: (github.event_name != 'pull_request' || matrix.build-in-pr) && (matrix.host != 'macos')
-        run: nix build -L .#ci.workspaceTestDoc
+        run: nix run "github:Mic92/nix-fast-build?rev=4376b8a33b217ee2f78ba3dcff01a3e464d13a46" -- --skip-cached --no-nom --flake .#legacyPackages.$(nix eval --raw --impure --expr builtins.currentSystem).ci.workspaceTestDoc
 
       - name: Tests
         if: (github.event_name != 'pull_request' || matrix.build-in-pr) && matrix.run-tests
         run: |
-          nix build -L .#ci.ciTestAll --keep-failed
+          nix run "github:Mic92/nix-fast-build?rev=4376b8a33b217ee2f78ba3dcff01a3e464d13a46" -- --skip-cached --no-nom --option keep-failed true --flake .#legacyPackages.$(nix eval --raw --impure --expr builtins.currentSystem).wasm32-unknown.ci.ciTestAll
+
+      - name: Tests (5 times more)
+        if: github.event_name == 'merge_group' && matrix.run-tests
+        run: |
+          nix build -L .#wasm32-unknown.ci.ciTestAll5Times --keep-failed
 
       - name: Wasm Tests
         if: (github.event_name != 'pull_request' || matrix.build-in-pr) && matrix.run-tests && (matrix.host != 'macos')
-        run: nix build -L .#wasm32-unknown.ci.wasmTest --keep-failed
+        run: nix run "github:Mic92/nix-fast-build?rev=4376b8a33b217ee2f78ba3dcff01a3e464d13a46" -- --skip-cached --no-nom --option keep-failed true --flake .#legacyPackages.$(nix eval --raw --impure --expr builtins.currentSystem).wasm32-unknown.ci.wasmTest
 
       - name: Prepare failed test build dirs
         if: always()
@@ -156,9 +215,12 @@ jobs:
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
-      - uses: cachix/install-nix-action@v25
+      - uses: cachix/install-nix-action@v26
         with:
-          nix_path: nixpkgs=channel:nixos-22.05
+          nix_path: nixpkgs=channel:nixos-23.11
+          extra_nix_config: |
+            connect-timeout = 15
+            stalled-download-timeout = 15
       - uses: cachix/cachix-action@v14
         with:
           name: fedimint
@@ -167,11 +229,11 @@ jobs:
       - name: Run cargo audit
         run: |
           nix flake update advisory-db
-          nix build -L .#ci.cargoAudit
+          nix run "github:Mic92/nix-fast-build?rev=4376b8a33b217ee2f78ba3dcff01a3e464d13a46" -- --skip-cached --no-nom --flake .#legacyPackages.$(nix eval --raw --impure --expr builtins.currentSystem).ci.cargoAudit
 
       - name: Run cargo deny
         run: |
-          nix build -L .#ci.cargoDeny
+          nix run "github:Mic92/nix-fast-build?rev=4376b8a33b217ee2f78ba3dcff01a3e464d13a46" -- --skip-cached --no-nom --flake .#legacyPackages.$(nix eval --raw --impure --expr builtins.currentSystem).ci.cargoDeny
 
   # Code Coverage will build using a completely different profile (neither debug/release)
   # Which means we can not reuse much from `build` job. Might as well run it as another
@@ -183,9 +245,12 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      - uses: cachix/install-nix-action@v25
+      - uses: cachix/install-nix-action@v26
         with:
-          nix_path: nixpkgs=channel:nixos-22.05
+          nix_path: nixpkgs=channel:nixos-23.11
+          extra_nix_config: |
+            connect-timeout = 15
+            stalled-download-timeout = 15
       - uses: cachix/cachix-action@v14
         with:
           name: fedimint
@@ -196,16 +261,22 @@ jobs:
         run: nix run nixpkgs#curl -- --fail-with-body -X POST --data-binary @.codecov.yml https://codecov.io/validate
 
       - name: Build and run tests with Code Coverage
-        run: nix build -L .#ci.workspaceCov
+        run: nix run "github:Mic92/nix-fast-build?rev=4376b8a33b217ee2f78ba3dcff01a3e464d13a46" -- --skip-cached --no-nom --flake .#legacyPackages.$(nix eval --raw --impure --expr builtins.currentSystem).ci.workspaceTestCov
 
-      - name: Ensure lcov.info exists
-        run: test -f result/lcov.info
+      # nix-fast-build will not create `result-` (- on purpuse) if the result was already build
+      # which is kind of OK - no code changes requires no codecov message.
+      # - name: Ensure lcov.info exists
+      #   run: test -f result-/lcov.info
 
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v3
+        uses: codecov/codecov-action@v4
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: result/lcov.info
+
+      - name: Build and run tests with Code Coverage (5 times more)
+        if: github.event_name == 'merge_group'
+        run: nix build -L .#ci.workspaceTest5TimesCov
 
   cross:
     name: "Cross-compile on ${{ matrix.host }} to ${{ matrix.toolchain }}"
@@ -224,19 +295,21 @@ jobs:
           - host: linux
             runs-on: ubuntu-22.04
             build-in-pr: true
-            timeout: 20
+            # TODO: debugging network issues, should reduce to 20 minutes
+            # https://github.com/fedimint/fedimint/issues/4488
+            timeout: 60
           - host: macos
-            runs-on: macos-12
+            runs-on: macos-14
             build-in-pr: false
             # TODO: Too slow; see https://github.com/actions/runner-images/issues/1336
-            timeout: 60
+            timeout: 120
         exclude:
             # there's not enough macos runners available for our CI, so test only the more important cross-compilation toolchains
             # if they work, rest probably works as well
           - host: macos
-            toolchain: armv7-linux-androideabi
+            toolchain: armv7-android
           - host: macos
-            toolchain: x86_64-linux-android
+            toolchain: x86_64-android
 
 
     runs-on: ${{ matrix.runs-on }}
@@ -246,10 +319,13 @@ jobs:
       - uses: actions/checkout@v4
         if: github.event_name != 'pull_request' || matrix.build-in-pr
 
-      - uses: cachix/install-nix-action@v25
+      - uses: cachix/install-nix-action@v26
         if: github.event_name != 'pull_request' || matrix.build-in-pr
         with:
-          nix_path: nixpkgs=channel:nixos-22.05
+          nix_path: nixpkgs=channel:nixos-23.11
+          extra_nix_config: |
+            connect-timeout = 15
+            stalled-download-timeout = 15
 
       - uses: cachix/cachix-action@v14
         if: github.event_name != 'pull_request' || matrix.build-in-pr
@@ -260,22 +336,31 @@ jobs:
 
       - name: Build client packages for ${{ matrix.toolchain }}
         if: github.event_name != 'pull_request' || matrix.build-in-pr
-        run: nix build -L .#${{ matrix.toolchain }}.ci.client-pkgs
+        run: |
+          # nix-fast-build seems to strugle
+          if [[ "${{ matrix.host }}" == "macos" ]]; then
+            nix build -L .#ci.client-pkgs
+          else
+            nix run "github:Mic92/nix-fast-build?rev=4376b8a33b217ee2f78ba3dcff01a3e464d13a46" -- --skip-cached --no-nom --flake .#legacyPackages.$(nix eval --raw --impure --expr builtins.currentSystem).${{ matrix.toolchain }}.ci.client-pkgs
+          fi
 
   containers:
     if: github.repository == 'fedimint/fedimint'
     name: "Containers"
     runs-on: buildjet-8vcpu-ubuntu-2004
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
       - name: Prepare
         uses: ./.github/actions/prepare
       - uses: actions/checkout@v4
-      - uses: cachix/install-nix-action@v25
+      - uses: cachix/install-nix-action@v26
         with:
-          nix_path: nixpkgs=channel:nixos-22.05
+          nix_path: nixpkgs=channel:nixos-23.11
+          extra_nix_config: |
+            connect-timeout = 15
+            stalled-download-timeout = 15
       - uses: cachix/cachix-action@v14
         with:
           name: fedimint
@@ -284,27 +369,47 @@ jobs:
 
       - name: Build fedimintd container
         run: |
-          nix build -L .#container.fedimintd
+          if [ "$GITHUB_EVENT_NAME" == "pull_request" ] || [ "$GITHUB_EVENT_NAME" == "merge_group" ]; then
+            nix build -L .#ci.container.fedimintd
+          else
+            nix build -L .#container.fedimintd
+          fi
           echo "fedimintd_container_tag=$(docker load < result | awk '{ print $3 }')" >> $GITHUB_ENV
 
       - name: Build fedimint-cli container
         run: |
-          nix build -L .#container.fedimint-cli
+          if [ "$GITHUB_EVENT_NAME" == "pull_request" ] || [ "$GITHUB_EVENT_NAME" == "merge_group" ]; then
+            nix build -L .#ci.container.fedimint-cli
+          else
+            nix build -L .#container.fedimint-cli
+          fi
           echo "fedimint_cli_container_tag=$(docker load < result | awk '{ print $3 }')" >> $GITHUB_ENV
 
       - name: Build gatewayd container
         run: |
-          nix build -L .#container.gatewayd
+          if [ "$GITHUB_EVENT_NAME" == "pull_request" ] || [ "$GITHUB_EVENT_NAME" == "merge_group" ]; then
+            nix build -L .#ci.container.gatewayd
+          else
+            nix build -L .#container.gatewayd
+          fi
           echo "gatewayd_container_tag=$(docker load < result | awk '{ print $3 }')" >> $GITHUB_ENV
 
       - name: Build gateway-cli container
         run: |
-          nix build -L .#container.gateway-cli
+          if [ "$GITHUB_EVENT_NAME" == "pull_request" ] || [ "$GITHUB_EVENT_NAME" == "merge_group" ]; then
+            nix build -L .#ci.container.gateway-cli
+          else
+            nix build -L .#container.gateway-cli
+          fi
           echo "gateway-cli_container_tag=$(docker load < result | awk '{ print $3 }')" >> $GITHUB_ENV
 
       - name: Build devtools container
         run: |
-          nix build -L .#container.devtools
+          if [ "$GITHUB_EVENT_NAME" == "pull_request" ] || [ "$GITHUB_EVENT_NAME" == "merge_group" ]; then
+            nix build -L .#ci.container.devtools
+          else
+            nix build -L .#container.devtools
+          fi
           echo "devtools_container_tag=$(docker load < result | awk '{ print $3 }')" >> $GITHUB_ENV
 
       - name: Login to Docker Hub
@@ -352,21 +457,32 @@ jobs:
             bins: fedimintd,fedimint-cli,fedimint-dbtool
             deb: fedimint
           - flake-output: gateway-pkgs
-            bins: gateway-cli,gatewayd
+            bins: gateway-cli,gatewayd,gateway-cln-extension
             deb: fedimint-gateway
 
     runs-on: buildjet-4vcpu-ubuntu-2004
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-      - uses: cachix/install-nix-action@v25
+      - uses: cachix/install-nix-action@v26
         with:
-          nix_path: nixpkgs=channel:nixos-22.05
+          nix_path: nixpkgs=channel:nixos-23.11
+          extra_nix_config: |
+            connect-timeout = 15
+            stalled-download-timeout = 15
       - uses: cachix/cachix-action@v14
         with:
           name: fedimint
           authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
         continue-on-error: true
+
+      - name: Set BUILD_ID to tag or commit hash
+        run: |
+          if [[ $GITHUB_REF_TYPE == "tag" ]]; then
+            echo "BUILD_ID=${GITHUB_REF_NAME}" >> $GITHUB_ENV
+          else
+            echo "BUILD_ID=${GITHUB_SHA}" >> $GITHUB_ENV
+          fi
 
       - name: Build ${{ matrix.build.flake-output }}
         run: |
@@ -374,7 +490,12 @@ jobs:
           mkdir -p bins
           bins="${{ matrix.build.bins }}"
           for bin in ${bins//,/ } ; do
-            nix bundle .#$bin -o bins/$bin
+            if [[ $GITHUB_REF_TYPE == "tag" ]]; then
+              nix build .#$bin
+              cachix push fedimint -c 8 -j 8 $(nix-store --query --references $(readlink -f result)) $(readlink -f result)
+              cachix pin fedimint "fedimint-release-$bin:$BUILD_ID" $(readlink -f result)
+            fi
+            nix bundle --bundler .# .#$bin -o "bins/$bin-$BUILD_ID" && sha256sum "bins/$bin-$BUILD_ID"
           done
 
       - name: Check version ${{ matrix.build.bins }}
@@ -398,7 +519,7 @@ jobs:
           path: "bins/**"
 
       - name: Release Binaries
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
         with:
           files: "bins/**"
@@ -407,7 +528,7 @@ jobs:
         run: |
           bins="${{ matrix.build.bins }}"
           for bin in ${bins//,/ } ; do
-            nix bundle -L --bundler github:NixOS/bundlers#toDEB --accept-flake-config -o debs/$bin .#$bin
+            nix bundle -L --bundler .#toDEB --accept-flake-config -o debs/$bin .#$bin
             # workaround: https://github.com/actions/upload-artifact/issues/92
             cp -a debs/$bin/*.deb debs/
           done
@@ -416,7 +537,7 @@ jobs:
         run: |
           bins="${{ matrix.build.bins }}"
           for bin in ${bins//,/ } ; do
-            nix bundle -L --bundler github:NixOS/bundlers#toRPM --accept-flake-config -o rpms/$bin .#$bin
+            nix bundle -L --bundler .#toRPM --accept-flake-config -o rpms/$bin .#$bin
             # workaround: https://github.com/actions/upload-artifact/issues/92
             cp -a rpms/$bin/*.rpm rpms/
           done
@@ -424,11 +545,11 @@ jobs:
       - name: Upload DEB packages
         uses: actions/upload-artifact@v4
         with:
-          name: "deb-bundle"
+          name: "${{ matrix.build.flake-output }}-deb-bundle"
           path: "debs/**.deb"
 
       - name: Release DEB packages
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
         with:
           files: "debs/**.deb"
@@ -436,23 +557,37 @@ jobs:
       - name: Upload RPM packages
         uses: actions/upload-artifact@v4
         with:
-          name: "rpm-bundle"
+          name: "${{ matrix.build.flake-output }}-rpm-bundle"
           path: "rpms/**.rpm"
 
       - name: Release RPM packages
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
         with:
           files: "rpms/**.rpm"
 
+  status:
+    name: Status
+    needs: [lint, shell, build, cross, ccov, containers, pkgs]
+    if: ${{ always() }}
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check status of all jobs
+        if: >-
+          ${{
+            contains(needs.*.result, 'failure') ||
+            contains(needs.*.result, 'cancelled')
+          }}
+        run: exit 1
+
   notifications:
-    if: always() && github.repository == 'fedimint/fedimint'
+    if: always() && github.repository == 'fedimint/fedimint' && github.event_name != 'merge_group'
     name: "Notifications"
     timeout-minutes: 1
     runs-on: ubuntu-22.04
     # note: we don't depend on `audit` because it will
     # be often broken, and we can't fix it immediately
-    needs: [ build, cross, ccov, containers, pkgs ]
+    needs: [ lint, build, shell, cross, ccov, containers, pkgs ]
 
     steps:
     - name: Discord notifications on failure

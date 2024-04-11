@@ -23,12 +23,15 @@ use fedimint_client::sm::{Context, DynState, ModuleNotifier, State, StateTransit
 use fedimint_client::transaction::{ClientOutput, TransactionBuilder};
 use fedimint_client::{sm_enum_variant_translation, DynGlobalClientContext};
 use fedimint_core::api::DynModuleApi;
-use fedimint_core::bitcoinrpc::BitcoinRpcConfig;
+use fedimint_core::bitcoin_migration::{
+    bitcoin29_to_bitcoin30_network, bitcoin30_to_bitcoin29_address,
+};
 use fedimint_core::core::{Decoder, IntoDynInstance, ModuleInstanceId, OperationId};
 use fedimint_core::db::{
     AutocommitError, DatabaseTransaction, DatabaseVersion, IDatabaseTransactionOpsCoreTyped,
 };
 use fedimint_core::encoding::{Decodable, Encodable};
+use fedimint_core::envs::BitcoinRpcConfig;
 use fedimint_core::module::{
     ApiVersion, CommonModuleInit, ModuleCommon, ModuleInit, MultiApiVersion, TransactionItemAmount,
 };
@@ -38,7 +41,6 @@ use fedimint_wallet_common::config::WalletClientConfig;
 use fedimint_wallet_common::tweakable::Tweakable;
 pub use fedimint_wallet_common::*;
 use futures::{Stream, StreamExt};
-use miniscript::ToPublicKey;
 use rand::{thread_rng, Rng};
 use secp256k1::{All, Secp256k1};
 use serde::{Deserialize, Serialize};
@@ -113,9 +115,9 @@ impl WalletClientInit {
     }
 }
 
-#[apply(async_trait_maybe_send!)]
 impl ModuleInit for WalletClientInit {
     type Common = WalletCommonInit;
+    const DATABASE_VERSION: DatabaseVersion = DatabaseVersion(0);
 
     async fn dump_database(
         &self,
@@ -146,7 +148,6 @@ impl ModuleInit for WalletClientInit {
 #[apply(async_trait_maybe_send!)]
 impl ClientModuleInit for WalletClientInit {
     type Module = WalletClientModule;
-    const DATABASE_VERSION: DatabaseVersion = DatabaseVersion(0);
 
     fn supported_api_versions(&self) -> MultiApiVersion {
         MultiApiVersion::try_from_iter([ApiVersion { major: 0, minor: 0 }])
@@ -209,7 +210,7 @@ pub struct WalletClientModule {
     cfg: WalletClientConfig,
     module_root_secret: DerivableSecret,
     module_api: DynModuleApi,
-    notifier: ModuleNotifier<DynGlobalClientContext, WalletClientStates>,
+    notifier: ModuleNotifier<WalletClientStates>,
     rpc: DynBitcoindRpc,
     secp: Secp256k1<All>,
     client_ctx: ClientContext<Self>,
@@ -297,14 +298,15 @@ impl WalletClientModule {
             .to_secp_key(&self.secp);
 
         let public_tweak_key = secret_tweak_key.public_key();
-        let operation_id = OperationId(public_tweak_key.to_x_only_pubkey().serialize()); // TODO: make hash?
+        let operation_id = OperationId(public_tweak_key.x_only_public_key().0.serialize()); // TODO: make hash?
 
-        let address = self
-            .cfg
-            .peg_in_descriptor
-            .tweak(&public_tweak_key, secp256k1::SECP256K1)
-            .address(self.cfg.network)
-            .unwrap();
+        let address = bitcoin30_to_bitcoin29_address(
+            self.cfg
+                .peg_in_descriptor
+                .tweak(&public_tweak_key, secp256k1::SECP256K1)
+                .address(bitcoin29_to_bitcoin30_network(self.cfg.network))
+                .unwrap(),
+        );
 
         let deposit_sm = WalletClientStates::Deposit(DepositStateMachine {
             operation_id,
@@ -682,14 +684,14 @@ async fn get_next_peg_in_tweak_child_id(dbtx: &mut DatabaseTransaction<'_>) -> C
     ChildId(index)
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Decodable, Encodable)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Decodable, Encodable)]
 pub enum WalletClientStates {
     Deposit(DepositStateMachine),
     Withdraw(WithdrawStateMachine),
 }
 
 impl IntoDynInstance for WalletClientStates {
-    type DynType = DynState<DynGlobalClientContext>;
+    type DynType = DynState;
 
     fn into_dyn(self, instance_id: ModuleInstanceId) -> Self::DynType {
         DynState::from_typed(instance_id, self)
@@ -698,7 +700,6 @@ impl IntoDynInstance for WalletClientStates {
 
 impl State for WalletClientStates {
     type ModuleContext = WalletClientContext;
-    type GlobalContext = DynGlobalClientContext;
 
     fn transitions(
         &self,

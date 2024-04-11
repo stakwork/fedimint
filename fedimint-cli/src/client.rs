@@ -3,14 +3,13 @@ use std::ffi;
 use std::str::FromStr;
 use std::time::{Duration, UNIX_EPOCH};
 
-use anyhow::{bail, Context};
+use anyhow::{anyhow, bail, Context};
 use bip39::Mnemonic;
 use bitcoin::{secp256k1, Network};
-use bitcoin_hashes::hex::ToHex;
 use clap::Subcommand;
 use fedimint_client::backup::Metadata;
-use fedimint_client::ClientArc;
-use fedimint_core::config::FederationId;
+use fedimint_client::ClientHandleArc;
+use fedimint_core::config::{ClientModuleConfig, FederationId};
 use fedimint_core::core::{ModuleInstanceId, ModuleKind, OperationId};
 use fedimint_core::encoding::Encodable;
 use fedimint_core::time::now;
@@ -20,13 +19,17 @@ use fedimint_ln_client::{
     PayType,
 };
 use fedimint_ln_common::contracts::ContractId;
+use fedimint_ln_common::LightningGateway;
+use fedimint_logging::LOG_CLIENT;
 use fedimint_mint_client::{
     MintClientModule, OOBNotes, SelectNotesWithAtleastAmount, SelectNotesWithExactAmount,
 };
 use fedimint_wallet_client::{WalletClientModule, WithdrawState};
 use futures::StreamExt;
 use itertools::Itertools;
-use lightning_invoice::Bolt11Invoice;
+use lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescription, Description};
+use rand::rngs::OsRng;
+use rand::seq::IteratorRandom;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use time::format_description::well_known::iso8601;
@@ -39,6 +42,19 @@ use crate::{metadata_from_clap_cli, LnInvoiceResponse};
 pub enum ModuleSelector {
     Id(ModuleInstanceId),
     Kind(ModuleKind),
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub enum ModuleStatus {
+    Active,
+    UnsupportedByClient,
+}
+
+#[derive(Serialize)]
+struct ModuleInfo {
+    kind: ModuleKind,
+    id: u16,
+    status: ModuleStatus,
 }
 
 impl FromStr for ModuleSelector {
@@ -71,6 +87,10 @@ pub enum ClientCmd {
         /// hasn't been redeemed by the recipient. Defaults to one week.
         #[clap(long, default_value_t = 60 * 60 * 24 * 7)]
         timeout: u64,
+        /// If the necessary information to join the federation the e-cash
+        /// belongs to should be included in the serialized notes
+        #[clap(long)]
+        include_invite: bool,
     },
     /// Verifies the signatures of e-cash notes, but *not* if they have been
     /// spent already
@@ -91,6 +111,10 @@ pub enum ClientCmd {
         description: String,
         #[clap(long)]
         expiry_time: Option<u64>,
+        #[clap(long)]
+        gateway_id: Option<secp256k1::PublicKey>,
+        #[clap(long, default_value = "false")]
+        force_internal: bool,
     },
     /// Wait for incoming invoice to be paid
     AwaitInvoice { operation_id: OperationId },
@@ -107,15 +131,18 @@ pub enum ClientCmd {
         /// Will return immediately after funding the payment
         #[clap(long, action)]
         finish_in_background: bool,
+        #[clap(long)]
+        gateway_id: Option<secp256k1::PublicKey>,
+        #[clap(long, default_value = "false")]
+        force_internal: bool,
     },
     /// Wait for a lightning payment to complete
     AwaitLnPay { operation_id: OperationId },
     /// List registered gateways
-    ListGateways,
-    /// Switch active gateway
-    SwitchGateway {
-        #[clap(value_parser = parse_gateway_id)]
-        gateway_id: secp256k1::PublicKey,
+    ListGateways {
+        /// Don't fetch the registered gateways from the federation
+        #[clap(long, default_value = "false")]
+        no_update: bool,
     },
     /// Generate a new deposit address, funds sent to it can later be claimed
     DepositAddress {
@@ -160,23 +187,21 @@ pub enum ClientCmd {
         limit: usize,
     },
     /// Call a module subcommand
+    // Make `--help` be passed to the module handler, not root cli one
+    #[command(disable_help_flag = true)]
     Module {
         /// Module selector (either module id or module kind)
-        #[clap(long)]
-        module: ModuleSelector,
+        module: Option<ModuleSelector>,
+        #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
         args: Vec<ffi::OsString>,
     },
     /// Returns the client config
     Config,
 }
 
-pub fn parse_gateway_id(s: &str) -> Result<secp256k1::PublicKey, secp256k1::Error> {
-    secp256k1::PublicKey::from_str(s)
-}
-
 pub async fn handle_command(
     command: ClientCmd,
-    client: ClientArc,
+    client: ClientHandleArc,
 ) -> anyhow::Result<serde_json::Value> {
     match command {
         ClientCmd::Info => get_note_summary(&client).await,
@@ -197,7 +222,7 @@ pub async fn handle_command(
                     bail!("Reissue failed: {e}");
                 }
 
-                info!("Update: {update:?}");
+                debug!(target: LOG_CLIENT, ?update, "Reissue external notes state update");
             }
 
             Ok(serde_json::to_value(amount).unwrap())
@@ -206,6 +231,7 @@ pub async fn handle_command(
             amount,
             allow_overpay,
             timeout,
+            include_invite,
         } => {
             warn!("The client will try to double-spend these notes after the duration specified by the --timeout option to recover any unclaimed e-cash.");
 
@@ -213,7 +239,13 @@ pub async fn handle_command(
             let timeout = Duration::from_secs(timeout);
             let (operation, notes) = if allow_overpay {
                 let (operation, notes) = mint_module
-                    .spend_notes_with_selector(&SelectNotesWithAtleastAmount, amount, timeout, ())
+                    .spend_notes_with_selector(
+                        &SelectNotesWithAtleastAmount,
+                        amount,
+                        timeout,
+                        include_invite,
+                        (),
+                    )
                     .await?;
 
                 let overspend_amount = notes.total_amount() - amount;
@@ -227,7 +259,13 @@ pub async fn handle_command(
                 (operation, notes)
             } else {
                 mint_module
-                    .spend_notes_with_selector(&SelectNotesWithExactAmount, amount, timeout, ())
+                    .spend_notes_with_selector(
+                        &SelectNotesWithExactAmount,
+                        amount,
+                        timeout,
+                        include_invite,
+                        (),
+                    )
                     .await?
             };
             info!("Spend e-cash operation: {operation}");
@@ -299,12 +337,21 @@ pub async fn handle_command(
             amount,
             description,
             expiry_time,
+            gateway_id,
+            force_internal,
         } => {
-            let lightning_module = client.get_first_module::<LightningClientModule>();
-            lightning_module.select_active_gateway().await?;
+            let ln_gateway = get_gateway(&client, gateway_id, force_internal).await?;
 
+            let lightning_module = client.get_first_module::<LightningClientModule>();
+            let desc = Description::new(description)?;
             let (operation_id, invoice, _) = lightning_module
-                .create_bolt11_invoice(amount, description, expiry_time, ())
+                .create_bolt11_invoice(
+                    amount,
+                    Bolt11InvoiceDescription::Direct(&desc),
+                    expiry_time,
+                    (),
+                    ln_gateway,
+                )
                 .await?;
             Ok(serde_json::to_value(LnInvoiceResponse {
                 operation_id,
@@ -329,7 +376,7 @@ pub async fn handle_command(
                     _ => {}
                 }
 
-                info!("Update: {update:?}");
+                debug!(target: LOG_CLIENT, ?update, "Await invoice state update");
             }
 
             Err(anyhow::anyhow!(
@@ -341,19 +388,20 @@ pub async fn handle_command(
             amount,
             finish_in_background,
             lnurl_comment,
+            gateway_id,
+            force_internal,
         } => {
             let bolt11 = get_invoice(&payment_info, amount, lnurl_comment).await?;
             info!("Paying invoice: {bolt11}");
-            let lightning_module = client.get_first_module::<LightningClientModule>();
-            lightning_module.select_active_gateway().await?;
+            let ln_gateway = get_gateway(&client, gateway_id, force_internal).await?;
 
-            let gateway = lightning_module.select_active_gateway_opt().await;
+            let lightning_module = client.get_first_module::<LightningClientModule>();
             let OutgoingLightningPayment {
                 payment_type,
                 contract_id,
                 fee,
             } = lightning_module
-                .pay_bolt11_invoice(gateway, bolt11, ())
+                .pay_bolt11_invoice(ln_gateway, bolt11, ())
                 .await?;
             let operation_id = payment_type.operation_id();
             info!("Gateway fee: {fee}, payment operation id: {operation_id}");
@@ -392,36 +440,17 @@ pub async fn handle_command(
                     .context("expected a response")?,
             )
         }
-        ClientCmd::ListGateways => {
+        ClientCmd::ListGateways { no_update } => {
             let lightning_module = client.get_first_module::<LightningClientModule>();
-            let gateways = lightning_module.fetch_registered_gateways().await?;
+            if !no_update {
+                lightning_module.update_gateway_cache().await?;
+            }
+            let gateways = lightning_module.list_gateways().await;
             if gateways.is_empty() {
                 return Ok(serde_json::to_value(Vec::<String>::new()).unwrap());
             }
 
-            let mut gateways_json = json!(&gateways);
-            let active_gateway = lightning_module.select_active_gateway().await?;
-
-            gateways_json
-                .as_array_mut()
-                .expect("gateways_json is not an array")
-                .iter_mut()
-                .for_each(|gateway| {
-                    if gateway["node_pub_key"] == json!(active_gateway.node_pub_key) {
-                        gateway["active"] = json!(true);
-                    } else {
-                        gateway["active"] = json!(false);
-                    }
-                });
-            Ok(serde_json::to_value(gateways_json).unwrap())
-        }
-        ClientCmd::SwitchGateway { gateway_id } => {
-            let lightning_module = client.get_first_module::<LightningClientModule>();
-            lightning_module.set_active_gateway(&gateway_id).await?;
-            let gateway = lightning_module.select_active_gateway().await?;
-            let mut gateway_json = json!(&gateway);
-            gateway_json["active"] = json!(true);
-            Ok(serde_json::to_value(gateway_json).unwrap())
+            Ok(json!(&gateways))
         }
         ClientCmd::DepositAddress { timeout } => {
             let (operation_id, address) = client
@@ -443,7 +472,7 @@ pub async fn handle_command(
                 .into_stream();
 
             while let Some(update) = updates.next().await {
-                info!("Update: {update:?}");
+                debug!(target: LOG_CLIENT, ?update, "Await deposit state update");
             }
 
             Ok(serde_json::to_value(()).unwrap())
@@ -549,12 +578,12 @@ pub async fn handle_command(
                 .into_stream();
 
             while let Some(update) = updates.next().await {
-                info!("Update: {update:?}");
+                debug!(target: LOG_CLIENT, ?update, "Withdraw state update");
 
                 match update {
                     WithdrawState::Succeeded(txid) => {
                         return Ok(json!({
-                            "txid": txid.to_hex(),
+                            "txid": txid.consensus_encode_to_hex(),
                             "fees_sat": absolute_fees.to_sat(),
                         }));
                     }
@@ -568,22 +597,43 @@ pub async fn handle_command(
             unreachable!("Update stream ended without outcome");
         }
         ClientCmd::DiscoverVersion => {
-            Ok(json!({ "versions": client.discover_common_api_version().await? }))
+            Ok(json!({ "versions": client.discover_common_api_version(None).await? }))
         }
-        ClientCmd::Module { module, args } => {
-            let module_instance_id = match module {
-                ModuleSelector::Id(id) => id,
-                ModuleSelector::Kind(kind) => client
-                    .get_first_instance(&kind)
-                    .context("No module with this kind found")?,
-            };
+        ClientCmd::Module { module, args } => match module {
+            Some(module) => {
+                let module_instance_id = match module {
+                    ModuleSelector::Id(id) => id,
+                    ModuleSelector::Kind(kind) => client
+                        .get_first_instance(&kind)
+                        .context("No module with this kind found")?,
+                };
 
-            client
-                .get_module_client_dyn(module_instance_id)
-                .context("Module not found")?
-                .handle_cli_command(&args)
-                .await
-        }
+                client
+                    .get_module_client_dyn(module_instance_id)
+                    .context("Module not found")?
+                    .handle_cli_command(&args)
+                    .await
+            }
+            None => {
+                let module_list: Vec<ModuleInfo> = client
+                    .get_config()
+                    .modules
+                    .iter()
+                    .map(|(id, ClientModuleConfig { kind, .. })| ModuleInfo {
+                        kind: kind.clone(),
+                        id: *id,
+                        status: if client.has_module(*id) {
+                            ModuleStatus::Active
+                        } else {
+                            ModuleStatus::UnsupportedByClient
+                        },
+                    })
+                    .collect();
+                Ok(json!({
+                    "list": module_list,
+                }))
+            }
+        },
         ClientCmd::Config => {
             let config = client.get_config_json();
             Ok(serde_json::to_value(config).expect("Client config is serializable"))
@@ -641,13 +691,12 @@ async fn get_invoice(
 }
 
 async fn wait_for_ln_payment(
-    client: &ClientArc,
+    client: &ClientHandleArc,
     payment_type: PayType,
     contract_id: ContractId,
     return_on_funding: bool,
 ) -> anyhow::Result<Option<serde_json::Value>> {
     let lightning_module = client.get_first_module::<LightningClientModule>();
-    lightning_module.select_active_gateway().await?;
 
     match payment_type {
         PayType::Internal(operation_id) => {
@@ -688,7 +737,7 @@ async fn wait_for_ln_payment(
                         bail!("FundingFailed: {error}")
                     }
                 }
-                info!("Update: {update:?}");
+                debug!(target: LOG_CLIENT, ?update, "Wait for ln payment state update");
             }
         }
         PayType::Lightning(operation_id) => {
@@ -723,14 +772,14 @@ async fn wait_for_ln_payment(
                         bail!("UnexpectedError: {error_message}")
                     }
                 }
-                info!("Update: {update:?}");
+                debug!(target: LOG_CLIENT, ?update, "Wait for ln payment state update");
             }
         }
     };
     bail!("Lightning Payment failed")
 }
 
-async fn get_note_summary(client: &ClientArc) -> anyhow::Result<serde_json::Value> {
+async fn get_note_summary(client: &ClientHandleArc) -> anyhow::Result<serde_json::Value> {
     let mint_client = client.get_first_module::<MintClientModule>();
     let wallet_client = client.get_first_module::<WalletClientModule>();
     let summary = mint_client
@@ -751,6 +800,44 @@ async fn get_note_summary(client: &ClientArc) -> anyhow::Result<serde_json::Valu
         denominations_msat: summary,
     })
     .unwrap())
+}
+
+/// Returns a gateway to be used for a lightning operation. If `force_internal`
+/// is true and no `gateway_id` is specified, no gateway will be selected.
+async fn get_gateway(
+    client: &ClientHandleArc,
+    gateway_id: Option<secp256k1::PublicKey>,
+    force_internal: bool,
+) -> anyhow::Result<Option<LightningGateway>> {
+    let lightning_module = client.get_first_module::<LightningClientModule>();
+    match gateway_id {
+        Some(gateway_id) => {
+            if let Some(gw) = lightning_module.select_gateway(&gateway_id).await {
+                Ok(Some(gw))
+            } else {
+                // Refresh the gateway cache in case the target gateway was registered since the
+                // last update.
+                lightning_module.update_gateway_cache().await?;
+                Ok(lightning_module.select_gateway(&gateway_id).await)
+            }
+        }
+        None if !force_internal => {
+            // Refresh the gateway cache to find a random gateway to select from.
+            lightning_module.update_gateway_cache().await?;
+            let gateways = lightning_module.list_gateways().await;
+            let gw = gateways.into_iter().choose(&mut OsRng).map(|gw| gw.info);
+            if let Some(gw) = gw {
+                let gw_id = gw.gateway_id;
+                info!(%gw_id, "Using random gateway");
+                Ok(Some(gw))
+            } else {
+                Err(anyhow!(
+                    "No gateways exist in gateway cache and `force_internal` is false"
+                ))
+            }
+        }
+        None => Ok(None),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

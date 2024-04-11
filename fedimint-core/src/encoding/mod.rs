@@ -1,11 +1,16 @@
 //! This module defines a binary encoding interface which is more suitable for
 //! consensus critical encoding than e.g. `bincode`. Over time all structs that
 //! need to be encoded to binary will be migrated to this interface.
+//!
+//! This code is based on corresponding `rust-bitcoin` types.
+//!
+//! See [`Encodable`] and [`Decodable`] for two main traits.
 
 pub mod as_hex;
+mod bls12_381;
 mod btc;
 mod secp256k1;
-mod tbs;
+mod threshold_crypto;
 
 #[cfg(not(target_family = "wasm"))]
 mod tls;
@@ -19,8 +24,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{cmp, mem};
 
 use anyhow::format_err;
-use bitcoin_hashes::hex::{FromHex, ToHex};
 pub use fedimint_derive::{Decodable, Encodable};
+use hex::{FromHex, ToHex};
 use lightning::util::ser::{Readable, Writeable};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -80,13 +85,22 @@ pub trait Encodable {
         bytes
     }
 
+    /// Encode and convert to hex string representation
     fn consensus_encode_to_hex(&self) -> String {
         let mut bytes = vec![];
         self.consensus_encode(&mut bytes)
             .expect("encoding to bytes can't fail for io reasons");
-        bytes.to_hex()
+        // TODO: This double allocation offends real Rustaceans. We should
+        // be able to go straight to String, but this use case seems under-served
+        // by hex encoding crates.
+        bytes.encode_hex()
     }
 
+    /// Encode without storing the encoding, return the size
+    fn consensus_encode_to_len(&self) -> usize {
+        self.consensus_encode(&mut io::sink())
+            .expect("encoding to bytes can't fail for io reasons")
+    }
     /// Generate a SHA256 hash of the consensus encoding using the default hash
     /// engine for `H`.
     ///
@@ -104,13 +118,74 @@ pub trait Encodable {
     }
 }
 
+/// Maximum size, in bytes, of data we are allowed to ever decode
+/// for a single value.
+pub const MAX_DECODE_SIZE: usize = 16_000_000;
+
 /// Data which can be encoded in a consensus-consistent way
 pub trait Decodable: Sized {
-    /// Decode an object with a well-defined format
+    /// Decode `Self` from a size-limited reader.
+    ///
+    /// Like `consensus_decode` but relies on the reader being limited in the
+    /// amount of data it returns, e.g. by being wrapped in
+    /// [`std::io::Take`].
+    ///
+    /// Failing to abide to this requirement might lead to memory exhaustion
+    /// caused by malicious inputs.
+    ///
+    /// Users should default to `consensus_decode`, but when data to be decoded
+    /// is already in a byte vector of a limited size, calling this function
+    /// directly might be marginally faster (due to avoiding extra checks).
+    ///
+    /// ### Rules for trait implementations
+    ///
+    /// * Simple types that that have a fixed size (own and member fields),
+    ///   don't have to overwrite this method, or be concern with it, should
+    ///   only impl `consensus_decode`.
+    /// * Types that deserialize based on decoded untrusted length should
+    ///   implement `consensus_decode_from_finite_reader` only:
+    ///   * Default implementation of `consensus_decode` will forward to
+    ///     `consensus_decode_bytes_from_finite_reader` with the reader wrapped
+    ///     by `Take`, protecting from readers that keep returning data.
+    ///   * Implementation must make sure to put a cap on things like
+    ///     `Vec::with_capacity` and other allocations to avoid oversized
+    ///     allocations, and rely on the reader being finite and running out of
+    ///     data, and collections reallocating on a legitimately oversized input
+    ///     data, instead of trying to enforce arbitrary length limits.
+    /// * Types that contain other types that might be require limited reader
+    ///   (thus implementing `consensus_decode_from_finite_reader`), should also
+    ///   implement it applying same rules, and in addition make sure to call
+    ///   `consensus_decode_from_finite_reader` on all members, to avoid
+    ///   creating redundant `Take` wrappers (`Take<Take<...>>`). Failure to do
+    ///   so might result only in a tiny performance hit.
+    #[inline]
+    fn consensus_decode_from_finite_reader<R: std::io::Read>(
+        r: &mut R,
+        modules: &ModuleDecoderRegistry,
+    ) -> Result<Self, DecodeError> {
+        // This method is always strictly less general than, `consensus_decode`, so it's
+        // safe and make sense to default to just calling it. This way most
+        // types, that don't care about protecting against resource exhaustion
+        // due to malicious input, can just ignore it.
+        Self::consensus_decode(r, modules)
+    }
+
+    /// Decode an object with a well-defined format.
+    ///
+    /// This is the method that should be implemented for a typical, fixed sized
+    /// type implementing this trait. Default implementation is wrapping the
+    /// reader in [`std::io::Take`] to limit the input size to
+    /// [`MAX_DECODE_SIZE`], and forwards the call to
+    /// [`Self::consensus_decode_from_finite_reader`], which is convenient
+    /// for types that override [`Self::consensus_decode_from_finite_reader`]
+    /// instead.
+    #[inline]
     fn consensus_decode<R: std::io::Read>(
         r: &mut R,
-        _modules: &ModuleDecoderRegistry,
-    ) -> Result<Self, DecodeError>;
+        modules: &ModuleDecoderRegistry,
+    ) -> Result<Self, DecodeError> {
+        Self::consensus_decode_from_finite_reader(&mut r.take(MAX_DECODE_SIZE as u64), modules)
+    }
 
     /// Decode an object from hex
     fn consensus_decode_hex(
@@ -140,11 +215,11 @@ impl Encodable for SafeUrl {
 }
 
 impl Decodable for SafeUrl {
-    fn consensus_decode<D: std::io::Read>(
+    fn consensus_decode_from_finite_reader<D: std::io::Read>(
         d: &mut D,
         modules: &ModuleDecoderRegistry,
     ) -> Result<Self, DecodeError> {
-        String::consensus_decode(d, modules)?
+        String::consensus_decode_from_finite_reader(d, modules)?
             .parse::<SafeUrl>()
             .map_err(DecodeError::from_err)
     }
@@ -302,7 +377,14 @@ fn read_bytes_from_finite_reader<D: Read + ?Sized>(
 
 /// Specialized version of Decodable for bytes
 pub fn consensus_decode_bytes<D: std::io::Read>(r: &mut D) -> Result<Vec<u8>, DecodeError> {
-    let len = u64::consensus_decode(r, &Default::default())?;
+    consensus_decode_bytes_from_finite_reader(&mut r.take(MAX_DECODE_SIZE as u64))
+}
+
+/// Specialized version of Decodable for bytes
+pub fn consensus_decode_bytes_from_finite_reader<D: std::io::Read>(
+    r: &mut D,
+) -> Result<Vec<u8>, DecodeError> {
+    let len = u64::consensus_decode_from_finite_reader(r, &Default::default())?;
 
     let len: usize =
         usize::try_from(len).map_err(|_| DecodeError::from_str("size exceeds memory"))?;
@@ -317,6 +399,12 @@ pub fn consensus_decode_bytes<D: std::io::Read>(r: &mut D) -> Result<Vec<u8>, De
 
 /// Specialized version of Decodable for fixed-size byte arrays
 pub fn consensus_decode_bytes_static<const N: usize, D: std::io::Read>(
+    r: &mut D,
+) -> Result<[u8; N], DecodeError> {
+    consensus_decode_bytes_static_from_finite_reader(&mut r.take(MAX_DECODE_SIZE as u64))
+}
+/// Specialized version of Decodable for fixed-size byte arrays
+pub fn consensus_decode_bytes_static_from_finite_reader<const N: usize, D: std::io::Read>(
     r: &mut D,
 ) -> Result<[u8; N], DecodeError> {
     let mut bytes = [0u8; N];
@@ -362,15 +450,17 @@ impl<T> Decodable for Vec<T>
 where
     T: Decodable + 'static,
 {
-    fn consensus_decode<D: std::io::Read>(
+    fn consensus_decode_from_finite_reader<D: std::io::Read>(
         d: &mut D,
         modules: &ModuleDecoderRegistry,
     ) -> Result<Self, DecodeError> {
         if TypeId::of::<T>() == TypeId::of::<u8>() {
             // unsafe: we've just checked that T is `u8` so the transmute here is a no-op
-            return Ok(unsafe { mem::transmute::<Vec<u8>, Vec<T>>(consensus_decode_bytes(d)?) });
+            return Ok(unsafe {
+                mem::transmute::<Vec<u8>, Vec<T>>(consensus_decode_bytes_from_finite_reader(d)?)
+            });
         }
-        let len = u64::consensus_decode(d, modules)?;
+        let len = u64::consensus_decode_from_finite_reader(d, modules)?;
 
         // `collect` under the hood uses `FromIter::from_iter`, which can potentially be
         // backed by code like:
@@ -383,12 +473,12 @@ where
         // Up to a cap, use the (potentially specialized for better perf in stdlib)
         // `from_iter`.
         let mut v: Vec<_> = (0..cap_len)
-            .map(|_| T::consensus_decode(d, modules))
+            .map(|_| T::consensus_decode_from_finite_reader(d, modules))
             .collect::<Result<Vec<_>, DecodeError>>()?;
 
         // Add any excess manually avoiding any surprises.
         while (v.len() as u64) < len {
-            v.push(T::consensus_decode(d, modules)?);
+            v.push(T::consensus_decode_from_finite_reader(d, modules)?);
         }
 
         assert_eq!(v.len() as u64, len);
@@ -443,21 +533,21 @@ impl<T, const SIZE: usize> Decodable for [T; SIZE]
 where
     T: Decodable + Debug + Default + Copy + 'static,
 {
-    fn consensus_decode<D: std::io::Read>(
+    fn consensus_decode_from_finite_reader<D: std::io::Read>(
         d: &mut D,
         modules: &ModuleDecoderRegistry,
     ) -> Result<Self, DecodeError> {
         if TypeId::of::<T>() == TypeId::of::<u8>() {
             // unsafe: we've just checked that T is `u8` so the transmute here is a no-op
             return Ok(unsafe {
-                let arr = consensus_decode_bytes_static(d)?;
+                let arr = consensus_decode_bytes_static_from_finite_reader(d)?;
                 horribe_array_transmute_workaround::<SIZE, u8, T>(arr)
             });
         }
         // todo: impl without copy
         let mut data = [T::default(); SIZE];
         for item in data.iter_mut() {
-            *item = T::consensus_decode(d, modules)?;
+            *item = T::consensus_decode_from_finite_reader(d, modules)?;
         }
         Ok(data)
     }
@@ -483,14 +573,14 @@ impl<T> Decodable for Option<T>
 where
     T: Decodable,
 {
-    fn consensus_decode<D: std::io::Read>(
+    fn consensus_decode_from_finite_reader<D: std::io::Read>(
         d: &mut D,
         modules: &ModuleDecoderRegistry,
     ) -> Result<Self, DecodeError> {
-        let flag = u8::consensus_decode(d, modules)?;
+        let flag = u8::consensus_decode_from_finite_reader(d, modules)?;
         match flag {
             0 => Ok(None),
-            1 => Ok(Some(T::consensus_decode(d, modules)?)),
+            1 => Ok(Some(T::consensus_decode_from_finite_reader(d, modules)?)),
             _ => Err(DecodeError::from_str(
                 "Invalid flag for option enum, expected 0 or 1",
             )),
@@ -526,14 +616,14 @@ where
     T: Decodable,
     E: Decodable,
 {
-    fn consensus_decode<D: std::io::Read>(
+    fn consensus_decode_from_finite_reader<D: std::io::Read>(
         d: &mut D,
         modules: &ModuleDecoderRegistry,
     ) -> Result<Self, DecodeError> {
-        let flag = u8::consensus_decode(d, modules)?;
+        let flag = u8::consensus_decode_from_finite_reader(d, modules)?;
         match flag {
-            0 => Ok(Err(E::consensus_decode(d, modules)?)),
-            1 => Ok(Ok(T::consensus_decode(d, modules)?)),
+            0 => Ok(Err(E::consensus_decode_from_finite_reader(d, modules)?)),
+            1 => Ok(Ok(T::consensus_decode_from_finite_reader(d, modules)?)),
             _ => Err(DecodeError::from_str(
                 "Invalid flag for option enum, expected 0 or 1",
             )),
@@ -554,11 +644,13 @@ impl<T> Decodable for Box<T>
 where
     T: Decodable,
 {
-    fn consensus_decode<D: std::io::Read>(
+    fn consensus_decode_from_finite_reader<D: std::io::Read>(
         d: &mut D,
         modules: &ModuleDecoderRegistry,
     ) -> Result<Self, DecodeError> {
-        Ok(Box::new(T::consensus_decode(d, modules)?))
+        Ok(Box::new(T::consensus_decode_from_finite_reader(
+            d, modules,
+        )?))
     }
 }
 
@@ -593,11 +685,12 @@ impl Encodable for String {
 }
 
 impl Decodable for String {
-    fn consensus_decode<D: std::io::Read>(
+    fn consensus_decode_from_finite_reader<D: std::io::Read>(
         d: &mut D,
         modules: &ModuleDecoderRegistry,
     ) -> Result<Self, DecodeError> {
-        String::from_utf8(Decodable::consensus_decode(d, modules)?).map_err(DecodeError::from_err)
+        String::from_utf8(Decodable::consensus_decode_from_finite_reader(d, modules)?)
+            .map_err(DecodeError::from_err)
     }
 }
 
@@ -753,16 +846,23 @@ where
     K: Decodable + Ord,
     V: Decodable,
 {
-    fn consensus_decode<D: std::io::Read>(
+    fn consensus_decode_from_finite_reader<D: std::io::Read>(
         d: &mut D,
         modules: &ModuleDecoderRegistry,
     ) -> Result<Self, DecodeError> {
         let mut res = BTreeMap::new();
-        let len = u64::consensus_decode(d, modules)?;
+        let len = u64::consensus_decode_from_finite_reader(d, modules)?;
         for _ in 0..len {
-            let amt = K::consensus_decode(d, modules)?;
-            let v = V::consensus_decode(d, modules)?;
-            if res.insert(amt, v).is_some() {
+            let k = K::consensus_decode_from_finite_reader(d, modules)?;
+            if res
+                .last_key_value()
+                .map(|(prev_key, _v)| k <= *prev_key)
+                .unwrap_or_default()
+            {
+                return Err(DecodeError::from_str("Non-canonical encoding"));
+            }
+            let v = V::consensus_decode_from_finite_reader(d, modules)?;
+            if res.insert(k, v).is_some() {
                 return Err(DecodeError(format_err!("Duplicate key")));
             }
         }
@@ -788,14 +888,21 @@ impl<K> Decodable for BTreeSet<K>
 where
     K: Decodable + Ord,
 {
-    fn consensus_decode<D: std::io::Read>(
+    fn consensus_decode_from_finite_reader<D: std::io::Read>(
         d: &mut D,
         modules: &ModuleDecoderRegistry,
     ) -> Result<Self, DecodeError> {
         let mut res = BTreeSet::new();
-        let len = u64::consensus_decode(d, modules)?;
+        let len = u64::consensus_decode_from_finite_reader(d, modules)?;
         for _ in 0..len {
-            let k = K::consensus_decode(d, modules)?;
+            let k = K::consensus_decode_from_finite_reader(d, modules)?;
+            if res
+                .last()
+                .map(|prev_key| k <= *prev_key)
+                .unwrap_or_default()
+            {
+                return Err(DecodeError::from_str("Non-canonical encoding"));
+            }
             if !res.insert(k) {
                 return Err(DecodeError(format_err!("Duplicate key")));
             }
@@ -891,6 +998,15 @@ impl<T> DynRawFallback<T>
 where
     T: Decodable + 'static,
 {
+    /// Get the decoded `T` or `None` if not decoded yet
+    pub fn decoded(self) -> Option<T> {
+        match self {
+            DynRawFallback::Raw { .. } => None,
+            DynRawFallback::Decoded(v) => Some(v),
+        }
+    }
+
+    /// Convert into the decoded `T` and panic if not decoded yet
     pub fn expect_decoded(self) -> T {
         match self {
             DynRawFallback::Raw { .. } => {
@@ -900,6 +1016,7 @@ where
         }
     }
 
+    /// Get the decoded `T` and panic if not decoded yet
     pub fn expect_decoded_ref(&self) -> &T {
         match self {
             DynRawFallback::Raw { .. } => {
@@ -922,8 +1039,9 @@ where
                 module_instance_id,
                 raw,
             } => match decoders.get(module_instance_id) {
-                Some(decoder) => DynRawFallback::Decoded(decoder.decode(
+                Some(decoder) => DynRawFallback::Decoded(decoder.decode_complete(
                     &mut &raw[..],
+                    raw.len() as u64,
                     module_instance_id,
                     decoders,
                 )?),
@@ -947,31 +1065,29 @@ impl<T> Decodable for DynRawFallback<T>
 where
     T: Decodable + 'static,
 {
-    fn consensus_decode<R: std::io::Read>(
+    fn consensus_decode_from_finite_reader<R: std::io::Read>(
         reader: &mut R,
         decoders: &ModuleDecoderRegistry,
     ) -> Result<Self, crate::encoding::DecodeError> {
         let module_instance_id =
-            fedimint_core::core::ModuleInstanceId::consensus_decode(reader, decoders)?;
+            fedimint_core::core::ModuleInstanceId::consensus_decode_from_finite_reader(
+                reader, decoders,
+            )?;
         Ok(match decoders.get(module_instance_id) {
             Some(decoder) => {
-                let total_len_u64 = u64::consensus_decode(reader, decoders)?;
-                let mut reader = reader.take(total_len_u64);
-                let v: T = decoder.decode(&mut reader, module_instance_id, decoders)?;
-
-                if reader.limit() != 0 {
-                    return Err(fedimint_core::encoding::DecodeError::new_custom(
-                        anyhow::anyhow!("Dyn type did not consume all bytes during decoding"),
-                    ));
-                }
-
-                DynRawFallback::Decoded(v)
+                let total_len_u64 = u64::consensus_decode_from_finite_reader(reader, decoders)?;
+                DynRawFallback::Decoded(decoder.decode_complete(
+                    reader,
+                    total_len_u64,
+                    module_instance_id,
+                    decoders,
+                )?)
             }
             None => {
                 // since the decoder is not available, just read the raw data
                 Self::Raw {
                     module_instance_id,
-                    raw: Vec::consensus_decode(reader, decoders)?,
+                    raw: Vec::consensus_decode_from_finite_reader(reader, decoders)?,
                 }
             }
         })
@@ -1001,13 +1117,11 @@ where
 mod tests {
     use std::fmt::Debug;
     use std::io::Cursor;
-
-    use bitcoin_hashes::hex::FromHex;
+    use std::str::FromStr;
 
     use super::*;
     use crate::db::DatabaseValue;
     use crate::encoding::{Decodable, Encodable};
-    use crate::ModuleDecoderRegistry;
 
     pub(crate) fn test_roundtrip<T>(value: T)
     where
@@ -1088,7 +1202,7 @@ mod tests {
 
         match decode_res {
             Ok(_) => panic!("Should return error"),
-            Err(e) => assert!(e.to_string().contains("invalid enum variant")),
+            Err(e) => assert!(e.to_string().contains("Invalid enum variant")),
         }
     }
 
@@ -1272,7 +1386,7 @@ mod tests {
     #[test]
     fn test_bitcoin_consensus_encoding() {
         // encodings should follow the bitcoin consensus encoding
-        let txid = bitcoin::Txid::from_hex(
+        let txid = bitcoin::Txid::from_str(
             "51f7ed2f23e58cc6e139e715e9ce304a1e858416edc9079dd7b74fa8d2efc09a",
         )
         .unwrap();
@@ -1306,7 +1420,7 @@ mod tests {
                 89, 179, 192, 90, 98, 30, 246, 95, 23, 126, 162, 134, 0, 0, 0, 0,
             ],
         );
-        let blockhash = bitcoin::BlockHash::from_hex(
+        let blockhash = bitcoin::BlockHash::from_str(
             "0000000000000000000065bda8f8a88f2e1e00d9a6887a43d640e52a4c7660f2",
         )
         .unwrap();

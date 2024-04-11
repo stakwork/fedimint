@@ -1,9 +1,21 @@
+//! Fedimint supports modules to allow extending it's functionality.
+//! Some of the standard functionality is implemented in form of modules as
+//! well.
+//!
+//! The top level server-side types are:
+//!
+//! * [`fedimint_core::module::ModuleInit`]
+//! * [`fedimint_core::module::ServerModule`]
+//!
+//! Top level client-side types are:
+//!
+//! * `ClientModuleInit` (in `fedimint_client`)
+//! * `ClientModule` (in `fedimint_client`)
 pub mod audit;
 pub mod registry;
 
 use std::collections::BTreeMap;
-use std::fmt::{Debug, Formatter};
-use std::io::Read;
+use std::fmt::{self, Debug, Formatter};
 use std::marker::{self, PhantomData};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -27,16 +39,17 @@ use crate::core::{
 };
 use crate::db::{
     Committable, Database, DatabaseKey, DatabaseKeyWithNotify, DatabaseRecord, DatabaseTransaction,
-    DatabaseVersion, MigrationMap,
+    DatabaseVersion, ServerMigrationFn,
 };
 use crate::encoding::{Decodable, DecodeError, Encodable};
+use crate::fmt_utils::AbbreviateHexBytes;
 use crate::module::audit::Audit;
 use crate::net::peers::MuxPeerConnections;
 use crate::server::DynServerModule;
 use crate::task::{MaybeSend, TaskGroup};
 use crate::{
-    apply, async_trait_maybe_send, dyn_newtype_define, maybe_add_send, maybe_add_send_sync, Amount,
-    OutPoint, PeerId,
+    apply, async_trait_maybe_send, maybe_add_send, maybe_add_send_sync, Amount, NumPeers, OutPoint,
+    PeerId,
 };
 
 #[derive(Debug, PartialEq)]
@@ -64,7 +77,7 @@ impl TransactionItemAmount {
 }
 
 /// All requests from client to server contain these fields
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ApiRequest<T> {
     /// Hashed user password if the API requires authentication
     pub auth: Option<ApiAuth>,
@@ -197,6 +210,10 @@ impl<'a> ApiEndpointContext<'a> {
         self.has_auth
     }
 
+    pub fn db(&self) -> Database {
+        self.db.clone()
+    }
+
     /// Waits for key to be present in database.
     pub fn wait_key_exists<K>(&self, key: K) -> impl Future<Output = K::Value>
     where
@@ -265,11 +282,13 @@ pub mod __reexports {
 /// # Example
 ///
 /// ```rust
+/// # use fedimint_core::module::ApiVersion;
 /// # use fedimint_core::module::{api_endpoint, ApiEndpoint, registry::ModuleInstanceId};
 /// struct State;
 ///
 /// let _: ApiEndpoint<State> = api_endpoint! {
 ///     "/foobar",
+///     ApiVersion::new(0, 3),
 ///     async |state: &State, _dbtx, params: ()| -> i32 {
 ///         Ok(0)
 ///     }
@@ -279,6 +298,9 @@ pub mod __reexports {
 macro_rules! __api_endpoint {
     (
         $path:expr,
+        // Api Version this endpoint was introduced in, at the current consensus level
+        // Currently for documentation purposes only.
+        $version_introduced:expr,
         async |$state:ident: &$state_ty:ty, $context:ident, $param:ident: $param_ty:ty| -> $resp_ty:ty $body:block
     ) => {{
         struct Endpoint;
@@ -295,6 +317,10 @@ macro_rules! __api_endpoint {
                 $context: &'context mut $crate::module::ApiEndpointContext<'dbtx>,
                 $param: Self::Param,
             ) -> ::std::result::Result<Self::Response, $crate::module::ApiError> {
+                {
+                    // just to enforce the correct type
+                    const __API_VERSION: $crate::module::ApiVersion = $version_introduced;
+                }
                 $body
             }
         }
@@ -398,6 +424,8 @@ pub trait IDynCommonModuleInit: Debug {
 
     fn to_dyn_common(&self) -> DynCommonModuleInit;
 
+    fn database_version(&self) -> DatabaseVersion;
+
     async fn dump_database(
         &self,
         dbtx: &mut DatabaseTransaction<'_>,
@@ -406,15 +434,28 @@ pub trait IDynCommonModuleInit: Debug {
 }
 
 /// Trait implemented by every `*ModuleInit` (server or client side)
-#[apply(async_trait_maybe_send!)]
 pub trait ModuleInit: Debug + Clone + Send + Sync + 'static {
     type Common: CommonModuleInit;
 
-    async fn dump_database(
+    /// This represents the module's database version that the current code is
+    /// compatible with. It is important to increment this value whenever a
+    /// key or a value that is persisted to the database within the module
+    /// changes. It is also important to add the corresponding
+    /// migration function in `get_database_migrations` which should define how
+    /// to move from the previous database version to the current version.
+    const DATABASE_VERSION: DatabaseVersion;
+
+    fn dump_database(
         &self,
         dbtx: &mut DatabaseTransaction<'_>,
         prefix_names: Vec<String>,
-    ) -> Box<dyn Iterator<Item = (String, Box<dyn erased_serde::Serialize + Send>)> + '_>;
+    ) -> maybe_add_send!(
+        impl Future<
+            Output = Box<
+                dyn Iterator<Item = (String, Box<dyn erased_serde::Serialize + Send>)> + '_,
+            >,
+        >
+    );
 }
 
 #[apply(async_trait_maybe_send!)]
@@ -432,6 +473,10 @@ where
 
     fn to_dyn_common(&self) -> DynCommonModuleInit {
         DynCommonModuleInit::from_inner(Arc::new(self.clone()))
+    }
+
+    fn database_version(&self) -> DatabaseVersion {
+        <Self as ModuleInit>::DATABASE_VERSION
     }
 
     async fn dump_database(
@@ -458,21 +503,15 @@ pub trait IServerModuleInit: IDynCommonModuleInit {
 
     fn supported_api_versions(&self) -> SupportedModuleApiVersions;
 
-    fn database_version(&self) -> DatabaseVersion;
-
     /// Initialize the [`DynServerModule`] instance from its config
     async fn init(
         &self,
+        peer_num: NumPeers,
         cfg: ServerModuleConfig,
         db: Database,
-        task_group: &mut TaskGroup,
+        task_group: &TaskGroup,
         our_peer_id: PeerId,
     ) -> anyhow::Result<DynServerModule>;
-
-    /// Retrieves the `MigrationMap` from the module to be applied to the
-    /// database before the module is initialized. The `MigrationMap` is
-    /// indexed on the from version.
-    fn get_database_migrations(&self) -> MigrationMap;
 
     fn validate_params(&self, params: &ConfigGenModuleParams) -> anyhow::Result<()>;
 
@@ -495,6 +534,11 @@ pub trait IServerModuleInit: IDynCommonModuleInit {
         module_instance_id: ModuleInstanceId,
         config: &ServerModuleConsensusConfig,
     ) -> anyhow::Result<ClientModuleConfig>;
+
+    /// Retrieves the migrations map from the server module to be applied to the
+    /// database before the module is initialized. The migrations map is
+    /// indexed on the from version.
+    fn get_database_migrations(&self) -> BTreeMap<DatabaseVersion, ServerMigrationFn>;
 }
 
 dyn_newtype_define!(
@@ -546,6 +590,7 @@ where
     db: Database,
     task_group: TaskGroup,
     our_peer_id: PeerId,
+    num_peers: NumPeers,
     // ClientModuleInitArgs needs a bound because sometimes we need
     // to pass associated-types data, so let's just put it here right away
     _marker: marker::PhantomData<S>,
@@ -558,8 +603,13 @@ where
     pub fn cfg(&self) -> &ServerModuleConfig {
         &self.cfg
     }
+
     pub fn db(&self) -> &Database {
         &self.db
+    }
+
+    pub fn num_peers(&self) -> NumPeers {
+        self.num_peers
     }
 
     pub fn task_group(&self) -> &TaskGroup {
@@ -579,14 +629,6 @@ where
 #[apply(async_trait_maybe_send!)]
 pub trait ServerModuleInit: ModuleInit + Sized {
     type Params: ModuleInitParams;
-
-    /// This represents the module's database version that the current code is
-    /// compatible with. It is important to increment this value whenever a
-    /// key or a value that is persisted to the database within the module
-    /// changes. It is also important to add the corresponding
-    /// migration function in `get_database_migrations` which should define how
-    /// to move from the previous database version to the current version.
-    const DATABASE_VERSION: DatabaseVersion;
 
     /// Version of the module consensus supported by this implementation given a
     /// certain [`CoreConsensusVersion`].
@@ -611,13 +653,6 @@ pub trait ServerModuleInit: ModuleInit + Sized {
     /// Initialize the [`DynServerModule`] instance from its config
     async fn init(&self, args: &ServerModuleInitArgs<Self>) -> anyhow::Result<DynServerModule>;
 
-    /// Retrieves the `MigrationMap` from the module to be applied to the
-    /// database before the module is initialized. The `MigrationMap` is
-    /// indexed on the from version.
-    fn get_database_migrations(&self) -> MigrationMap {
-        MigrationMap::new()
-    }
-
     fn parse_params(&self, params: &ConfigGenModuleParams) -> anyhow::Result<Self::Params> {
         params.to_typed::<Self::Params>()
     }
@@ -641,6 +676,13 @@ pub trait ServerModuleInit: ModuleInit + Sized {
         &self,
         config: &ServerModuleConsensusConfig,
     ) -> anyhow::Result<<<Self as ModuleInit>::Common as CommonModuleInit>::ClientConfig>;
+
+    /// Retrieves the migrations map from the server module to be applied to the
+    /// database before the module is initialized. The migrations map is
+    /// indexed on the from version.
+    fn get_database_migrations(&self) -> BTreeMap<DatabaseVersion, ServerMigrationFn> {
+        BTreeMap::new()
+    }
 }
 
 #[apply(async_trait_maybe_send!)]
@@ -656,20 +698,18 @@ where
         <Self as ServerModuleInit>::supported_api_versions(self)
     }
 
-    fn database_version(&self) -> DatabaseVersion {
-        <Self as ServerModuleInit>::DATABASE_VERSION
-    }
-
     async fn init(
         &self,
+        num_peers: NumPeers,
         cfg: ServerModuleConfig,
         db: Database,
-        task_group: &mut TaskGroup,
+        task_group: &TaskGroup,
         our_peer_id: PeerId,
     ) -> anyhow::Result<DynServerModule> {
         <Self as ServerModuleInit>::init(
             self,
             &ServerModuleInitArgs {
+                num_peers,
                 cfg,
                 db,
                 task_group: task_group.clone(),
@@ -678,10 +718,6 @@ where
             },
         )
         .await
-    }
-
-    fn get_database_migrations(&self) -> MigrationMap {
-        <Self as ServerModuleInit>::get_database_migrations(self)
     }
 
     fn validate_params(&self, params: &ConfigGenModuleParams) -> anyhow::Result<()> {
@@ -720,6 +756,10 @@ where
             config.version,
             <Self as ServerModuleInit>::get_client_config(self, config)?,
         )
+    }
+
+    fn get_database_migrations(&self) -> BTreeMap<DatabaseVersion, ServerMigrationFn> {
+        <Self as ServerModuleInit>::get_database_migrations(self)
     }
 }
 
@@ -764,23 +804,43 @@ pub trait ServerModule: Debug + Sized {
     }
 
     /// Returns a decoder for the following associated types of this module:
+    /// * `ClientConfig`
     /// * `Input`
     /// * `Output`
     /// * `OutputOutcome`
     /// * `ConsensusItem`
+    /// * `InputError`
+    /// * `OutputError`
     fn decoder() -> Decoder {
         Self::Common::decoder_builder().build()
     }
 
-    /// This module's contribution to the next consensus proposal
+    /// This module's contribution to the next consensus proposal. This method
+    /// is only guaranteed to be called once every few seconds. Consensus items
+    /// are not meant to be latency critical; do not create them as
+    /// a response to a processed transaction. Only use consensus items to
+    /// establish consensus on a value that is required to verify
+    /// transactions, like unix time, block heights and feerates, and model all
+    /// other state changes trough transactions. The intention for this method
+    /// is to always return all available consensus items even if they are
+    /// redundant while process_consensus_item returns an error for the
+    /// redundant proposals.
+    ///
+    /// If you think you actually do require latency critical consensus items or
+    /// have trouble designing your module in order to avoid them please contact
+    /// the Fedimint developers.
     async fn consensus_proposal<'a>(
         &'a self,
         dbtx: &mut DatabaseTransaction<'_>,
     ) -> Vec<<Self::Common as ModuleCommon>::ConsensusItem>;
 
     /// This function is called once for every consensus item. The function
-    /// returns an error if and only if the consensus item does not change
-    /// our state and therefore may be safely discarded by the atomic broadcast.
+    /// should return Ok if and only if the consensus item changes
+    /// the system state. *Therefore this method should return an error in case
+    /// of merely redundant consensus items such that they will be purged from
+    /// the history of the federation.* This enables consensus_proposal to
+    /// return all available consensus item without wasting disk
+    /// space with redundant consensus items.
     async fn process_consensus_item<'a, 'b>(
         &'a self,
         dbtx: &mut DatabaseTransaction<'b>,
@@ -846,11 +906,23 @@ pub trait ServerModule: Debug + Sized {
 /// interact with `serde`-based APIs (AlephBFT, jsonrpsee). It creates a wrapper
 /// that holds the data as serialized
 // bytes internally.
-#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub struct SerdeModuleEncoding<T: Encodable + Decodable>(
     #[serde(with = "::fedimint_core::encoding::as_hex")] Vec<u8>,
     #[serde(skip)] PhantomData<T>,
 );
+
+impl<T> fmt::Debug for SerdeModuleEncoding<T>
+where
+    T: Encodable + Decodable,
+{
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str("SerdeModuleEncoding(")?;
+        fmt::Debug::fmt(&AbbreviateHexBytes(&self.0), f)?;
+        f.write_str(")")?;
+        Ok(())
+    }
+}
 
 impl<T: Encodable + Decodable> From<&T> for SerdeModuleEncoding<T> {
     fn from(value: &T) -> Self {
@@ -882,23 +954,9 @@ impl<T: Encodable + Decodable + 'static> SerdeModuleEncoding<T> {
 
         let total_len = u64::consensus_decode(&mut reader, &ModuleDecoderRegistry::default())?;
 
-        let mut reader = reader.take(total_len);
-
         // No recursive module decoding is supported since we give an empty decoder
         // registry to the decode function
-        let val = decoder.decode(
-            &mut reader,
-            module_instance,
-            &ModuleDecoderRegistry::default(),
-        )?;
-
-        if reader.limit() != 0 {
-            return Err(fedimint_core::encoding::DecodeError::new_custom(
-                anyhow::anyhow!("Dyn type did not consume all bytes during decoding"),
-            ));
-        }
-
-        Ok(val)
+        decoder.decode_complete(&mut reader, total_len, module_instance, &Default::default())
     }
 }
 

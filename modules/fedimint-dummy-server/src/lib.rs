@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::string::ToString;
 
 use anyhow::bail;
 use async_trait::async_trait;
@@ -9,7 +8,7 @@ use fedimint_core::config::{
 };
 use fedimint_core::core::ModuleInstanceId;
 use fedimint_core::db::{
-    DatabaseTransaction, DatabaseVersion, IDatabaseTransactionOpsCoreTyped, MigrationMap,
+    DatabaseTransaction, DatabaseVersion, IDatabaseTransactionOpsCoreTyped, ServerMigrationFn,
 };
 use fedimint_core::module::audit::Audit;
 use fedimint_core::module::{
@@ -42,9 +41,9 @@ pub mod db;
 pub struct DummyInit;
 
 // TODO: Boilerplate-code
-#[async_trait]
 impl ModuleInit for DummyInit {
     type Common = DummyCommonInit;
+    const DATABASE_VERSION: DatabaseVersion = DatabaseVersion(1);
 
     /// Dumps all database items for debugging
     async fn dump_database(
@@ -91,7 +90,6 @@ impl ModuleInit for DummyInit {
 #[async_trait]
 impl ServerModuleInit for DummyInit {
     type Params = DummyGenParams;
-    const DATABASE_VERSION: DatabaseVersion = DatabaseVersion(1);
 
     /// Returns the version of this module
     fn versions(&self, _core: CoreConsensusVersion) -> &[ModuleConsensusVersion] {
@@ -107,13 +105,6 @@ impl ServerModuleInit for DummyInit {
         Ok(Dummy::new(args.cfg().to_typed()?).into())
     }
 
-    /// DB migrations to move from old to newer versions
-    fn get_database_migrations(&self) -> MigrationMap {
-        let mut migrations = MigrationMap::new();
-        migrations.insert(DatabaseVersion(0), move |dbtx| migrate_to_v1(dbtx).boxed());
-        migrations
-    }
-
     /// Generates configs for all peers in a trusted manner for testing
     fn trusted_dealer_gen(
         &self,
@@ -126,9 +117,7 @@ impl ServerModuleInit for DummyInit {
             .iter()
             .map(|&peer| {
                 let config = DummyConfig {
-                    local: DummyConfigLocal {
-                        example: params.local.0.clone(),
-                    },
+                    local: DummyConfigLocal {},
                     private: DummyConfigPrivate,
                     consensus: DummyConfigConsensus {
                         tx_fee: params.consensus.tx_fee,
@@ -148,9 +137,7 @@ impl ServerModuleInit for DummyInit {
         let params = self.parse_params(params).unwrap();
 
         Ok(DummyConfig {
-            local: DummyConfigLocal {
-                example: params.local.0.clone(),
-            },
+            local: DummyConfigLocal {},
             private: DummyConfigPrivate,
             consensus: DummyConfigConsensus {
                 tx_fee: params.consensus.tx_fee,
@@ -176,6 +163,13 @@ impl ServerModuleInit for DummyInit {
         _config: ServerModuleConfig,
     ) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    /// DB migrations to move from old to newer versions
+    fn get_database_migrations(&self) -> BTreeMap<DatabaseVersion, ServerMigrationFn> {
+        let mut migrations: BTreeMap<DatabaseVersion, ServerMigrationFn> = BTreeMap::new();
+        migrations.insert(DatabaseVersion(0), move |dbtx| migrate_to_v1(dbtx).boxed());
+        migrations
     }
 }
 

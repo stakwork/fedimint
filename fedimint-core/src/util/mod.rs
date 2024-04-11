@@ -1,6 +1,8 @@
 /// Copied from `tokio_stream` 0.1.12 to use our optional Send bounds
 pub mod broadcaststream;
+pub mod update_merge;
 
+use std::convert::Infallible;
 use std::fmt::{Debug, Display, Formatter};
 use std::future::Future;
 use std::hash::Hash;
@@ -11,14 +13,15 @@ use std::str::FromStr;
 use std::{fs, io};
 
 use anyhow::format_err;
+use fedimint_logging::LOG_CORE;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
-use tracing::debug;
+use tracing::{debug, warn, Instrument, Span};
 use url::{Host, ParseError, Url};
 
 use crate::task::MaybeSend;
-use crate::{apply, async_trait_maybe_send, maybe_add_send};
+use crate::{apply, async_trait_maybe_send, maybe_add_send, runtime};
 
 /// Future that is `Send` unless targeting WASM
 pub type BoxFuture<'a, T> = Pin<Box<maybe_add_send!(dyn Future<Output = T> + 'a)>>;
@@ -185,6 +188,7 @@ pub fn write_overwrite<P: AsRef<Path>, C: AsRef<[u8]>>(path: P, contents: C) -> 
     fs::File::options()
         .write(true)
         .create(true)
+        .truncate(true)
         .open(path)?
         .write_all(contents.as_ref())
 }
@@ -197,6 +201,7 @@ pub async fn write_overwrite_async<P: AsRef<Path>, C: AsRef<[u8]>>(
     tokio::fs::OpenOptions::new()
         .write(true)
         .create(true)
+        .truncate(true)
         .open(path)
         .await?
         .write_all(contents.as_ref())
@@ -217,15 +222,181 @@ pub async fn write_new_async<P: AsRef<Path>, C: AsRef<[u8]>>(
         .await
 }
 
+#[derive(Debug, Clone)]
+pub struct Spanned<T> {
+    value: T,
+    span: Span,
+}
+
+impl<T> Spanned<T> {
+    pub async fn new<F: Future<Output = T>>(span: Span, make: F) -> Self {
+        Self::try_new::<Infallible, _>(span, async { Ok(make.await) })
+            .await
+            .unwrap()
+    }
+
+    pub async fn try_new<E, F: Future<Output = Result<T, E>>>(
+        span: Span,
+        make: F,
+    ) -> Result<Self, E> {
+        let span2 = span.clone();
+        async move {
+            Ok(Self {
+                value: make.await?,
+                span: span2,
+            })
+        }
+        .instrument(span)
+        .await
+    }
+
+    pub fn borrow(&self) -> Spanned<&T> {
+        Spanned {
+            value: &self.value,
+            span: self.span.clone(),
+        }
+    }
+
+    pub fn map<U>(self, map: impl Fn(T) -> U) -> Spanned<U> {
+        Spanned {
+            value: map(self.value),
+            span: self.span.clone(),
+        }
+    }
+
+    pub async fn borrow_mut(&mut self) -> Spanned<&mut T> {
+        Spanned {
+            value: &mut self.value,
+            span: self.span.clone(),
+        }
+    }
+
+    pub fn with_sync<O, F: FnOnce(T) -> O>(self, f: F) -> O {
+        let _g = self.span.enter();
+        f(self.value)
+    }
+
+    pub async fn with<Fut: Future, F: FnOnce(T) -> Fut>(self, f: F) -> Fut::Output {
+        async { f(self.value).await }.instrument(self.span).await
+    }
+
+    pub fn span(&self) -> Span {
+        self.span.clone()
+    }
+
+    pub fn value(&self) -> &T {
+        &self.value
+    }
+
+    pub fn value_mut(&mut self) -> &mut T {
+        &mut self.value
+    }
+
+    pub fn into_value(self) -> T {
+        self.value
+    }
+}
+
+/// For CLIs, detects `version-hash` as a single argument, prints the provided
+/// version hash, then exits the process.
+pub fn handle_version_hash_command(version_hash: &str) {
+    let mut args = std::env::args();
+    if let Some(ref arg) = args.nth(1) {
+        if arg.as_str() == "version-hash" {
+            println!("{}", version_hash);
+            std::process::exit(0);
+        }
+    }
+}
+
+pub use backon::{
+    BackoffBuilder, ConstantBuilder as ConstantBackoff, ExponentialBuilder as ExponentialBackoff,
+    FibonacciBuilder as FibonacciBackoff,
+};
+
+/// Run the supplied closure `op_fn` until it succeeds. Frequency and number of
+/// retries is determined by the specified strategy.
+///
+/// ```
+/// use std::time::Duration;
+///
+/// use fedimint_core::util::{retry, FibonacciBackoff};
+/// # tokio_test::block_on(async {
+/// retry(
+///     "Gateway balance after swap".to_string(),
+///     FibonacciBackoff::default()
+///         .with_min_delay(Duration::from_millis(200))
+///         .with_max_delay(Duration::from_secs(3))
+///         .with_max_times(10),
+///     || async {
+///         // Fallible network calls …
+///         Ok(())
+///     },
+/// )
+/// .await
+/// .expect("never fails");
+/// # });
+/// ```
+///
+/// # Returns
+///
+/// - If the closure runs successfully, the result is immediately returned
+/// - If the closure did not run successfully for `max_attempts` times, the
+///   error of the closure is returned
+pub async fn retry<F, Fut, T>(
+    op_name: impl Into<String>,
+    strategy: impl backon::BackoffBuilder,
+    op_fn: F,
+) -> Result<T, anyhow::Error>
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = Result<T, anyhow::Error>>,
+{
+    let mut strategy = strategy.build();
+    let op_name = op_name.into();
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        match op_fn().await {
+            Ok(result) => return Ok(result),
+            Err(error) => {
+                if let Some(interval) = strategy.next() {
+                    // run closure op_fn again
+                    debug!(
+                        target: LOG_CORE,
+                        %error,
+                        %attempts,
+                        interval = interval.as_secs(),
+                        "{} failed, retrying",
+                        op_name,
+                    );
+                    runtime::sleep(interval).await;
+                } else {
+                    warn!(
+                        target: LOG_CORE,
+                        %error,
+                        %attempts,
+                        "{} failed",
+                        op_name,
+                    );
+                    return Err(error);
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU8, Ordering};
     use std::time::Duration;
 
-    use fedimint_core::task::Elapsed;
+    use anyhow::anyhow;
+    use fedimint_core::runtime::Elapsed;
     use futures::FutureExt;
 
-    use crate::task::timeout;
-    use crate::util::{NextOrPending, SafeUrl};
+    use super::*;
+    use crate::runtime::timeout;
 
     #[test]
     fn test_safe_url() {
@@ -286,5 +457,47 @@ mod tests {
             timeout(Duration::from_millis(100), stream.next_or_pending()).await,
             Err(Elapsed)
         ));
+    }
+    #[tokio::test]
+    async fn retry_succeed_with_one_attempt() {
+        let counter = AtomicU8::new(0);
+        let closure = || async {
+            counter.fetch_add(1, Ordering::SeqCst);
+            // always return a success
+            Ok(42)
+        };
+
+        let _ = retry(
+            "Run once",
+            ConstantBackoff::default()
+                .with_delay(Duration::ZERO)
+                .with_max_times(3),
+            closure,
+        )
+        .await;
+
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn retry_fail_with_three_attempts() {
+        let counter = AtomicU8::new(0);
+        let closure = || async {
+            counter.fetch_add(1, Ordering::SeqCst);
+            // always fail
+            Err::<(), anyhow::Error>(anyhow!("42"))
+        };
+
+        let _ = retry(
+            "Run 3 once",
+            ConstantBackoff::default()
+                .with_delay(Duration::ZERO)
+                // retry two error
+                .with_max_times(2),
+            closure,
+        )
+        .await;
+
+        assert_eq!(counter.load(Ordering::SeqCst), 3);
     }
 }

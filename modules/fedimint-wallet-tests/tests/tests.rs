@@ -1,18 +1,21 @@
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use anyhow::{bail, Context};
 use assert_matches::assert_matches;
 use bitcoin::secp256k1::rand::rngs::OsRng;
-use bitcoin::secp256k1::{self, Secp256k1};
+use bitcoin::secp256k1::Secp256k1;
 use fedimint_bitcoind::DynBitcoindRpc;
 use fedimint_client::secret::{PlainRootSecretStrategy, RootSecretStrategy};
-use fedimint_client::ClientArc;
-use fedimint_core::bitcoinrpc::BitcoinRpcConfig;
+use fedimint_client::ClientHandleArc;
+use fedimint_core::bitcoin_migration::{
+    bitcoin29_to_bitcoin30_network, bitcoin30_to_bitcoin29_address,
+};
 use fedimint_core::db::mem_impl::MemDatabase;
 use fedimint_core::db::{DatabaseTransaction, IRawDatabaseExt};
-use fedimint_core::task::sleep;
+use fedimint_core::envs::BitcoinRpcConfig;
+use fedimint_core::task::sleep_in_test;
 use fedimint_core::util::{BoxStream, NextOrPending};
-use fedimint_core::{sats, Amount, Feerate, PeerId, ServerModule};
+use fedimint_core::{sats, time, Amount, Feerate, PeerId, ServerModule};
 use fedimint_dummy_client::DummyClientInit;
 use fedimint_dummy_common::config::DummyGenParams;
 use fedimint_dummy_server::DummyInit;
@@ -44,12 +47,12 @@ const PEG_OUT_AMOUNT_SATS: u64 = 1000;
 const PEG_IN_TIMEOUT: Duration = Duration::from_secs(60);
 
 async fn peg_in<'a>(
-    client: &'a ClientArc,
+    client: &'a ClientHandleArc,
     bitcoin: &dyn BitcoinTest,
     dyn_bitcoin_rpc: &DynBitcoindRpc,
     finality_delay: u64,
 ) -> anyhow::Result<BoxStream<'a, Amount>> {
-    let valid_until = SystemTime::now() + PEG_IN_TIMEOUT;
+    let valid_until = time::now() + PEG_IN_TIMEOUT;
 
     let mut balance_sub = client.subscribe_balance_changes().await;
     assert_eq!(balance_sub.ok().await?, sats(0));
@@ -80,7 +83,10 @@ async fn peg_in<'a>(
     Ok(balance_sub)
 }
 
-async fn await_consensus_to_catch_up(client: &ClientArc, block_count: u64) -> anyhow::Result<u64> {
+async fn await_consensus_to_catch_up(
+    client: &ClientHandleArc,
+    block_count: u64,
+) -> anyhow::Result<u64> {
     let wallet = client.get_first_module::<WalletClientModule>();
     loop {
         let current_consensus = client
@@ -90,7 +96,7 @@ async fn await_consensus_to_catch_up(client: &ClientArc, block_count: u64) -> an
             .await?;
         if current_consensus < block_count {
             info!("Current consensus block count is {current_consensus}, waiting for consensus to reach block count {block_count}");
-            sleep(Duration::from_secs(1)).await;
+            sleep_in_test(format!("Current consensus block count is {current_consensus}, waiting for consensus to reach block count {block_count}"), Duration::from_secs(1)).await;
         } else {
             info!("Current consensus block count is {current_consensus}, consensus caught up");
             return Ok(current_consensus);
@@ -437,9 +443,11 @@ async fn peg_ins_that_are_unconfirmed_are_rejected() -> anyhow::Result<()> {
     let wallet_config: WalletConfig = wallet_server_cfg[0].to_typed()?;
     let peg_in_descriptor = wallet_config.consensus.peg_in_descriptor;
 
-    let peg_in_address = peg_in_descriptor
-        .tweak(&pk, secp256k1::SECP256K1)
-        .address(wallet_config.consensus.network)?;
+    let peg_in_address = bitcoin30_to_bitcoin29_address(
+        peg_in_descriptor.tweak(&pk, secp256k1::SECP256K1).address(
+            bitcoin29_to_bitcoin30_network(wallet_config.consensus.network),
+        )?,
+    );
 
     let mut wallet = fedimint_wallet_server::Wallet::new_with_bitcoind(
         wallet_server_cfg[0].to_typed()?,
@@ -588,40 +596,36 @@ fn build_wallet_server_configs(
 
 #[cfg(test)]
 mod fedimint_migration_tests {
-    use anyhow::{ensure, Context};
+    use anyhow::ensure;
     use bitcoin::psbt::{Input, PartiallySignedTransaction};
     use bitcoin::{
         Amount, BlockHash, PackedLockTime, Script, Sequence, Transaction, TxIn, TxOut, Txid,
         WPubkeyHash,
     };
     use fedimint_client::module::init::DynClientModuleInit;
-    use fedimint_client::module::ClientModule;
-    use fedimint_core::core::LEGACY_HARDCODED_INSTANCE_ID_WALLET;
     use fedimint_core::db::{
-        apply_migrations, DatabaseTransaction, DatabaseVersion, DatabaseVersionKey,
-        IDatabaseTransactionOpsCoreTyped,
+        Database, DatabaseVersion, DatabaseVersionKeyV0, IDatabaseTransactionOpsCoreTyped,
     };
-    use fedimint_core::module::registry::ModuleDecoderRegistry;
-    use fedimint_core::module::{CommonModuleInit, DynServerModuleInit};
-    use fedimint_core::{BitcoinHash, Feerate, OutPoint, PeerId, ServerModule, TransactionId};
+    use fedimint_core::module::DynServerModuleInit;
+    use fedimint_core::{BitcoinHash, Feerate, OutPoint, PeerId, TransactionId};
     use fedimint_logging::TracingSetup;
     use fedimint_testing::db::{
-        prepare_db_migration_snapshot, validate_migrations, BYTE_20, BYTE_32, BYTE_33,
+        snapshot_db_migrations, snapshot_db_migrations_client, validate_migrations_client,
+        validate_migrations_server, BYTE_20, BYTE_32, BYTE_33,
     };
     use fedimint_wallet_client::client_db::NextPegInTweakIndexKey;
     use fedimint_wallet_client::{WalletClientInit, WalletClientModule};
-    use fedimint_wallet_common::db::{
+    use fedimint_wallet_common::{
+        PegOutFees, Rbf, SpendableUTXO, WalletCommonInit, WalletOutputOutcome,
+    };
+    use fedimint_wallet_server::db::{
         BlockCountVoteKey, BlockCountVotePrefix, BlockHashKey, BlockHashKeyPrefix, DbKeyPrefix,
         FeeRateVoteKey, FeeRateVotePrefix, PegOutBitcoinTransaction,
         PegOutBitcoinTransactionPrefix, PegOutNonceKey, PegOutTxSignatureCI,
         PegOutTxSignatureCIPrefix, PendingTransactionKey, PendingTransactionPrefixKey, UTXOKey,
         UTXOPrefixKey, UnsignedTransactionKey, UnsignedTransactionPrefixKey,
     };
-    use fedimint_wallet_common::{
-        PegOutFees, PendingTransaction, Rbf, SpendableUTXO, UnsignedTransaction, WalletCommonInit,
-        WalletOutputOutcome,
-    };
-    use fedimint_wallet_server::Wallet;
+    use fedimint_wallet_server::{PendingTransaction, UnsignedTransaction};
     use futures::StreamExt;
     use rand::rngs::OsRng;
     use secp256k1::Message;
@@ -636,8 +640,11 @@ mod fedimint_migration_tests {
     /// in future code versions. This function should not be updated when
     /// database keys/values change - instead a new function should be added
     /// that creates a new database backup that can be tested.
-    async fn create_server_db_with_v0_data(mut dbtx: DatabaseTransaction<'_>) {
-        dbtx.insert_new_entry(&DatabaseVersionKey, &DatabaseVersion(0))
+    async fn create_server_db_with_v0_data(db: Database) {
+        let mut dbtx = db.begin_transaction().await;
+
+        // Will be migrated to `DatabaseVersionKey` during `apply_migrations`
+        dbtx.insert_new_entry(&DatabaseVersionKeyV0, &DatabaseVersion(0))
             .await;
 
         dbtx.insert_new_entry(&BlockHashKey(BlockHash::from_slice(&BYTE_32).unwrap()), &())
@@ -784,54 +791,42 @@ mod fedimint_migration_tests {
             &WalletOutputOutcome::new_v0(Txid::from_slice(&BYTE_32).unwrap()),
         )
         .await;
+
+        dbtx.commit_tx().await;
     }
 
-    async fn create_client_db_with_v0_data(mut dbtx: DatabaseTransaction<'_>) {
-        dbtx.insert_new_entry(&DatabaseVersionKey, &DatabaseVersion(0))
+    async fn create_client_db_with_v0_data(db: Database) {
+        let mut dbtx = db.begin_transaction().await;
+
+        // Will be migrated to `DatabaseVersionKey` during `apply_migrations`
+        dbtx.insert_new_entry(&DatabaseVersionKeyV0, &DatabaseVersion(0))
             .await;
 
         dbtx.insert_new_entry(&NextPegInTweakIndexKey, &2).await;
+
+        dbtx.commit_tx().await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn prepare_server_db_migration_snapshots() -> anyhow::Result<()> {
-        prepare_db_migration_snapshot(
-            "wallet-server-v0",
-            |dbtx| {
-                Box::pin(async move {
-                    create_server_db_with_v0_data(dbtx).await;
-                })
-            },
-            ModuleDecoderRegistry::from_iter([(
-                LEGACY_HARDCODED_INSTANCE_ID_WALLET,
-                WalletCommonInit::KIND,
-                <Wallet as ServerModule>::decoder(),
-            )]),
-        )
+    async fn snapshot_server_db_migrations() -> anyhow::Result<()> {
+        snapshot_db_migrations::<_, WalletCommonInit>("wallet-server-v0", |db| {
+            Box::pin(async move {
+                create_server_db_with_v0_data(db).await;
+            })
+        })
         .await
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_migrations() -> anyhow::Result<()> {
+    async fn test_server_db_migrations() -> anyhow::Result<()> {
         let _ = TracingSetup::default().init();
 
-        validate_migrations(
+        let module = DynServerModuleInit::from(WalletInit);
+        validate_migrations_server(
+            module,
             "wallet-server",
             |db| async move {
-                let module = DynServerModuleInit::from(WalletInit);
-                apply_migrations(
-                    &db,
-                    module.module_kind().to_string(),
-                    module.database_version(),
-                    module.get_database_migrations(),
-                )
-                .await
-                .context("Error applying migrations to temp database")?;
-
-                // Verify that all of the data from the wallet namespace can be read. If a
-                // database migration failed or was not properly supplied,
-                // the struct will fail to be read.
-                let mut dbtx = db.begin_transaction().await;
+                let mut dbtx = db.begin_transaction_nc().await;
 
                 for prefix in DbKeyPrefix::iter() {
                     match prefix {
@@ -846,6 +841,7 @@ mod fedimint_migration_tests {
                                 num_blocks > 0,
                                 "validate_migrations was not able to read any BlockHashes"
                             );
+                            info!("Validated BlockHash");
                         }
                         DbKeyPrefix::PegOutBitcoinOutPoint => {
                             let outpoints = dbtx
@@ -858,6 +854,7 @@ mod fedimint_migration_tests {
                                 num_outpoints > 0,
                                 "validate_migrations was not able to read any PegOutBitcoinTransactions"
                             );
+                            info!("Validated PegOutBitcoinOutPoint");
                         }
                         DbKeyPrefix::PegOutTxSigCi => {
                             let sigs = dbtx
@@ -870,6 +867,7 @@ mod fedimint_migration_tests {
                                 num_sigs > 0,
                                 "validate_migrations was not able to read any PegOutTxSigCi"
                             );
+                            info!("Validated PegOutTxSigCi");
                         }
                         DbKeyPrefix::PendingTransaction => {
                             let pending_txs = dbtx
@@ -882,12 +880,14 @@ mod fedimint_migration_tests {
                                 num_txs > 0,
                                 "validate_migrations was not able to read any PendingTransactions"
                             );
+                            info!("Validated PendingTransaction");
                         }
                         DbKeyPrefix::PegOutNonce => {
                             ensure!(dbtx
                                 .get_value(&PegOutNonceKey)
                                 .await
                                 .is_some());
+                            info!("Validated PegOutNonce");
                         }
                         DbKeyPrefix::UnsignedTransaction => {
                             let unsigned_txs = dbtx
@@ -900,6 +900,7 @@ mod fedimint_migration_tests {
                                 num_txs > 0,
                                 "validate_migrations was not able to read any UnsignedTransactions"
                             );
+                            info!("Validated UnsignedTransaction");
                         }
                         DbKeyPrefix::Utxo => {
                             let utxos = dbtx
@@ -912,6 +913,7 @@ mod fedimint_migration_tests {
                                 num_utxos > 0,
                                 "validate_migrations was not able to read any UTXOs"
                             );
+                            info!("Validated Utxo");
                         }
                         DbKeyPrefix::BlockCountVote => {
                             let heights = dbtx
@@ -924,6 +926,7 @@ mod fedimint_migration_tests {
                                 num_heights > 0,
                                 "validate_migrations was not able to read any block height votes"
                             );
+                            info!("Validated BlockCountVote");
                         }
                         DbKeyPrefix::FeeRateVote => {
                             let rates = dbtx
@@ -936,53 +939,35 @@ mod fedimint_migration_tests {
                                 num_rates > 0,
                                 "validate_migrations was not able to read any fee rate votes"
                             );
+                            info!("Validated FeeRateVote");
                         }
                     }
                 }
                 Ok(())
-            },
-            ModuleDecoderRegistry::from_iter([(
-                LEGACY_HARDCODED_INSTANCE_ID_WALLET,
-                WalletCommonInit::KIND,
-                <Wallet as ServerModule>::decoder(),
-            )]),
-        )
-        .await
+            }
+        ).await
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn prepare_client_db_migration_snapshots() -> anyhow::Result<()> {
-        prepare_db_migration_snapshot(
+    async fn snapshot_client_db_migrations() -> anyhow::Result<()> {
+        snapshot_db_migrations_client::<_, _, WalletCommonInit>(
             "wallet-client-v0",
-            |dbtx| Box::pin(async move { create_client_db_with_v0_data(dbtx).await }),
-            ModuleDecoderRegistry::from_iter([(
-                LEGACY_HARDCODED_INSTANCE_ID_WALLET,
-                WalletCommonInit::KIND,
-                <WalletClientModule as ClientModule>::decoder(),
-            )]),
+            |db| Box::pin(async move { create_client_db_with_v0_data(db).await }),
+            || (Vec::new(), Vec::new()),
         )
         .await
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_client_migrations() -> anyhow::Result<()> {
-        TracingSetup::default().init()?;
+    async fn test_client_db_migrations() -> anyhow::Result<()> {
+        let _ = TracingSetup::default().init();
 
-        validate_migrations(
+        let module = DynClientModuleInit::from(WalletClientInit::default());
+        validate_migrations_client::<_, _, WalletClientModule>(
+            module,
             "wallet-client",
-            |db| async move {
-                let module = DynClientModuleInit::from(WalletClientInit::default());
-                apply_migrations(
-                    &db,
-                    WalletCommonInit::KIND.to_string(),
-                    module.database_version(),
-                    module.get_database_migrations(),
-                )
-                .await
-                .context("Error applying migrations to client database")?;
-
-                let mut dbtx = db.begin_transaction().await;
-
+            |db, _, _| async move {
+                let mut dbtx = db.begin_transaction_nc().await;
                 for prefix in fedimint_wallet_client::client_db::DbKeyPrefix::iter() {
                     match prefix {
                         fedimint_wallet_client::client_db::DbKeyPrefix::NextPegInTweakIndex => {
@@ -998,11 +983,6 @@ mod fedimint_migration_tests {
 
                 Ok(())
             },
-            ModuleDecoderRegistry::from_iter([(
-                LEGACY_HARDCODED_INSTANCE_ID_WALLET,
-                WalletCommonInit::KIND,
-                <Wallet as ServerModule>::decoder(),
-            )]),
         )
         .await
     }

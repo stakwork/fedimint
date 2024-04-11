@@ -5,15 +5,16 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::net::SocketAddr;
 use std::panic::AssertUnwindSafe;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{anyhow as format_err, Context};
 use async_trait::async_trait;
 use bitcoin_hashes::sha256::HashEngine;
 use bitcoin_hashes::{sha256, Hash};
-use config::io::PLAINTEXT_PASSWORD;
+use config::io::{read_server_config, PLAINTEXT_PASSWORD};
 use config::ServerConfig;
+use fedimint_core::config::ServerModuleInitRegistry;
 use fedimint_core::core::ModuleInstanceId;
 use fedimint_core::db::Database;
 use fedimint_core::encoding::Encodable;
@@ -23,8 +24,7 @@ use fedimint_core::task::TaskGroup;
 use fedimint_core::PeerId;
 use fedimint_logging::{LOG_CONSENSUS, LOG_CORE, LOG_NET_API};
 use futures::FutureExt;
-use jsonrpsee::server::{ServerBuilder, ServerHandle};
-use jsonrpsee::types::error::CallError;
+use jsonrpsee::server::{PingConfig, RpcServiceBuilder, ServerBuilder, ServerHandle};
 use jsonrpsee::types::ErrorObject;
 use jsonrpsee::RpcModule;
 use tokio::runtime::Runtime;
@@ -32,8 +32,12 @@ use tracing::{error, info};
 
 use crate::config::api::{ConfigGenApi, ConfigGenSettings};
 use crate::consensus::server::ConsensusServer;
+use crate::metrics::initialize_gauge_metrics;
 use crate::net::api::{ConsensusApi, RpcHandlerCtx};
 use crate::net::connect::TlsTcpConnector;
+
+pub mod envs;
+pub mod metrics;
 
 pub mod atomic_broadcast;
 
@@ -69,6 +73,7 @@ pub trait HasApiContext<State> {
 }
 
 /// Main server for running Fedimint consensus and APIs
+#[derive(Debug)]
 pub struct FedimintServer {
     /// Location where configs are stored
     pub data_dir: PathBuf,
@@ -76,28 +81,43 @@ pub struct FedimintServer {
     pub settings: ConfigGenSettings,
     /// Database shared by the API and consensus
     pub db: Database,
-
     /// Version hash
     pub version_hash: String,
 }
 
 impl FedimintServer {
-    /// Starts the `ConfigGenApi` unless configs already exist
-    /// After configs are generated, start `ConsensusApi` and `ConsensusServer`
-    pub async fn run(&mut self, mut task_group: TaskGroup) -> anyhow::Result<()> {
+    pub fn new(
+        data_dir: PathBuf,
+        settings: ConfigGenSettings,
+        db: Database,
+        version_hash: String,
+    ) -> Self {
+        Self {
+            data_dir,
+            settings,
+            db,
+            version_hash,
+        }
+    }
+
+    /// Starts the `ConfigGenApi` with existing configs
+    pub async fn run_cfg(
+        &mut self,
+        cfg: &ServerConfig,
+        task_group: TaskGroup,
+    ) -> anyhow::Result<()> {
         info!(target: LOG_CONSENSUS, "Starting config gen");
-        let cfg = self
-            .run_config_gen(task_group.make_subgroup().await)
-            .await?;
+
+        initialize_gauge_metrics(&self.db).await;
 
         let (consensus_server, consensus_api) = ConsensusServer::new(
-            cfg,
+            cfg.clone(),
             self.db.clone(),
             self.settings.registry.clone(),
-            &mut task_group,
+            &task_group,
         )
         .await
-        .unwrap();
+        .context("Setting up consensus server")?;
 
         info!(target: LOG_CONSENSUS, "Starting consensus API");
 
@@ -113,12 +133,62 @@ impl FedimintServer {
         Ok(())
     }
 
+    /// Starts server that will run DKG
+    /// After configs are generated, start `ConsensusApi` and `ConsensusServer`
+    pub async fn run_dkg(&mut self, task_group: TaskGroup) -> anyhow::Result<ServerConfig> {
+        info!(target: LOG_CONSENSUS, "Starting config gen");
+
+        initialize_gauge_metrics(&self.db).await;
+
+        self.generate_config(task_group.make_subgroup()).await
+    }
+
+    pub async fn run(
+        &mut self,
+        module_inits: &ServerModuleInitRegistry,
+        task_group: TaskGroup,
+    ) -> anyhow::Result<()> {
+        let cfg = match FedimintServer::get_config(&self.data_dir).await? {
+            Some(cfg) => cfg,
+            None => self.run_dkg(task_group.clone()).await?,
+        };
+
+        let decoders = module_inits.decoders_strict(
+            cfg.consensus
+                .modules
+                .iter()
+                .map(|(id, config)| (*id, &config.kind)),
+        )?;
+
+        let db = self.db.with_decoders(decoders);
+
+        // Reconstruct yourself, with a DB that has decoders configured
+        let mut s = Self {
+            db,
+            data_dir: self.data_dir.clone(),
+            settings: self.settings.clone(),
+            version_hash: self.version_hash.clone(),
+        };
+
+        s.run_cfg(&cfg, task_group.clone()).await
+    }
+
+    pub async fn get_config(data_dir: &Path) -> anyhow::Result<Option<ServerConfig>> {
+        // Attempt get the config with local password, otherwise start config gen
+        if let Ok(password) = fs::read_to_string(data_dir.join(PLAINTEXT_PASSWORD)) {
+            return Ok(Some(read_server_config(&password, data_dir.to_owned())?));
+        }
+
+        Ok(None)
+    }
+
     /// Generates the `ServerConfig`
     ///
     /// If a local password file exists, will try to read the configs from the
     /// filesystem.  Otherwise, it will start the `ConfigGenApi`.
-    async fn run_config_gen(&self, mut task_group: TaskGroup) -> anyhow::Result<ServerConfig> {
+    async fn generate_config(&self, mut task_group: TaskGroup) -> anyhow::Result<ServerConfig> {
         let (config_generated_tx, mut config_generated_rx) = tokio::sync::mpsc::channel(1);
+
         let config_gen = ConfigGenApi::new(
             self.data_dir.clone(),
             self.settings.clone(),
@@ -188,7 +258,8 @@ impl FedimintServer {
     ) -> FedimintApiHandler {
         let mut builder = ServerBuilder::new()
             .max_connections(max_connections)
-            .ping_interval(Duration::from_secs(10));
+            .enable_ws_ping(PingConfig::new().ping_interval(Duration::from_secs(10)))
+            .set_rpc_middleware(RpcServiceBuilder::new().layer(metrics::jsonrpsee::MetricsLayer));
 
         let runtime = if force_shutdown {
             let runtime = Runtime::new().expect("Creates runtime");
@@ -204,8 +275,7 @@ impl FedimintServer {
             .context(format!("Bind address: {api_bind}"))
             .context(format!("API name: {name}"))
             .expect("Could not build API server")
-            .start(module)
-            .expect("Could not start API server");
+            .start(module);
         info!(target: LOG_NET_API, "Starting api on ws://{api_bind}");
 
         FedimintApiHandler { handle, runtime }
@@ -263,20 +333,15 @@ impl FedimintServer {
                             target: LOG_NET_API,
                             path, "API handler panicked, DO NOT IGNORE, FIX IT!!!"
                         );
-                        jsonrpsee::core::Error::Call(CallError::Custom(ErrorObject::owned(
-                            500,
-                            "API handler panicked",
-                            None::<()>,
-                        )))
+                        ErrorObject::owned(500, "API handler panicked", None::<()>)
                     })?
                     .map_err(|tokio::time::error::Elapsed { .. }| {
-                        jsonrpsee::core::Error::RequestTimeout
+                        // TODO: find a better error for this, the error we used before:
+                        // jsonrpsee::core::Error::RequestTimeout
+                        // was moved to be client-side only
+                        ErrorObject::owned(-32000, "Request timeout", None::<()>)
                     })?
-                    .map_err(|e| {
-                        jsonrpsee::core::Error::Call(CallError::Custom(ErrorObject::owned(
-                            e.code, e.message, None::<()>,
-                        )))
-                    })
+                    .map_err(|e| ErrorObject::owned(e.code, e.message, None::<()>))
                 })
                 .expect("Failed to register async method");
         }

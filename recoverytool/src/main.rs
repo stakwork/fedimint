@@ -1,3 +1,5 @@
+pub mod envs;
+
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use std::fmt::{Display, Formatter};
@@ -5,11 +7,14 @@ use std::hash::Hasher;
 use std::path::{Path, PathBuf};
 
 use anyhow::anyhow;
-use bitcoin::hashes::hex::FromHex;
-use bitcoin::hashes::sha256::Hash;
 use bitcoin::network::constants::Network;
 use bitcoin::OutPoint;
 use clap::{ArgGroup, Parser, Subcommand};
+use fedimint_core::bitcoin_migration::{
+    bitcoin29_to_bitcoin30_amount, bitcoin29_to_bitcoin30_network, bitcoin29_to_bitcoin30_outpoint,
+    bitcoin29_to_bitcoin30_secp256k1_secret_key, bitcoin30_to_bitcoin29_network,
+    bitcoin30_to_bitcoin29_secp256k1_secret_key,
+};
 use fedimint_core::core::{
     LEGACY_HARDCODED_INSTANCE_ID_LN, LEGACY_HARDCODED_INSTANCE_ID_MINT,
     LEGACY_HARDCODED_INSTANCE_ID_WALLET,
@@ -30,21 +35,25 @@ use fedimint_rocksdb::{RocksDb, RocksDbReadOnly};
 use fedimint_server::config::io::read_server_config;
 use fedimint_server::db::SignedSessionOutcomePrefix;
 use fedimint_wallet_server::common::config::WalletConfig;
-use fedimint_wallet_server::common::db::{UTXOKey, UTXOPrefixKey};
 use fedimint_wallet_server::common::keys::CompressedPublicKey;
 use fedimint_wallet_server::common::tweakable::Tweakable;
 use fedimint_wallet_server::common::{
     PegInDescriptor, SpendableUTXO, WalletCommonInit, WalletInput,
 };
+use fedimint_wallet_server::db::{UTXOKey, UTXOPrefixKey};
 use fedimint_wallet_server::{nonce_from_idx, Wallet};
 use futures::stream::StreamExt;
+use hex::FromHex;
 use miniscript::{Descriptor, MiniscriptKey, ToPublicKey, TranslatePk, Translator};
 use secp256k1::SecretKey;
 use serde::Serialize;
 use tracing::info;
 
+use crate::envs::FM_PASSWORD_ENV;
+
 /// Tool to recover the on-chain wallet of a Fedimint federation
 #[derive(Debug, Parser)]
+#[command(version)]
 #[command(group(
     ArgGroup::new("keysource")
         .required(true)
@@ -55,7 +64,7 @@ struct RecoveryTool {
     #[arg(long = "cfg")]
     config: Option<PathBuf>,
     /// The password that encrypts the configs
-    #[arg(long, env = "FM_PASSWORD", requires = "config")]
+    #[arg(long, env = FM_PASSWORD_ENV, requires = "config")]
     password: String,
     /// Wallet descriptor, can be used instead of --cfg
     #[arg(long)]
@@ -139,14 +148,23 @@ async fn main() -> anyhow::Result<()> {
 
         (base_descriptor, base_key, network)
     } else if let (Some(descriptor), Some(key)) = (opts.descriptor, opts.key) {
-        (descriptor, key, opts.network)
+        (
+            descriptor,
+            key,
+            bitcoin30_to_bitcoin29_network(opts.network),
+        )
     } else {
         panic!("Either config or descriptor need to be provided by clap");
     };
 
     match opts.strategy {
         TweakSource::Direct { tweak } => {
-            let descriptor = tweak_descriptor(&base_descriptor, &base_key, &tweak, network);
+            let descriptor = tweak_descriptor(
+                &base_descriptor,
+                &base_key,
+                &tweak,
+                bitcoin29_to_bitcoin30_network(network),
+            );
             let wallets = vec![ImportableWalletMin { descriptor }];
 
             serde_json::to_writer(std::io::stdout().lock(), &wallets)
@@ -167,12 +185,17 @@ async fn main() -> anyhow::Result<()> {
                 .find_by_prefix(&UTXOPrefixKey)
                 .await
                 .map(|(UTXOKey(outpoint), SpendableUTXO { tweak, amount })| {
-                    let descriptor = tweak_descriptor(&base_descriptor, &base_key, &tweak, network);
+                    let descriptor = tweak_descriptor(
+                        &base_descriptor,
+                        &base_key,
+                        &tweak,
+                        bitcoin29_to_bitcoin30_network(network),
+                    );
 
                     ImportableWallet {
-                        outpoint,
+                        outpoint: bitcoin29_to_bitcoin30_outpoint(outpoint),
                         descriptor,
-                        amount_sat: amount,
+                        amount_sat: bitcoin29_to_bitcoin30_amount(amount),
                     }
                 })
                 .collect()
@@ -243,7 +266,12 @@ async fn main() -> anyhow::Result<()> {
 
             let wallets = tweaks
                 .map(|tweak| {
-                    let descriptor = tweak_descriptor(&base_descriptor, &base_key, &tweak, network);
+                    let descriptor = tweak_descriptor(
+                        &base_descriptor,
+                        &base_key,
+                        &tweak,
+                        bitcoin29_to_bitcoin30_network(network),
+                    );
                     ImportableWalletMin { descriptor }
                 })
                 .collect::<Vec<_>>()
@@ -305,10 +333,10 @@ fn tweak_descriptor(
     base_descriptor
         .tweak(tweak, secp256k1::SECP256K1)
         .translate_pk(&mut SecretKeyInjector {
-            secret: bitcoin::util::key::PrivateKey {
+            secret: bitcoin::key::PrivateKey {
                 compressed: true,
                 network,
-                inner: secret_key,
+                inner: bitcoin29_to_bitcoin30_secp256k1_secret_key(secret_key),
             },
             public: pub_key,
         })
@@ -320,7 +348,7 @@ fn tweak_descriptor(
 struct ImportableWallet {
     outpoint: OutPoint,
     descriptor: Descriptor<Key>,
-    #[serde(with = "bitcoin::util::amount::serde::as_sat")]
+    #[serde(with = "bitcoin::amount::serde::as_sat")]
     amount_sat: bitcoin::Amount,
 }
 
@@ -335,7 +363,7 @@ struct ImportableWalletMin {
 #[derive(Debug, Clone, Copy, Eq)]
 enum Key {
     Public(CompressedPublicKey),
-    Private(bitcoin::util::key::PrivateKey),
+    Private(bitcoin::key::PrivateKey),
 }
 
 impl PartialOrd for Key {
@@ -372,7 +400,9 @@ impl Key {
         match self {
             Key::Public(pk) => pk,
             Key::Private(sk) => {
-                CompressedPublicKey::new(secp256k1::PublicKey::from_secret_key_global(&sk.inner))
+                CompressedPublicKey::new(secp256k1::PublicKey::from_secret_key_global(
+                    &bitcoin30_to_bitcoin29_secp256k1_secret_key(sk.inner),
+                ))
             }
         }
     }
@@ -392,6 +422,10 @@ impl MiniscriptKey for Key {
         false
     }
 
+    fn num_der_paths(&self) -> usize {
+        0
+    }
+
     type Sha256 = bitcoin::hashes::sha256::Hash;
     type Hash256 = miniscript::hash256::Hash;
     type Ripemd160 = bitcoin::hashes::ripemd160::Hash;
@@ -399,11 +433,13 @@ impl MiniscriptKey for Key {
 }
 
 impl ToPublicKey for Key {
-    fn to_public_key(&self) -> bitcoin::PublicKey {
+    fn to_public_key(&self) -> miniscript::bitcoin::PublicKey {
         self.to_compressed_public_key().to_public_key()
     }
 
-    fn to_sha256(hash: &<Self as MiniscriptKey>::Sha256) -> Hash {
+    fn to_sha256(
+        hash: &<Self as MiniscriptKey>::Sha256,
+    ) -> miniscript::bitcoin::hashes::sha256::Hash {
         *hash
     }
 
@@ -411,11 +447,15 @@ impl ToPublicKey for Key {
         *hash
     }
 
-    fn to_ripemd160(hash: &<Self as MiniscriptKey>::Ripemd160) -> bitcoin::hashes::ripemd160::Hash {
+    fn to_ripemd160(
+        hash: &<Self as MiniscriptKey>::Ripemd160,
+    ) -> miniscript::bitcoin::hashes::ripemd160::Hash {
         *hash
     }
 
-    fn to_hash160(hash: &<Self as MiniscriptKey>::Hash160) -> bitcoin::hashes::hash160::Hash {
+    fn to_hash160(
+        hash: &<Self as MiniscriptKey>::Hash160,
+    ) -> miniscript::bitcoin::hashes::hash160::Hash {
         *hash
     }
 }
@@ -424,7 +464,7 @@ impl ToPublicKey for Key {
 /// know.
 #[derive(Debug)]
 struct SecretKeyInjector {
-    secret: bitcoin::util::key::PrivateKey,
+    secret: bitcoin::key::PrivateKey,
     public: CompressedPublicKey,
 }
 
@@ -468,12 +508,12 @@ impl Translator<CompressedPublicKey, Key, ()> for SecretKeyInjector {
 
 #[test]
 fn parses_valid_length_tweaks() {
-    use bitcoin::hashes::hex::ToHex;
+    use hex::ToHex;
 
-    let bad_length_tweak_hex = rand::random::<[u8; 32]>().to_hex();
+    let bad_length_tweak_hex = rand::random::<[u8; 32]>().encode_hex::<String>();
     // rand::random only supports random byte arrays up to 32 bytes
     let good_length_tweak: [u8; 33] = core::array::from_fn(|_| rand::random::<u8>());
-    let good_length_tweak_hex = good_length_tweak.to_hex();
+    let good_length_tweak_hex = good_length_tweak.encode_hex::<String>();
     assert_eq!(
         tweak_parser(good_length_tweak_hex.as_str()).expect("should parse valid length hex"),
         good_length_tweak

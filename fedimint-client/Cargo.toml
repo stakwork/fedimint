@@ -1,6 +1,6 @@
 [package]
 name = "fedimint-client"
-version = "0.3.0-alpha"
+version = "0.4.0-alpha"
 authors = ["The Fedimint Developers"]
 edition = "2021"
 description = "fedimint-client provides a library for sending transactions to the federation."
@@ -20,34 +20,35 @@ name = "fedimint_client"
 path = "src/lib.rs"
 
 [dependencies]
-anyhow = "1.0.69"
-aquamarine = "0.3.1"
+anyhow = { workspace = true }
+aquamarine = "0.5.0"
 async-stream = "0.3.5"
-async-trait = "0.1.73"
+async-trait = { workspace = true }
 bitcoin = "0.29.2"
-bitcoin_hashes = "0.11.0"
-fedimint-core  = { version = "0.3.0-alpha", path = "../fedimint-core/" }
-fedimint-derive-secret = { version = "0.3.0-alpha", path = "../crypto/derive-secret" }
-fedimint-aead = { version = "0.3.0-alpha", path = "../crypto/aead" }
-fedimint-logging = { version = "0.3.0-alpha", path = "../fedimint-logging" }
-futures = "0.3.26"
-itertools = "0.10.5"
-rand = "0.8.5"
+bitcoin_hashes = { workspace = true }
+fedimint-core  = { version = "=0.4.0-alpha", path = "../fedimint-core/" }
+fedimint-derive-secret = { version = "=0.4.0-alpha", path = "../crypto/derive-secret" }
+fedimint-aead = { version = "=0.4.0-alpha", path = "../crypto/aead" }
+fedimint-logging = { version = "=0.4.0-alpha", path = "../fedimint-logging" }
+futures = { workspace = true }
+itertools = { workspace = true }
+rand = { workspace = true }
 secp256k1-zkp = "0.7.0"
-serde = "1.0.152"
-serde_json = "1.0.91"
-strum = "0.24.1"
-strum_macros = "0.24.1"
-thiserror = "1.0.39"
-tokio = { version = "1.26.0", features = [ "time", "macros" ] }
+serde = "1.0.197"
+serde_json = { workspace = true }
+strum = { workspace = true }
+strum_macros = { workspace = true }
+thiserror = { workspace = true }
+tokio = { version = "1.36.0", features = [ "time", "macros", "rt" ] }
 tokio-stream = { version = "0.1.14", features = [ "time", "sync" ] }
-tracing = "0.1.37"
+tracing = { workspace = true }
+reqwest = { version = "0.12.2", features = ["json", "rustls-tls"], default-features = false }
 
 [target.'cfg(target_family = "wasm")'.dependencies]
-ring = { version = "0.17.5", features = ["wasm32_unknown_unknown_js"] }
+ring = { version = "0.17.8", features = ["wasm32_unknown_unknown_js"] }
 
 [dev-dependencies]
 tracing-test = "0.2.4"
 
 [build-dependencies]
-fedimint-build = { version = "0.3.0-alpha", path = "../fedimint-build" }
+fedimint-build = { version = "=0.4.0-alpha", path = "../fedimint-build" }

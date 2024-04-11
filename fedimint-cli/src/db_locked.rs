@@ -2,6 +2,7 @@ use std::path::Path;
 
 use anyhow::Context;
 use fedimint_core::db::IRawDatabase;
+use fedimint_core::task::block_in_place;
 use fedimint_core::{apply, async_trait_maybe_send};
 use fedimint_logging::LOG_CLIENT;
 use tracing::{debug, info};
@@ -27,7 +28,7 @@ pub struct LockedBuilder {
 impl LockedBuilder {
     /// Create a [`Self`] by acquiring a lock file
     pub async fn new(lock_path: &Path) -> anyhow::Result<LockedBuilder> {
-        tokio::task::block_in_place(|| {
+        block_in_place(|| {
             let file = std::fs::OpenOptions::new()
                 .write(true)
                 .create(true)
@@ -35,11 +36,17 @@ impl LockedBuilder {
                 .open(lock_path)
                 .with_context(|| format!("Failed to open {}", lock_path.display()))?;
 
-            // TODO: Use https://github.com/cargo-bins/cargo-binstall/pull/1496 to
-            // give user feedback only when the initial `new_try_exclusive` failed.
-            info!(target: LOG_CLIENT, "Acquiring database lock");
-            let lock =
-                fs_lock::FileLock::new_exclusive(file).context("Failed to acquire a lock file")?;
+            debug!(target: LOG_CLIENT, "Acquiring database lock");
+
+            let lock = match fs_lock::FileLock::new_try_exclusive(file) {
+                Ok(lock) => lock,
+                Err((file, _)) => {
+                    info!(target: LOG_CLIENT, "Waiting for the database lock");
+
+                    fs_lock::FileLock::new_exclusive(file)
+                        .context("Failed to acquire a lock file")?
+                }
+            };
             debug!(target: LOG_CLIENT, "Acquired database lock");
 
             Ok(LockedBuilder { lock })

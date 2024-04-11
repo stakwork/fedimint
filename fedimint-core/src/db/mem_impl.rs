@@ -1,11 +1,10 @@
-use std::collections::BTreeMap;
-use std::fmt::Debug;
+use std::fmt::{self, Debug};
 
 use anyhow::Result;
-use bitcoin_hashes::hex::ToHex;
 use futures::{stream, StreamExt};
+use hex::ToHex;
+use imbl::OrdMap;
 use macro_rules_attribute::apply;
-use tokio::sync::Mutex;
 
 use super::{
     IDatabaseTransactionOps, IDatabaseTransactionOpsCore, IRawDatabase, IRawDatabaseTransaction,
@@ -32,19 +31,37 @@ pub enum DatabaseOperation {
     Delete(DatabaseDeleteOperation),
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct MemDatabase {
-    data: Mutex<BTreeMap<Vec<u8>, Vec<u8>>>,
+    data: tokio::sync::RwLock<OrdMap<Vec<u8>, Vec<u8>>>,
 }
 
-#[derive(Debug)]
+impl fmt::Debug for MemDatabase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_fmt(format_args!("MemDatabase {{}}",))
+    }
+}
 pub struct MemTransaction<'a> {
     operations: Vec<DatabaseOperation>,
-    tx_data: BTreeMap<Vec<u8>, Vec<u8>>,
+    tx_data: OrdMap<Vec<u8>, Vec<u8>>,
     db: &'a MemDatabase,
-    savepoint: BTreeMap<Vec<u8>, Vec<u8>>,
+    savepoint: OrdMap<Vec<u8>, Vec<u8>>,
     num_pending_operations: usize,
     num_savepoint_operations: usize,
+}
+
+impl<'a> fmt::Debug for MemTransaction<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_fmt(format_args!(
+            "MemTransaction {{ db={:?}, operations_len={}, tx_data_len={}, savepoint_len={}, num_pending_ops={}, num_savepoint_ops={} }}",
+            self.db,
+            self.operations.len(),
+            self.tx_data.len(),
+            self.savepoint.len(),
+            self.num_pending_operations,
+            self.num_savepoint_operations,
+        ))
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -56,10 +73,14 @@ impl MemDatabase {
     }
 
     pub async fn dump_db(&self) {
-        let data = self.data.lock().await;
+        let data = self.data.read().await;
         let data_iter = data.iter();
         for (key, value) in data_iter {
-            println!("{}: {}", key.to_hex(), value.to_hex());
+            println!(
+                "{}: {}",
+                key.encode_hex::<String>(),
+                value.encode_hex::<String>()
+            );
         }
     }
 }
@@ -68,7 +89,7 @@ impl MemDatabase {
 impl IRawDatabase for MemDatabase {
     type Transaction<'a> = MemTransaction<'a>;
     async fn begin_transaction<'a>(&'a self) -> MemTransaction<'a> {
-        let db_copy = self.data.lock().await.clone();
+        let db_copy = self.data.read().await.clone();
         let mut memtx = MemTransaction {
             operations: Vec::new(),
             tx_data: db_copy.clone(),
@@ -132,7 +153,7 @@ impl<'a> IDatabaseTransactionOpsCore for MemTransaction<'a> {
     async fn raw_find_by_prefix(&mut self, key_prefix: &[u8]) -> Result<PrefixStream<'_>> {
         let data = self
             .tx_data
-            .range::<Vec<u8>, _>((key_prefix.to_vec())..)
+            .range((key_prefix.to_vec())..)
             .take_while(|(key, _)| key.starts_with(key_prefix))
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect::<Vec<_>>();
@@ -145,7 +166,7 @@ impl<'a> IDatabaseTransactionOpsCore for MemTransaction<'a> {
     ) -> Result<PrefixStream<'_>> {
         let mut data = self
             .tx_data
-            .range::<Vec<u8>, _>((key_prefix.to_vec())..)
+            .range((key_prefix.to_vec())..)
             .take_while(|(key, _)| key.starts_with(key_prefix))
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect::<Vec<_>>();
@@ -179,7 +200,7 @@ impl<'a> IDatabaseTransactionOps for MemTransaction<'a> {
 #[apply(async_trait_maybe_send!)]
 impl<'a> IRawDatabaseTransaction for MemTransaction<'a> {
     async fn commit_tx(self) -> Result<()> {
-        let mut data = self.db.data.lock().await;
+        let mut data = self.db.data.write().await;
         let mut data_copy = data.clone();
         for op in self.operations {
             match op {

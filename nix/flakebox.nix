@@ -51,10 +51,10 @@ let
   filterWorkspaceDepsBuildFiles = src: filterSrcWithRegexes filterWorkspaceDepsBuildFilesRegex src;
 
   # Filter only files relevant to building the workspace
-  filterWorkspaceBuildFiles = src: filterSrcWithRegexes (filterWorkspaceDepsBuildFilesRegex ++ [ ".*\.rs" ".*\.html" ".*/proto/.*" "db/migrations/.*" "devimint/src/cfg/.*" ]) src;
+  filterWorkspaceBuildFiles = src: filterSrcWithRegexes (filterWorkspaceDepsBuildFilesRegex ++ [ ".*\.rs" ".*\.html" ".*/proto/.*" "db/migrations/.*" "devimint/src/cfg/.*" "docs/.*\.md" ]) src;
 
   # Like `filterWorkspaceFiles` but with `./scripts/` included
-  filterWorkspaceTestFiles = src: filterSrcWithRegexes (filterWorkspaceDepsBuildFilesRegex ++ [ ".*\.rs" ".*\.html" ".*/proto/.*" "db/migrations/.*" "devimint/src/cfg/.*" "scripts/.*" ]) src;
+  filterWorkspaceTestFiles = src: filterSrcWithRegexes (filterWorkspaceDepsBuildFilesRegex ++ [ ".*\.rs" ".*\.html" ".*/proto/.*" "db/migrations/.*" "devimint/src/cfg/.*" "scripts/.*" "docs/.*\.md" ]) src;
 
   filterWorkspaceAuditFiles = src: filterSrcWithRegexes (filterWorkspaceDepsBuildFilesRegex ++ [ "deny.toml" ]) src;
 
@@ -159,6 +159,7 @@ let
       cargo-nextest
       moreutils-ts
       parallel
+      time
     ] ++ builtins.attrValues {
       inherit (pkgs) cargo-nextest;
     };
@@ -183,8 +184,6 @@ let
   craneLib =
     (craneLib'.overrideArgs (commonEnvsBuild // commonArgs // {
       src = filterWorkspaceBuildFiles commonSrc;
-      pname = "fedimint";
-      version = "0.1.0";
     })).overrideArgs'' (craneLib: args:
       pkgs.lib.optionalAttrs (!(builtins.elem (craneLib.toolchainName or null) [ null "default" "stable" "nightly" ])) commonEnvsShellRocksdbLinkCross
     );
@@ -214,15 +213,32 @@ rec {
   workspaceDeps = craneLib.buildWorkspaceDepsOnly {
     buildPhaseCargoCommand = "cargoWithProfile doc --locked ; cargoWithProfile check --all-targets --locked ; cargoWithProfile build --locked --all-targets";
   };
+
+  # like `workspaceDeps` but don't run `cargo doc`
+  workspaceDepsNoDocs = craneLib.buildWorkspaceDepsOnly {
+    buildPhaseCargoCommand = "cargoWithProfile check --all-targets --locked ; cargoWithProfile build --locked --all-targets";
+  };
   workspaceBuild = craneLib.buildWorkspace {
     cargoArtifacts = workspaceDeps;
     buildPhaseCargoCommand = "cargoWithProfile doc --locked ; cargoWithProfile check --all-targets --locked ; cargoWithProfile build --locked --all-targets";
+  };
+
+  workspaceDepsWasmTest = craneLib.buildWorkspaceDepsOnly {
+    pname = "${commonArgs.pname}-wasm-test";
+    buildPhaseCargoCommand = "cargoWithProfile build --locked --tests -p fedimint-wasm-tests";
+  };
+
+  workspaceBuildWasmTest = craneLib.buildWorkspace {
+    pnameSuffix = "-workspace-wasm-test";
+    cargoArtifacts = workspaceDepsWasmTest;
+    buildPhaseCargoCommand = "cargoWithProfile build --locked --tests -p fedimint-wasm-tests";
   };
 
   workspaceTest = craneLib.cargoNextest {
     cargoArtifacts = workspaceBuild;
     cargoExtraArgs = "--workspace --all-targets --locked";
 
+    FM_DISCOVER_API_VERSION_TIMEOUT = "10";
     FM_CARGO_DENY_COMPILATION = "1";
   };
 
@@ -243,35 +259,30 @@ rec {
     doInstallCargoArtifacts = false;
   };
 
-  workspaceDoc = craneLib.mkCargoDerivation {
+  workspaceDoc = craneLibTests.mkCargoDerivation {
     pnameSuffix = "-workspace-docs";
     cargoArtifacts = workspaceDeps;
-    preConfigure = ''
-      export RUSTDOCFLAGS='-D rustdoc::broken_intra_doc_links -D warnings'
+    buildPhaseCargoCommand = ''
+      patchShebangs ./scripts
+      export FM_RUSTDOC_INDEX_MD=${../docs/rustdoc-index.md}
+      ./scripts/dev/build-docs.sh
     '';
-    buildPhaseCargoCommand = "cargo doc --workspace --no-deps --document-private-items";
     doInstallCargoArtifacts = false;
     postInstall = ''
-      cp -a target/doc/ $out
+      mkdir $out/share
+      cp -a target/doc $out/share/doc
     '';
     doCheck = false;
+    dontFixup = true;
+    dontStrip = true;
   };
 
-  # version of `workspaceDocs` with some nightly-only flags to publish
-  workspaceDocExport = craneLib.mkCargoDerivation {
-    # no need for inheriting any artifacts, as we are using it as a one-off, and only care
-    # about the docs
-    cargoArtifacts = null;
-    preConfigure = ''
-      export RUSTDOCFLAGS='-D rustdoc::broken_intra_doc_links -Z unstable-options --enable-index-page -D warnings'
-    '';
-    buildPhaseCargoCommand = "cargo doc --workspace --no-deps --document-private-items";
-    doInstallCargoArtifacts = false;
-    installPhase = ''
-      cp -a target/doc/ $out
-    '';
-    doCheck = false;
-  };
+  # version of `workspaceDocs` for public consumption (uploaded to https://docs.fedimint.org/)
+  workspaceDocExport = workspaceDoc.overrideAttrs (final: prev: {
+    # we actually don't want to have docs for dependencies in exported documentation
+    cargoArtifacts = workspaceDepsNoDocs;
+    nativeBuildInputs = prev.nativeBuildInputs or [ ] ++ [ pkgs.pandoc ];
+  });
 
   workspaceCargoUdepsDeps = craneLib.buildDepsOnly {
     pname = "${commonArgs.pname}-udeps-deps";
@@ -284,8 +295,6 @@ rec {
 
   workspaceCargoUdeps = craneLib.mkCargoDerivation {
     pname = "fedimint-udeps";
-    # no need for inheriting any artifacts, as we are using it as a one-off, and only care
-    # about the docs
     cargoArtifacts = workspaceCargoUdepsDeps;
     nativeBuildInputs = commonArgs.nativeBuildInputs ++ [ pkgs.cargo-udeps ];
     buildPhaseCargoCommand = "cargo udeps --workspace --all-targets --profile $CARGO_PROFILE";
@@ -312,14 +321,41 @@ rec {
     doCheck = false;
   };
 
-  workspaceCov = craneLib.buildPackage {
+  workspaceCov = craneLib.buildWorkspace {
     pname = "fedimint-workspace-lcov";
     cargoArtifacts = workspaceDepsCov;
-    buildPhaseCargoCommand = "source <(cargo llvm-cov show-env --export-prefix); cargo build --locked --workspace --all-targets --profile $CARGO_PROFILE; env RUST_BACKTRACE=1 RUST_LOG=info,timing=debug cargo nextest run --locked --workspace --all-targets --cargo-profile $CARGO_PROFILE --profile $CARGO_PROFILE --test-threads=$(($(nproc) * 2)); mkdir -p $out ; cargo llvm-cov report --profile $CARGO_PROFILE --lcov --output-path $out/lcov.info";
+    buildPhaseCargoCommand = "source <(cargo llvm-cov show-env --export-prefix); cargo build --locked --workspace --all-targets --profile $CARGO_PROFILE;";
+    nativeBuildInputs = [ pkgs.cargo-llvm-cov ];
+    doCheck = false;
+  };
+
+  workspaceTestCovBase = { times }: craneLib.buildPackage {
+    pname = "fedimint-workspace-lcov";
+    cargoArtifacts = workspaceCov;
+
+    FM_DISCOVER_API_VERSION_TIMEOUT = "10";
+
+    buildPhaseCargoCommand = (''
+      source <(cargo llvm-cov show-env --export-prefix)
+    '' +
+    lib.concatStringsSep "\n"
+      (
+        lib.replicate times ''
+          env RUST_BACKTRACE=1 RUST_LOG=info,timing=debug cargo nextest run --locked --workspace --all-targets --cargo-profile $CARGO_PROFILE --profile $CARGO_PROFILE --test-threads=$(($(nproc) * 2))
+        ''
+      ) + ''
+      mkdir -p $out
+      cargo llvm-cov report --profile $CARGO_PROFILE --lcov --output-path $out/lcov.info
+    ''
+    );
     installPhaseCommand = "true";
     nativeBuildInputs = [ pkgs.cargo-llvm-cov ];
     doCheck = false;
   };
+
+  workspaceTestCov = workspaceTestCovBase { times = 1; };
+  workspaceTest5TimesCov = workspaceTestCovBase { times = 5; };
+  workspaceTest10TimesCov = workspaceTestCovBase { times = 10; };
 
   reconnectTest = craneLibTests.mkCargoDerivation {
     pname = "${commonCliTestArgs.pname}-reconnect";
@@ -331,6 +367,12 @@ rec {
     pname = "${commonCliTestArgs.pname}-latency";
     cargoArtifacts = workspaceBuild;
     buildPhaseCargoCommand = "patchShebangs ./scripts ; ./scripts/tests/latency-test.sh";
+  };
+
+  guardianBackupTest = craneLibTests.mkCargoDerivation {
+    pname = "${commonCliTestArgs.pname}-guardian-backp";
+    cargoArtifacts = workspaceBuild;
+    buildPhaseCargoCommand = "patchShebangs ./scripts ; ./scripts/tests/guardian-backup.sh";
   };
 
   devimintCliTest = craneLibTests.mkCargoDerivation {
@@ -357,23 +399,43 @@ rec {
     buildPhaseCargoCommand = "patchShebangs ./scripts ; ./scripts/test/backend-test.sh";
   };
 
-  ciTestAll = craneLibTests.mkCargoDerivation {
+  ciTestAllBase = { times }: craneLibTests.mkCargoDerivation {
     pname = "${commonCliTestArgs.pname}-all";
-    cargoArtifacts = workspaceBuild;
+    cargoArtifacts = craneMultiBuild.default.${craneLib.cargoProfile or "release"}.workspaceBuild;
+
+    FM_DISCOVER_API_VERSION_TIMEOUT = "10";
 
     # One normal run, then if succeeded, modify the "always success test" to fail,
     # and make sure we detect it (happened too many times that we didn't).
     # Thanks to early termination, this should be all very quick, as we actually
     # won't start other tests.
     buildPhaseCargoCommand = ''
+      # when running on a wasm32-unknown toolchain...
+      if [ "$CARGO_BUILD_TARGET" == "wasm32-unknown-unknown" ]; then
+        # import pre-built wasm32-unknown wasm test artifacts
+        # notably, they are extracted to target's sub-directory, where wasm-test.sh expects them
+        inheritCargoArtifacts ${craneMultiBuild.wasm32-unknown.${craneLib.cargoProfile or "release"}.workspaceBuildWasmTest} "target/pkgs/fedimint-wasm-tests"
+      fi
+      # default to building for native; running test for cross-compilation targets
+      # here doesn't make any sense, and `wasm32-unknown-unknown` toolchain is used
+      # mostly to opt-in into wasm tests
+      unset CARGO_BUILD_TARGET
+
       patchShebangs ./scripts
       export FM_CARGO_DENY_COMPILATION=1
+      export FM_TEST_CI_ALL_TIMES=${builtins.toString times}
+      export FM_TEST_CI_ALL_DISABLE_ETA=1
       ./scripts/tests/test-ci-all.sh || exit 1
+      cp scripts/tests/always-success-test.sh scripts/tests/always-success-test.sh.bck
       sed -i -e 's/exit 0/exit 1/g' scripts/tests/always-success-test.sh
       echo "Verifying failure detection..."
       ./scripts/tests/test-ci-all.sh 1>/dev/null 2>/dev/null && exit 1
+      cp -f scripts/tests/always-success-test.sh.bck scripts/tests/always-success-test.sh
     '';
   };
+
+  ciTestAll = ciTestAllBase { times = 1; };
+  ciTestAll5Times = ciTestAllBase { times = 5; };
 
   alwaysFailTest = craneLibTests.mkCargoDerivation {
     pname = "${commonCliTestArgs.pname}-always-fail";
@@ -385,9 +447,11 @@ rec {
   wasmTest = craneLibTests.mkCargoDerivation {
     pname = "wasm-test";
     # TODO: https://github.com/ipetkov/crane/issues/416
-    cargoArtifacts = craneMultiBuild.${craneLib.cargoProfile or "release"}.workspaceBuild;
+    cargoArtifacts = craneMultiBuild.default.${craneLib.cargoProfile or "release"}.workspaceBuild;
     nativeBuildInputs = commonCliTestArgs.nativeBuildInputs ++ [ pkgs.firefox pkgs.wasm-bindgen-cli pkgs.geckodriver pkgs.wasm-pack ];
-    buildPhaseCargoCommand = "patchShebangs ./scripts; SKIP_CARGO_BUILD=1 ./scripts/tests/wasm-test.sh";
+    buildPhaseCargoCommand = ''
+      inheritCargoArtifacts ${craneMultiBuild.wasm32-unknown.${craneLib.cargoProfile or "release"}.workspaceBuildWasmTest} "target/pkgs/fedimint-wasm-tests"
+      patchShebangs ./scripts; SKIP_CARGO_BUILD=1 ./scripts/tests/wasm-test.sh'';
   };
 
   fedimint-pkgs = fedimintBuildPackageGroup {
@@ -455,6 +519,12 @@ rec {
     {
       pkg = gateway-pkgs;
       bin = "gateway-cli";
+    };
+
+  gateway-cln-extension = flakeboxLib.pickBinary
+    {
+      pkg = gateway-pkgs;
+      bin = "gateway-cln-extension";
     };
 
   container =

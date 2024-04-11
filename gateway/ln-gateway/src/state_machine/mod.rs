@@ -1,6 +1,7 @@
-pub mod complete;
+mod complete;
 pub mod pay;
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,30 +18,29 @@ use fedimint_client::sm::{Context, DynState, ModuleNotifier, State};
 use fedimint_client::transaction::{ClientOutput, TransactionBuilder};
 use fedimint_client::{sm_enum_variant_translation, AddStateMachinesError, DynGlobalClientContext};
 use fedimint_core::api::DynModuleApi;
-use fedimint_core::config::FederationId;
 use fedimint_core::core::{Decoder, IntoDynInstance, ModuleInstanceId, OperationId};
 use fedimint_core::db::{AutocommitError, DatabaseTransaction, DatabaseVersion};
 use fedimint_core::encoding::{Decodable, Encodable};
 use fedimint_core::module::{ApiVersion, ModuleInit, MultiApiVersion, TransactionItemAmount};
 use fedimint_core::{apply, async_trait_maybe_send, Amount, OutPoint, TransactionId};
+use fedimint_ln_client::api::LnFederationApi;
 use fedimint_ln_client::incoming::{
     FundingOfferState, IncomingSmCommon, IncomingSmError, IncomingSmStates, IncomingStateMachine,
 };
 use fedimint_ln_client::pay::{PayInvoicePayload, PaymentData};
 use fedimint_ln_client::{create_incoming_contract_output, LightningClientInit};
-use fedimint_ln_common::api::LnFederationApi;
 use fedimint_ln_common::config::LightningClientConfig;
 use fedimint_ln_common::contracts::{ContractId, Preimage};
 use fedimint_ln_common::route_hints::RouteHint;
 use fedimint_ln_common::{
-    LightningClientContext, LightningCommonInit, LightningGateway, LightningGatewayAnnouncement,
-    LightningModuleTypes, LightningOutput, LightningOutputV0, KIND,
+    create_gateway_remove_message, LightningClientContext, LightningCommonInit, LightningGateway,
+    LightningGatewayAnnouncement, LightningModuleTypes, LightningOutput, LightningOutputV0,
+    RemoveGatewayRequest, KIND,
 };
 use futures::StreamExt;
 use lightning_invoice::RoutingFees;
 use secp256k1::{KeyPair, Secp256k1};
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
 use tracing::{debug, info, warn};
 
 use self::complete::GatewayCompleteStateMachine;
@@ -53,9 +53,6 @@ use crate::state_machine::complete::{
     GatewayCompleteCommon, GatewayCompleteStates, WaitForPreimageState,
 };
 use crate::{Gateway, LightningContext};
-
-pub const GW_ANNOUNCEMENT_TTL: Duration = Duration::from_secs(600);
-pub const INITIAL_REGISTER_BACKOFF_DURATION: Duration = Duration::from_secs(15);
 
 /// The high-level state of a reissue operation started with
 /// [`GatewayClientModule::gateway_pay_bolt11_invoice`].
@@ -113,9 +110,9 @@ pub struct GatewayClientInit {
     pub gateway: Gateway,
 }
 
-#[apply(async_trait_maybe_send!)]
 impl ModuleInit for GatewayClientInit {
     type Common = LightningCommonInit;
+    const DATABASE_VERSION: DatabaseVersion = DatabaseVersion(0);
 
     async fn dump_database(
         &self,
@@ -129,7 +126,6 @@ impl ModuleInit for GatewayClientInit {
 #[apply(async_trait_maybe_send!)]
 impl ClientModuleInit for GatewayClientInit {
     type Module = GatewayClientModule;
-    const DATABASE_VERSION: DatabaseVersion = DatabaseVersion(0);
 
     fn supported_api_versions(&self) -> MultiApiVersion {
         MultiApiVersion::try_from_iter([ApiVersion { major: 0, minor: 0 }])
@@ -155,11 +151,11 @@ impl ClientModuleInit for GatewayClientInit {
 
 #[derive(Debug, Clone)]
 pub struct GatewayClientContext {
-    redeem_key: bitcoin::KeyPair,
+    redeem_key: bitcoin29::KeyPair,
     timelock_delta: u64,
     secp: secp256k1_zkp::Secp256k1<secp256k1_zkp::All>,
     pub ln_decoder: Decoder,
-    notifier: ModuleNotifier<DynGlobalClientContext, GatewayClientStateMachines>,
+    notifier: ModuleNotifier<GatewayClientStateMachines>,
     gateway: Gateway,
 }
 
@@ -181,7 +177,7 @@ impl From<&GatewayClientContext> for LightningClientContext {
 #[derive(Debug)]
 pub struct GatewayClientModule {
     cfg: LightningClientConfig,
-    pub notifier: ModuleNotifier<DynGlobalClientContext, GatewayClientStateMachines>,
+    pub notifier: ModuleNotifier<GatewayClientStateMachines>,
     pub redeem_key: KeyPair,
     timelock_delta: u64,
     mint_channel_id: u64,
@@ -243,7 +239,7 @@ impl ClientModule for GatewayClientModule {
 }
 
 impl GatewayClientModule {
-    pub fn to_gateway_registration_info(
+    fn to_gateway_registration_info(
         &self,
         route_hints: Vec<RouteHint>,
         ttl: Duration,
@@ -256,7 +252,7 @@ impl GatewayClientModule {
                 gateway_redeem_key: self.redeem_key.public_key(),
                 node_pub_key: lightning_context.lightning_public_key,
                 lightning_alias: lightning_context.lightning_alias,
-                api: self.gateway.gateway_parameters.versioned_api.clone(),
+                api: self.gateway.versioned_api.clone(),
                 route_hints,
                 fees,
                 gateway_id: self.gateway.gateway_id,
@@ -265,19 +261,6 @@ impl GatewayClientModule {
             ttl,
             vetted: false,
         }
-    }
-
-    async fn register_with_federation_inner(
-        &self,
-        id: FederationId,
-        registration: LightningGatewayAnnouncement,
-    ) -> anyhow::Result<()> {
-        self.module_api.register_gateway(&registration).await?;
-        debug!(
-            "Successfully registered gateway {} with federation {id}",
-            registration.info.gateway_id
-        );
-        Ok(())
     }
 
     async fn create_funding_incoming_contract_output_from_htlc(
@@ -369,19 +352,69 @@ impl GatewayClientModule {
         fees: RoutingFees,
         lightning_context: LightningContext,
     ) -> anyhow::Result<()> {
-        {
-            let registration_info = self.to_gateway_registration_info(
-                route_hints,
-                time_to_live,
-                fees,
-                lightning_context,
-            );
+        let registration_info =
+            self.to_gateway_registration_info(route_hints, time_to_live, fees, lightning_context);
+        let gateway_id = registration_info.info.gateway_id;
 
-            let federation_id = self.client_ctx.get_config().global.federation_id();
-            self.register_with_federation_inner(federation_id, registration_info)
-                .await?;
-            Ok(())
+        let federation_id = self
+            .client_ctx
+            .get_config()
+            .global
+            .calculate_federation_id();
+        self.module_api.register_gateway(&registration_info).await?;
+        debug!("Successfully registered gateway {gateway_id} with federation {federation_id}");
+        Ok(())
+    }
+
+    /// Attempts to remove a gateway's registration from the federation. Since
+    /// removing gateway registrations is best effort, this does not return
+    /// an error and simply emits a warning when the registration cannot be
+    /// removed.
+    pub async fn remove_from_federation(&self, gateway_keypair: KeyPair) {
+        // Removing gateway registrations is best effort, so just emit a warning if it
+        // fails
+        if let Err(e) = self.remove_from_federation_inner(gateway_keypair).await {
+            let gateway_id = gateway_keypair.public_key();
+            let federation_id = self
+                .client_ctx
+                .get_config()
+                .global
+                .calculate_federation_id();
+            warn!("Failed to remove gateway {gateway_id} from federation {federation_id}: {e:?}");
         }
+    }
+
+    /// Retrieves the signing challenge from each federation peer. Since each
+    /// peer maintains their own list of registered gateways, the gateway
+    /// needs to provide a signature that is signed by the private key of the
+    /// gateway id to remove the registration.
+    async fn remove_from_federation_inner(&self, gateway_keypair: KeyPair) -> anyhow::Result<()> {
+        let gateway_id = gateway_keypair.public_key();
+        let challenges = self
+            .module_api
+            .get_remove_gateway_challenge(gateway_id)
+            .await?;
+
+        let fed_public_key = self.cfg.threshold_pub_key;
+        let signatures = challenges
+            .into_iter()
+            .filter_map(|(peer_id, challenge)| {
+                let msg = create_gateway_remove_message(fed_public_key, peer_id, challenge?);
+                let signature = gateway_keypair.sign_schnorr(msg);
+                Some((peer_id, signature))
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        let remove_gateway_request = RemoveGatewayRequest {
+            gateway_id,
+            signatures,
+        };
+
+        self.module_api
+            .remove_gateway(remove_gateway_request)
+            .await?;
+
+        Ok(())
     }
 
     /// Attempt fulfill HTLC by buying preimage from the federation
@@ -623,8 +656,7 @@ impl GatewayClientModule {
     }
 }
 
-#[allow(clippy::large_enum_variant)]
-#[derive(Debug, Clone, Eq, PartialEq, Decodable, Encodable)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Decodable, Encodable)]
 pub enum GatewayClientStateMachines {
     Pay(GatewayPayStateMachine),
     Receive(IncomingStateMachine),
@@ -632,7 +664,7 @@ pub enum GatewayClientStateMachines {
 }
 
 impl IntoDynInstance for GatewayClientStateMachines {
-    type DynType = DynState<DynGlobalClientContext>;
+    type DynType = DynState;
 
     fn into_dyn(self, instance_id: ModuleInstanceId) -> Self::DynType {
         DynState::from_typed(instance_id, self)
@@ -641,12 +673,11 @@ impl IntoDynInstance for GatewayClientStateMachines {
 
 impl State for GatewayClientStateMachines {
     type ModuleContext = GatewayClientContext;
-    type GlobalContext = DynGlobalClientContext;
 
     fn transitions(
         &self,
         context: &Self::ModuleContext,
-        global_context: &Self::GlobalContext,
+        global_context: &DynGlobalClientContext,
     ) -> Vec<fedimint_client::sm::StateTransition<Self>> {
         match self {
             GatewayClientStateMachines::Pay(pay_state) => {
@@ -679,11 +710,6 @@ impl State for GatewayClientStateMachines {
     }
 }
 
-#[derive(Error, Debug, Serialize, Deserialize, Encodable, Decodable, Clone, Eq, PartialEq)]
-pub enum ReceiveError {
-    #[error("Route htlc error")]
-    RouteHtlcError,
-}
 #[derive(Debug, Clone, Eq, PartialEq, Decodable, Encodable)]
 pub struct Htlc {
     /// The HTLC payment hash.
@@ -719,7 +745,7 @@ impl TryFrom<InterceptHtlcRequest> for Htlc {
 }
 
 #[derive(Debug, Clone)]
-pub struct SwapParameters {
+struct SwapParameters {
     payment_hash: sha256::Hash,
     amount_msat: Amount,
 }

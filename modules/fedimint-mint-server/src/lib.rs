@@ -1,5 +1,7 @@
+pub mod db;
+mod metrics;
+
 use std::collections::{BTreeMap, HashMap};
-use std::iter::FromIterator;
 
 use anyhow::bail;
 use fedimint_core::config::{
@@ -11,25 +13,19 @@ use fedimint_core::db::{DatabaseTransaction, DatabaseVersion, IDatabaseTransacti
 use fedimint_core::endpoint_constants::{BACKUP_ENDPOINT, RECOVER_ENDPOINT};
 use fedimint_core::module::audit::Audit;
 use fedimint_core::module::{
-    api_endpoint, ApiEndpoint, ApiError, CoreConsensusVersion, InputMeta, ModuleConsensusVersion,
-    ModuleInit, PeerHandle, ServerModuleInit, ServerModuleInitArgs, SupportedModuleApiVersions,
-    TransactionItemAmount,
+    api_endpoint, ApiEndpoint, ApiError, ApiVersion, CoreConsensusVersion, InputMeta,
+    ModuleConsensusVersion, ModuleInit, PeerHandle, ServerModuleInit, ServerModuleInitArgs,
+    SupportedModuleApiVersions, TransactionItemAmount,
 };
 use fedimint_core::server::DynServerModule;
 use fedimint_core::{
-    apply, async_trait_maybe_send, push_db_key_items, push_db_pair_items, Amount, NumPeers,
+    apply, async_trait_maybe_send, push_db_key_items, push_db_pair_items, Amount, NumPeersExt,
     OutPoint, PeerId, ServerModule, Tiered, TieredMultiZip,
 };
-use fedimint_metrics::{histogram_opts, lazy_static, prometheus, register_histogram, Histogram};
 pub use fedimint_mint_common as common;
 use fedimint_mint_common::config::{
-    FeeConsensus, MintClientConfig, MintConfig, MintConfigConsensus, MintConfigLocal,
-    MintConfigPrivate, MintGenParams,
-};
-use fedimint_mint_common::db::{
-    DbKeyPrefix, ECashUserBackupSnapshot, EcashBackupKey, EcashBackupKeyPrefix, MintAuditItemKey,
-    MintAuditItemKeyPrefix, MintOutputOutcomeKey, MintOutputOutcomePrefix, NonceKey,
-    NonceKeyPrefix,
+    MintClientConfig, MintConfig, MintConfigConsensus, MintConfigLocal, MintConfigPrivate,
+    MintGenParams,
 };
 pub use fedimint_mint_common::{BackupRequest, SignedBackupRequest};
 use fedimint_mint_common::{
@@ -39,6 +35,10 @@ use fedimint_mint_common::{
 use fedimint_server::config::distributedgen::{evaluate_polynomial_g2, scalar, PeerHandleOps};
 use futures::StreamExt;
 use itertools::Itertools;
+use metrics::{
+    MINT_INOUT_FEES_SATS, MINT_INOUT_SATS, MINT_ISSUED_ECASH_FEES_SATS, MINT_ISSUED_ECASH_SATS,
+    MINT_REDEEMED_ECASH_FEES_SATS, MINT_REDEEMED_ECASH_SATS,
+};
 use rand::rngs::OsRng;
 use secp256k1_zkp::SECP256K1;
 use strum::IntoEnumIterator;
@@ -51,58 +51,18 @@ use threshold_crypto::group::Curve;
 use threshold_crypto::{G2Projective, Scalar};
 use tracing::{debug, info};
 
-lazy_static! {
-    static ref AMOUNTS_BUCKETS_SATS: Vec<f64> = vec![
-        0.0,
-        0.1,
-        1.0,
-        10.0,
-        100.0,
-        1000.0,
-        10000.0,
-        100000.0,
-        1000000.0,
-        10000000.0,
-        100000000.0
-    ];
-    static ref MINT_REDEEMED_ECASH_SATS: Histogram = register_histogram!(histogram_opts!(
-        "mint_redeemed_ecash_sats",
-        "Value of redeemed e-cash notes in sats",
-        AMOUNTS_BUCKETS_SATS.clone()
-    ))
-    .unwrap();
-    static ref MINT_REDEEMED_ECASH_FEES_SATS: Histogram = register_histogram!(histogram_opts!(
-        "mint_redeemed_ecash_fees_sats",
-        "Value of e-cash fees during reissue in sats",
-        AMOUNTS_BUCKETS_SATS.clone()
-    ))
-    .unwrap();
-    static ref MINT_ISSUED_ECASH_SATS: Histogram = register_histogram!(histogram_opts!(
-        "mint_issued_ecash_sats",
-        "Value of issued e-cash notes in sats",
-        AMOUNTS_BUCKETS_SATS.clone()
-    ))
-    .unwrap();
-    static ref MINT_ISSUED_ECASH_FEES_SATS: Histogram = register_histogram!(histogram_opts!(
-        "mint_issued_ecash_fees_sats",
-        "Value of e-cash fees during issue in sats",
-        AMOUNTS_BUCKETS_SATS.clone()
-    ))
-    .unwrap();
-    static ref ALL_METRICS: [Box<dyn prometheus::core::Collector>; 4] = [
-        Box::new(MINT_REDEEMED_ECASH_SATS.clone()),
-        Box::new(MINT_REDEEMED_ECASH_FEES_SATS.clone()),
-        Box::new(MINT_ISSUED_ECASH_SATS.clone()),
-        Box::new(MINT_ISSUED_ECASH_FEES_SATS.clone()),
-    ];
-}
+use crate::db::{
+    DbKeyPrefix, ECashUserBackupSnapshot, EcashBackupKey, EcashBackupKeyPrefix, MintAuditItemKey,
+    MintAuditItemKeyPrefix, MintOutputOutcomeKey, MintOutputOutcomePrefix, NonceKey,
+    NonceKeyPrefix,
+};
 
 #[derive(Debug, Clone)]
 pub struct MintInit;
 
-#[apply(async_trait_maybe_send!)]
 impl ModuleInit for MintInit {
     type Common = MintCommonInit;
+    const DATABASE_VERSION: DatabaseVersion = DatabaseVersion(0);
 
     async fn dump_database(
         &self,
@@ -158,7 +118,6 @@ impl ModuleInit for MintInit {
 #[apply(async_trait_maybe_send!)]
 impl ServerModuleInit for MintInit {
     type Params = MintGenParams;
-    const DATABASE_VERSION: DatabaseVersion = DatabaseVersion(0);
 
     fn versions(&self, _core: CoreConsensusVersion) -> &[ModuleConsensusVersion] {
         const MODULE_CONSENSUS_VERSION: ModuleConsensusVersion = ModuleConsensusVersion::new(0, 0);
@@ -170,10 +129,6 @@ impl ServerModuleInit for MintInit {
     }
 
     async fn init(&self, args: &ServerModuleInitArgs<Self>) -> anyhow::Result<DynServerModule> {
-        // Ensure all metrics are initialized
-        for metric in ALL_METRICS.iter() {
-            metric.collect();
-        }
         Ok(Mint::new(args.cfg().to_typed()?).into())
     }
 
@@ -214,7 +169,7 @@ impl ServerModuleInit for MintInit {
                                 (key_peer, keys)
                             })
                             .collect(),
-                        fee_consensus: FeeConsensus::default(),
+                        fee_consensus: params.consensus.fee_consensus(),
                         max_notes_per_denomination: DEFAULT_MAX_NOTES_PER_DENOMINATION,
                     },
                     private: MintConfigPrivate {
@@ -278,7 +233,7 @@ impl ServerModuleInit for MintInit {
                         (*peer, pks)
                     })
                     .collect(),
-                fee_consensus: Default::default(),
+                fee_consensus: params.consensus.fee_consensus(),
                 max_notes_per_denomination: DEFAULT_MAX_NOTES_PER_DENOMINATION,
             },
         };
@@ -528,6 +483,7 @@ impl ServerModule for Mint {
         vec![
             api_endpoint! {
                 BACKUP_ENDPOINT,
+                ApiVersion::new(0, 0),
                 async |module: &Mint, context, request: SignedBackupRequest| -> () {
                     module
                         .handle_backup_request(&mut context.dbtx().into_nc(), request).await?;
@@ -536,6 +492,7 @@ impl ServerModule for Mint {
             },
             api_endpoint! {
                 RECOVER_ENDPOINT,
+                ApiVersion::new(0, 0),
                 async |module: &Mint, context, id: secp256k1_zkp::PublicKey| -> Option<ECashUserBackupSnapshot> {
                     Ok(module
                         .handle_recover_request(&mut context.dbtx().into_nc(), id).await)
@@ -591,6 +548,12 @@ fn calculate_mint_issued_ecash_metrics(
     fee: Amount,
 ) {
     dbtx.on_commit(move || {
+        MINT_INOUT_SATS
+            .with_label_values(&["outgoing"])
+            .observe(amount.sats_f64());
+        MINT_INOUT_FEES_SATS
+            .with_label_values(&["outgoing"])
+            .observe(fee.sats_f64());
         MINT_ISSUED_ECASH_SATS.observe(amount.sats_f64());
         MINT_ISSUED_ECASH_FEES_SATS.observe(fee.sats_f64());
     });
@@ -602,6 +565,12 @@ fn calculate_mint_redeemed_ecash_metrics(
     fee: Amount,
 ) {
     dbtx.on_commit(move || {
+        MINT_INOUT_SATS
+            .with_label_values(&["incoming"])
+            .observe(amount.sats_f64());
+        MINT_INOUT_FEES_SATS
+            .with_label_values(&["incoming"])
+            .observe(fee.sats_f64());
         MINT_REDEEMED_ECASH_SATS.observe(amount.sats_f64());
         MINT_REDEEMED_ECASH_FEES_SATS.observe(fee.sats_f64());
     });
@@ -626,7 +595,12 @@ impl Mint {
             .values()
             .all(|pk| pk.structural_eq(&cfg.private.tbs_sks)));
 
-        let ref_pub_key = cfg.private.tbs_sks.to_public();
+        let ref_pub_key = Tiered::from_iter(
+            cfg.private
+                .tbs_sks
+                .iter()
+                .map(|(amt, key)| (amt, key.to_pub_key_share())),
+        );
 
         // Find our key index and make sure we know the private key for all our public
         // key shares
@@ -704,7 +678,7 @@ mod test {
             &peers,
             &ConfigGenModuleParams::from_typed(MintGenParams {
                 local: Default::default(),
-                consensus: MintGenParamsConsensus::new(2),
+                consensus: MintGenParamsConsensus::new(2, FeeConsensus::default()),
             })
             .unwrap(),
         );
@@ -781,18 +755,21 @@ mod test {
     #[test_log::test(tokio::test)]
     async fn test_detect_double_spends() {
         let (mint_server_cfg, _) = build_configs();
-        // TODO - Extract this from the config so we don't assume we're using base-2
-        // denominations
-        let even_denomination_amount = Amount::from_msats(1024);
-
         let mint = Mint::new(mint_server_cfg[0].to_typed().unwrap());
-        let (_, note) = issue_note(&mint_server_cfg, even_denomination_amount);
+        let (_, tiered) = mint
+            .cfg
+            .consensus
+            .peer_tbs_pks
+            .first_key_value()
+            .expect("mint has peers");
+        let highest_denomination = *tiered.max_tier();
+        let (_, note) = issue_note(&mint_server_cfg, highest_denomination);
 
         // Normal spend works
         let db = Database::new(MemDatabase::new(), Default::default());
-        let input = MintInput::new_v0(even_denomination_amount, note);
+        let input = MintInput::new_v0(highest_denomination, note);
 
-        // Double spend in same epoch is detected
+        // Double spend in same session is detected
         let mut dbtx = db.begin_transaction().await;
         mint.process_input(&mut dbtx.to_ref_with_prefix_module_id(42).into_nc(), &input)
             .await

@@ -1,6 +1,6 @@
 [package]
 name = "fedimint-wallet-client"
-version = "0.3.0-alpha"
+version = "0.4.0-alpha"
 authors = ["The Fedimint Developers"]
 edition = "2021"
 description = "fedimint-wallet is a n on-chain bitcoin wallet module. It uses a key-value store and is not a standard HD wallet."
@@ -16,30 +16,35 @@ name = "fedimint_wallet_client"
 path = "src/lib.rs"
 
 [dependencies]
-anyhow = "1.0.66"
-aquamarine = "0.3.1"
+anyhow = { workspace = true }
+aquamarine = "0.5.0"
 async-stream = "0.3.5"
-async-trait = "0.1.73"
+async-trait = { workspace = true }
 bitcoin = { version = "0.29.2", features = [ "rand", "serde"] }
-erased-serde = "0.3"
-fedimint-bitcoind = { version = "0.3.0-alpha", path = "../../fedimint-bitcoind", default-features = false, features = ["esplora-client", "bitcoincore-rpc"] }
-fedimint-client = { version = "0.3.0-alpha", path = "../../fedimint-client" }
-fedimint-core = { version = "0.3.0-alpha", path = "../../fedimint-core" }
-fedimint-wallet-common = { version = "0.3.0-alpha", path = "../fedimint-wallet-common" }
-futures = "0.3"
-miniscript = { version = "9.0.2", features = [ "compiler", "serde" ] }
-impl-tools = "0.8.0"
-rand = "0.8"
-secp256k1 = { version = "0.24.2", features = [ "serde" ] }
-serde = { version = "1.0.149", features = [ "derive" ] }
-serde_json = "1.0.108"
-strum = "0.24"
-strum_macros = "0.24"
-thiserror = "1.0.39"
-tokio = { version = "1.26.0", features = ["sync", "rt"] }
-tracing ="0.1.37"
-url = "2.3.1"
-validator = { version = "0.16", features = ["derive"] }
+erased-serde = { workspace = true }
+fedimint-client = { version = "=0.4.0-alpha", path = "../../fedimint-client" }
+fedimint-core = { version = "=0.4.0-alpha", path = "../../fedimint-core" }
+fedimint-wallet-common = { version = "=0.4.0-alpha", path = "../fedimint-wallet-common" }
+futures = { workspace = true }
+miniscript = { version = "10.0.0", features = [ "compiler", "serde" ] }
+impl-tools = "0.10.0"
+rand = { workspace = true }
+secp256k1 = { version = "0.24.3", features = [ "serde" ] }
+serde = { version = "1.0.197", features = [ "derive" ] }
+serde_json = { workspace = true }
+strum = { workspace = true }
+strum_macros = { workspace = true }
+thiserror = { workspace = true }
+tokio = { version = "1.36.0", features = ["sync", "rt"] }
+tracing = { workspace = true }
+url = { workspace = true }
+validator = { version = "0.17", features = ["derive"] }
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+fedimint-bitcoind = { version = "=0.4.0-alpha", path = "../../fedimint-bitcoind", default-features = false, features = ["esplora-client", "bitcoincore-rpc"] }
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+fedimint-bitcoind = { version = "=0.4.0-alpha", path = "../../fedimint-bitcoind", default-features = false, features = ["esplora-client"] }
 
 [dev-dependencies]
-tracing-subscriber = { version = "0.3.16", features = [ "env-filter" ] }
+tracing-subscriber = { version = "0.3.18", features = [ "env-filter" ] }

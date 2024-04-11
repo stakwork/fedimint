@@ -1,18 +1,15 @@
+use std::collections::BTreeMap;
 use std::fmt::Debug;
 
 use fedimint_core::core::ModuleInstanceId;
-use fedimint_core::db::{
-    DatabaseTransaction, DatabaseVersion, IDatabaseTransactionOpsCoreTyped, MigrationMap,
-    MODULE_GLOBAL_PREFIX,
-};
+use fedimint_core::db::{DatabaseVersion, ServerMigrationFn, MODULE_GLOBAL_PREFIX};
 use fedimint_core::encoding::{Decodable, Encodable};
 use fedimint_core::session_outcome::{AcceptedItem, SignedSessionOutcome};
 use fedimint_core::{impl_db_lookup, impl_db_record, TransactionId};
-use futures::FutureExt;
 use serde::Serialize;
 use strum_macros::EnumIter;
 
-pub const GLOBAL_DATABASE_VERSION: DatabaseVersion = DatabaseVersion(1);
+pub const GLOBAL_DATABASE_VERSION: DatabaseVersion = DatabaseVersion(0);
 
 #[repr(u8)]
 #[derive(Clone, EnumIter, Debug)]
@@ -21,7 +18,6 @@ pub enum DbKeyPrefix {
     AcceptedTransaction = 0x02,
     SignedSessionOutcome = 0x04,
     AlephUnits = 0x05,
-    SignedSessionOutcomeCount = 0x06,
     Module = MODULE_GLOBAL_PREFIX,
 }
 
@@ -79,17 +75,6 @@ impl_db_lookup!(
     query_prefix = SignedSessionOutcomePrefix
 );
 
-/// Database entry that caches the current number of [`SignedSessionOutcome`]s
-/// in the database.
-#[derive(Debug, Encodable, Decodable)]
-pub struct SignedSessionOutcomeCountKey;
-
-impl_db_record!(
-    key = SignedSessionOutcomeCountKey,
-    value = u64,
-    db_prefix = DbKeyPrefix::SignedSessionOutcomeCount,
-);
-
 #[derive(Debug, Encodable, Decodable)]
 pub struct AlephUnitsKey(pub u64);
 
@@ -104,26 +89,8 @@ impl_db_record!(
 );
 impl_db_lookup!(key = AlephUnitsKey, query_prefix = AlephUnitsPrefix);
 
-pub fn get_global_database_migrations() -> MigrationMap {
-    let mut mm = MigrationMap::new();
-    mm.insert(DatabaseVersion(0), |dbtx| migrate_to_v1(dbtx).boxed());
-    mm
-}
-
-/// Adds a database key that contains the current session count so that we don't
-/// have to scan the entire session history every time just to count the
-/// entries.
-async fn migrate_to_v1(dbtx: &mut DatabaseTransaction<'_>) -> Result<(), anyhow::Error> {
-    use futures::StreamExt;
-
-    let session_count = dbtx
-        .find_by_prefix(&SignedSessionOutcomePrefix)
-        .await
-        .count()
-        .await as u64;
-    dbtx.insert_new_entry(&SignedSessionOutcomeCountKey, &session_count)
-        .await;
-    Ok(())
+pub fn get_global_database_migrations() -> BTreeMap<DatabaseVersion, ServerMigrationFn> {
+    BTreeMap::new()
 }
 
 #[cfg(test)]
@@ -131,13 +98,17 @@ mod fedimint_migration_tests {
     use std::collections::BTreeMap;
     use std::str::FromStr;
 
-    use anyhow::{ensure, Context};
-    use bitcoin::{secp256k1, KeyPair};
+    use anyhow::ensure;
+    use bitcoin::key::KeyPair;
+    use bitcoin::secp256k1;
     use bitcoin_hashes::Hash;
+    use fedimint_core::bitcoin_migration::{
+        bitcoin29_to_bitcoin30_message, bitcoin29_to_bitcoin30_secp256k1_secret_key,
+        bitcoin30_to_bitcoin29_schnorr_signature, bitcoin30_to_bitcoin29_secp256k1_public_key,
+    };
     use fedimint_core::core::{DynInput, DynOutput};
     use fedimint_core::db::{
-        apply_migrations, DatabaseTransaction, DatabaseVersion, DatabaseVersionKey,
-        IDatabaseTransactionOpsCoreTyped,
+        Database, DatabaseVersion, DatabaseVersionKeyV0, IDatabaseTransactionOpsCoreTyped,
     };
     use fedimint_core::epoch::ConsensusItem;
     use fedimint_core::module::registry::ModuleDecoderRegistry;
@@ -147,14 +118,19 @@ mod fedimint_migration_tests {
     use fedimint_core::{Amount, PeerId, ServerModule, TransactionId};
     use fedimint_dummy_common::{DummyCommonInit, DummyInput, DummyOutput};
     use fedimint_dummy_server::Dummy;
-    use fedimint_logging::TracingSetup;
-    use fedimint_testing::db::{prepare_db_migration_snapshot, validate_migrations, BYTE_32};
+    use fedimint_logging::{TracingSetup, LOG_DB};
+    use fedimint_testing::db::{
+        snapshot_db_migrations_with_decoders, validate_migrations_global, BYTE_32,
+        TEST_MODULE_INSTANCE_ID,
+    };
     use futures::StreamExt;
     use rand::rngs::OsRng;
+    use rand::thread_rng;
     use secp256k1_zkp::Message;
     use strum::IntoEnumIterator;
+    use tracing::info;
 
-    use super::{AcceptedTransactionKey, SignedSessionOutcomeCountKey};
+    use super::AcceptedTransactionKey;
     use crate::db::{
         get_global_database_migrations, AcceptedItem, AcceptedItemKey, AcceptedItemPrefix,
         AcceptedTransactionKeyPrefix, AlephUnitsKey, AlephUnitsPrefix, DbKeyPrefix,
@@ -167,36 +143,43 @@ mod fedimint_migration_tests {
     /// in future code versions. This function should not be updated when
     /// database keys/values change - instead a new function should be added
     /// that creates a new database backup that can be tested.
-    async fn create_server_db_with_v0_data(mut dbtx: DatabaseTransaction<'_>) {
-        dbtx.insert_new_entry(&DatabaseVersionKey, &DatabaseVersion(0))
+    async fn create_server_db_with_v0_data(db: Database) {
+        let mut dbtx = db.begin_transaction().await;
+
+        // Will be migrated to `DatabaseVersionKey` during `apply_migrations`
+        dbtx.insert_new_entry(&DatabaseVersionKeyV0, &DatabaseVersion(0))
             .await;
 
         let accepted_tx_id = AcceptedTransactionKey(TransactionId::from_slice(&BYTE_32).unwrap());
 
-        dbtx.insert_new_entry(&DatabaseVersionKey, &DatabaseVersion(0))
-            .await;
-
-        let (sk, _) = secp256k1::generate_keypair(&mut OsRng);
+        let (sk, _) = secp256k1_zkp::generate_keypair(&mut OsRng);
         let secp = secp256k1::Secp256k1::new();
-        let key_pair = KeyPair::from_secret_key(&secp, &sk);
-        let schnorr = secp.sign_schnorr(&Message::from_slice(&BYTE_32).unwrap(), &key_pair);
+        let key_pair =
+            KeyPair::from_secret_key(&secp, &bitcoin29_to_bitcoin30_secp256k1_secret_key(sk));
+        let schnorr = secp.sign_schnorr_with_rng(
+            &bitcoin29_to_bitcoin30_message(Message::from_slice(&BYTE_32).unwrap()),
+            &key_pair,
+            &mut thread_rng(),
+        );
         let transaction = Transaction {
             inputs: vec![DynInput::from_typed(
                 0,
                 DummyInput {
                     amount: Amount::ZERO,
-                    account: key_pair.public_key(),
+                    account: bitcoin30_to_bitcoin29_secp256k1_public_key(key_pair.public_key()),
                 },
             )],
             outputs: vec![DynOutput::from_typed(
                 0,
                 DummyOutput {
                     amount: Amount::ZERO,
-                    account: key_pair.public_key(),
+                    account: bitcoin30_to_bitcoin29_secp256k1_public_key(key_pair.public_key()),
                 },
             )],
             nonce: [0x42; 8],
-            signatures: TransactionSignature::NaiveMultisig(vec![schnorr]),
+            signatures: TransactionSignature::NaiveMultisig(vec![
+                bitcoin30_to_bitcoin29_schnorr_signature(schnorr),
+            ]),
         };
 
         let module_ids = transaction
@@ -228,20 +211,20 @@ mod fedimint_migration_tests {
         dbtx.insert_new_entry(&AlephUnitsKey(0), &vec![42, 42, 42])
             .await;
 
-        let _consensus_items = vec![ConsensusItem::Transaction(transaction)];
+        dbtx.commit_tx().await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn prepare_server_db_migration_snapshots() -> anyhow::Result<()> {
-        prepare_db_migration_snapshot(
-            "fedimint-server-v0",
-            |dbtx| {
+    async fn snapshot_server_db_migrations() -> anyhow::Result<()> {
+        snapshot_db_migrations_with_decoders(
+            "fedimint-server",
+            |db| {
                 Box::pin(async move {
-                    create_server_db_with_v0_data(dbtx).await;
+                    create_server_db_with_v0_data(db).await;
                 })
             },
             ModuleDecoderRegistry::from_iter([(
-                0,
+                TEST_MODULE_INSTANCE_ID,
                 DummyCommonInit::KIND,
                 <Dummy as ServerModule>::decoder(),
             )]),
@@ -250,24 +233,11 @@ mod fedimint_migration_tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_migrations() -> anyhow::Result<()> {
+    async fn test_server_db_migrations() -> anyhow::Result<()> {
         let _ = TracingSetup::default().init();
 
-        validate_migrations(
-            "fedimint-server",
+        validate_migrations_global(
             |db| async move {
-                apply_migrations(
-                    &db,
-                    "Global".to_string(),
-                    GLOBAL_DATABASE_VERSION,
-                    get_global_database_migrations(),
-                )
-                .await
-                .context("Error applying migrations to temp database")?;
-
-                // Verify that all of the data from the global namespace can be read. If a
-                // database migration failed or was not properly supplied,
-                // the struct will fail to be read.
                 let mut dbtx = db.begin_transaction().await;
 
                 for prefix in DbKeyPrefix::iter() {
@@ -283,6 +253,7 @@ mod fedimint_migration_tests {
                                 accepted_items > 0,
                                 "validate_migrations was not able to read any AcceptedItems"
                             );
+                            info!(target: LOG_DB, "Validated AcceptedItems");
                         }
                         DbKeyPrefix::AcceptedTransaction => {
                             let accepted_transactions = dbtx
@@ -295,6 +266,7 @@ mod fedimint_migration_tests {
                                 num_accepted_transactions > 0,
                                 "validate_migrations was not able to read any AcceptedTransactions"
                             );
+                            info!(target: LOG_DB, "Validated AcceptedTransactions");
                         }
                         DbKeyPrefix::SignedSessionOutcome => {
                             let signed_session_outcomes = dbtx
@@ -304,9 +276,10 @@ mod fedimint_migration_tests {
                                 .await;
                             let num_signed_session_outcomes = signed_session_outcomes.len();
                             ensure!(
-                                num_signed_session_outcomes > 0,
-                                "validate_migrations was not able to read any SignedSessionOutcomes"
-                            );
+                            num_signed_session_outcomes > 0,
+                            "validate_migrations was not able to read any SignedSessionOutcomes"
+                        );
+                            info!(target: LOG_DB, "Validated SignedSessionOutcome");
                         }
                         DbKeyPrefix::AlephUnits => {
                             let aleph_units = dbtx
@@ -319,23 +292,7 @@ mod fedimint_migration_tests {
                                 num_aleph_units > 0,
                                 "validate_migrations was not able to read any AlephUnits"
                             );
-                        }
-                        DbKeyPrefix::SignedSessionOutcomeCount => {
-                            let session_outcome_count = dbtx
-                                .get_value(&SignedSessionOutcomeCountKey)
-                                .await
-                                .expect("Count key should have been created");
-
-                            let real_session_outcome_count =
-                                dbtx.find_by_prefix(&SignedSessionOutcomePrefix)
-                                    .await
-                                    .count()
-                                    .await as u64;
-
-                            assert_eq!(
-                                session_outcome_count, real_session_outcome_count,
-                                "Session outcome count cash is inconsistent"
-                            );
+                            info!(target: LOG_DB, "Validated AlephUnits");
                         }
                         // Module prefix is reserved for modules, no migration testing is needed
                         DbKeyPrefix::Module => {}
@@ -343,8 +300,11 @@ mod fedimint_migration_tests {
                 }
                 Ok(())
             },
+            "fedimint-server",
+            GLOBAL_DATABASE_VERSION,
+            get_global_database_migrations(),
             ModuleDecoderRegistry::from_iter([(
-                0,
+                TEST_MODULE_INSTANCE_ID,
                 DummyCommonInit::KIND,
                 <Dummy as ServerModule>::decoder(),
             )]),

@@ -5,6 +5,7 @@ use std::time::{Duration, SystemTime};
 use fedimint_client::sm::{ClientSMDatabaseTransaction, State, StateTransition};
 use fedimint_client::transaction::ClientInput;
 use fedimint_client::DynGlobalClientContext;
+use fedimint_core::bitcoin_migration::bitcoin30_to_bitcoin29_script;
 use fedimint_core::core::OperationId;
 use fedimint_core::encoding::{Decodable, Encodable};
 use fedimint_core::task::sleep;
@@ -33,7 +34,7 @@ const TRANSACTION_STATUS_FETCH_INTERVAL: Duration = Duration::from_secs(1);
 ///     AwaitingConfirmations -- "Retransmit seen tx (planned)" --> AwaitingConfirmations
 ///     Created -- "No transactions seen for [time]" --> Timeout["Timed out"]
 /// ```
-#[derive(Debug, Clone, Eq, PartialEq, Decodable, Encodable)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Decodable, Encodable)]
 pub struct DepositStateMachine {
     pub(crate) operation_id: OperationId,
     pub(crate) state: DepositStates,
@@ -41,12 +42,11 @@ pub struct DepositStateMachine {
 
 impl State for DepositStateMachine {
     type ModuleContext = WalletClientContext;
-    type GlobalContext = DynGlobalClientContext;
 
     fn transitions(
         &self,
         context: &Self::ModuleContext,
-        global_context: &Self::GlobalContext,
+        global_context: &DynGlobalClientContext,
     ) -> Vec<StateTransition<Self>> {
         match &self.state {
             DepositStates::Created(created_state) => {
@@ -102,10 +102,12 @@ async fn await_created_btc_transaction_submitted(
     context: WalletClientContext,
     tweak: KeyPair,
 ) -> (bitcoin::Transaction, u32) {
-    let script = context
-        .wallet_descriptor
-        .tweak(&tweak.public_key(), &context.secp)
-        .script_pubkey();
+    let script = bitcoin30_to_bitcoin29_script(
+        context
+            .wallet_descriptor
+            .tweak(&tweak.public_key(), &context.secp)
+            .script_pubkey(),
+    );
     loop {
         match context.rpc.watch_script_history(&script).await {
             Ok(_) => break,
@@ -304,7 +306,7 @@ async fn transition_btc_tx_confirmed(
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Decodable, Encodable)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Decodable, Encodable)]
 pub enum DepositStates {
     Created(CreatedDepositState),
     WaitingForConfirmations(WaitingForConfirmationsDepositState),
@@ -312,13 +314,13 @@ pub enum DepositStates {
     TimedOut(TimedOutDepositState),
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Decodable, Encodable)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Decodable, Encodable)]
 pub struct CreatedDepositState {
     pub(crate) tweak_key: KeyPair,
     pub(crate) timeout_at: SystemTime,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Decodable, Encodable)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Decodable, Encodable)]
 pub struct WaitingForConfirmationsDepositState {
     /// Key pair of which the public was used to tweak the federation's wallet
     /// descriptor. The secret key is later used to sign the fedimint claim
@@ -331,12 +333,12 @@ pub struct WaitingForConfirmationsDepositState {
     pub(crate) out_idx: u32,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Decodable, Encodable)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Decodable, Encodable)]
 pub struct ClaimingDepositState {
     /// Fedimint transaction id in which the deposit is being claimed.
     pub(crate) transaction_id: TransactionId,
     pub(crate) change: Vec<OutPoint>,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Decodable, Encodable)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Decodable, Encodable)]
 pub struct TimedOutDepositState {}

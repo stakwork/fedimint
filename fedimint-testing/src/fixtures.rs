@@ -7,12 +7,13 @@ use fedimint_bitcoind::{create_bitcoind, DynBitcoindRpc};
 use fedimint_client::module::init::{
     ClientModuleInitRegistry, DynClientModuleInit, IClientModuleInit,
 };
-use fedimint_core::bitcoinrpc::BitcoinRpcConfig;
 use fedimint_core::config::{
     ModuleInitParams, ServerModuleConfigGenParamsRegistry, ServerModuleInitRegistry,
 };
 use fedimint_core::core::{ModuleInstanceId, ModuleKind};
+use fedimint_core::envs::BitcoinRpcConfig;
 use fedimint_core::module::{DynServerModuleInit, IServerModuleInit};
+use fedimint_core::runtime::block_in_place;
 use fedimint_core::task::{MaybeSend, MaybeSync, TaskGroup};
 use fedimint_core::util::SafeUrl;
 use fedimint_logging::{TracingSetup, LOG_TEST};
@@ -22,10 +23,13 @@ use tracing::info;
 use crate::btc::mock::FakeBitcoinFactory;
 use crate::btc::real::RealBitcoinTest;
 use crate::btc::BitcoinTest;
+use crate::envs::{
+    FM_PORT_ESPLORA_ENV, FM_TEST_BITCOIND_RPC_ENV, FM_TEST_DIR_ENV, FM_TEST_USE_REAL_DAEMONS_ENV,
+};
 use crate::federation::FederationTest;
 use crate::gateway::GatewayTest;
 use crate::ln::mock::FakeLightningTest;
-use crate::ln::real::{ClnLightningTest, LdkLightningTest, LndLightningTest};
+use crate::ln::real::{ClnLightningTest, LndLightningTest};
 use crate::ln::LightningTest;
 
 /// A default timeout for things happening in tests
@@ -34,6 +38,7 @@ pub const TIMEOUT: Duration = Duration::from_secs(10);
 /// A tool for easily writing fedimint integration tests
 pub struct Fixtures {
     num_peers: u16,
+    num_offline: u16,
     clients: Vec<DynClientModuleInit>,
     servers: Vec<DynServerModuleInit>,
     params: ServerModuleConfigGenParamsRegistry,
@@ -54,6 +59,7 @@ impl Fixtures {
         let _ = TracingSetup::default().init();
         let real_testing = Fixtures::is_real_test();
         let num_peers = 4;
+        let num_offline = 1;
         let task_group = TaskGroup::new();
         let (dyn_bitcoin_rpc, bitcoin, config): (
             DynBitcoindRpc,
@@ -62,7 +68,7 @@ impl Fixtures {
         ) = if real_testing {
             let rpc_config = BitcoinRpcConfig::from_env_vars().unwrap();
             let dyn_bitcoin_rpc = create_bitcoind(&rpc_config, task_group.make_handle()).unwrap();
-            let bitcoincore_url = env::var("FM_TEST_BITCOIND_RPC")
+            let bitcoincore_url = env::var(FM_TEST_BITCOIND_RPC_ENV)
                 .expect("Must have bitcoind RPC defined for real tests")
                 .parse()
                 .expect("Invalid bitcoind RPC URL");
@@ -77,6 +83,7 @@ impl Fixtures {
 
         Self {
             num_peers,
+            num_offline,
             clients: vec![],
             servers: vec![],
             params: Default::default(),
@@ -90,7 +97,7 @@ impl Fixtures {
     }
 
     pub fn is_real_test() -> bool {
-        env::var("FM_TEST_USE_REAL_DAEMONS") == Ok("1".to_string())
+        env::var(FM_TEST_USE_REAL_DAEMONS_ENV) == Ok("1".to_string())
     }
 
     // TODO: Auto-assign instance ids after removing legacy id order
@@ -102,8 +109,21 @@ impl Fixtures {
         params: impl ModuleInitParams,
     ) -> Self {
         self.params
-            .attach_config_gen_params(self.id, server.module_kind(), params);
+            .attach_config_gen_params_by_id(self.id, server.module_kind(), params);
         self.clients.push(DynClientModuleInit::from(client));
+        self.servers.push(DynServerModuleInit::from(server));
+        self.id += 1;
+
+        self
+    }
+
+    pub fn with_server_only_module(
+        mut self,
+        server: impl IServerModuleInit + MaybeSend + MaybeSync + 'static,
+        params: impl ModuleInitParams,
+    ) -> Self {
+        self.params
+            .attach_config_gen_params_by_id(self.id, server.module_kind(), params);
         self.servers.push(DynServerModuleInit::from(server));
         self.id += 1;
 
@@ -112,15 +132,17 @@ impl Fixtures {
 
     /// Starts a new federation with default number of peers for testing
     pub async fn new_fed(&self) -> FederationTest {
-        self.new_fed_with_peers(self.num_peers).await
+        self.new_fed_with_peers(self.num_peers, self.num_offline)
+            .await
     }
 
     /// Starts a new federation with number of peers
-    pub async fn new_fed_with_peers(&self, num_peers: u16) -> FederationTest {
+    pub async fn new_fed_with_peers(&self, num_peers: u16, num_offline: u16) -> FederationTest {
         info!(target: LOG_TEST, num_peers, "Setting federation with peers");
         FederationTest::new(
             num_peers,
-            tokio::task::block_in_place(|| fedimint_portalloc::port_alloc(num_peers * 2))
+            num_offline,
+            block_in_place(|| fedimint_portalloc::port_alloc(num_peers * 2))
                 .expect("Failed to allocate a port range"),
             self.params.clone(),
             ServerModuleInitRegistry::from(self.servers.clone()),
@@ -145,15 +167,22 @@ impl Fixtures {
         let clients = self.clients.clone().into_iter();
 
         GatewayTest::new(
-            tokio::task::block_in_place(|| fedimint_portalloc::port_alloc(1))
+            block_in_place(|| fedimint_portalloc::port_alloc(1))
                 .expect("Failed to allocate a port range"),
             cli_password,
             ln,
             decoders,
-            ClientModuleInitRegistry::from_iter(clients.filter(|client| {
-                // Remove LN module because the gateway adds one
-                client.to_dyn_common().module_kind() != ModuleKind::from_static_str("ln")
-            })),
+            ClientModuleInitRegistry::from_iter(
+                clients
+                    .filter(|client| {
+                        // Remove LN module because the gateway adds one
+                        client.to_dyn_common().module_kind() != ModuleKind::from_static_str("ln")
+                    })
+                    .filter(|client| {
+                        // Remove LN NG module because the gateway adds one
+                        client.to_dyn_common().module_kind() != ModuleKind::from_static_str("lnv2")
+                    }),
+            ),
             num_route_hints,
         )
         .await
@@ -175,14 +204,6 @@ impl Fixtures {
         }
     }
 
-    /// Spawns and returns a newly created LDK Node
-    pub async fn spawn_ldk(bitcoin: Arc<dyn BitcoinTest>) -> LdkLightningTest {
-        let db_dir = test_dir(&format!("LDKNode-{}", rand::random::<u64>())).0;
-        LdkLightningTest::new(db_dir, bitcoin.clone())
-            .await
-            .expect("Error spawning LDK Node")
-    }
-
     /// Get a server bitcoin RPC config
     pub fn bitcoin_server(&self) -> BitcoinRpcConfig {
         self.bitcoin_rpc.clone()
@@ -197,7 +218,7 @@ impl Fixtures {
                 kind: "esplora".to_string(),
                 url: SafeUrl::parse(&format!(
                     "http://127.0.0.1:{}/",
-                    env::var("FM_PORT_ESPLORA").unwrap_or(String::from("50002"))
+                    env::var(FM_PORT_ESPLORA_ENV).unwrap_or(String::from("50002"))
                 ))
                 .expect("Failed to parse default esplora server"),
             },
@@ -219,7 +240,7 @@ impl Fixtures {
 ///
 /// Callers must hold onto the tempdir until it is no longer needed
 pub fn test_dir(pathname: &str) -> (PathBuf, Option<TempDir>) {
-    let (parent, maybe_tmp_dir_guard) = match env::var("FM_TEST_DIR") {
+    let (parent, maybe_tmp_dir_guard) = match env::var(FM_TEST_DIR_ENV) {
         Ok(directory) => (directory, None),
         Err(_) => {
             let random = format!("test-{}", rand::random::<u64>());

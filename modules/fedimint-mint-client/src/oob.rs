@@ -6,7 +6,7 @@ use fedimint_client::transaction::ClientInput;
 use fedimint_client::DynGlobalClientContext;
 use fedimint_core::core::OperationId;
 use fedimint_core::encoding::{Decodable, Encodable};
-use fedimint_core::{task, Amount, TransactionId};
+use fedimint_core::{runtime, Amount, TransactionId};
 use fedimint_mint_common::MintInput;
 
 use crate::input::{
@@ -23,7 +23,7 @@ use crate::{MintClientContext, MintClientStateMachines, SpendableNote};
 ///     Created -- User triggered refund --> RefundU["User Refund"]
 ///     Created -- Timeout triggered refund --> RefundT["Timeout Refund"]
 /// ```
-#[derive(Debug, Clone, Eq, PartialEq, Decodable, Encodable)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Decodable, Encodable)]
 pub enum MintOOBStates {
     /// The e-cash has been taken out of the wallet and we are waiting for the
     /// recipient to reissue it or the user to trigger a refund.
@@ -36,37 +36,36 @@ pub enum MintOOBStates {
     TimeoutRefund(MintOOBStatesTimeoutRefund),
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Decodable, Encodable)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Decodable, Encodable)]
 pub struct MintOOBStateMachine {
     pub(crate) operation_id: OperationId,
     pub(crate) state: MintOOBStates,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Decodable, Encodable)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Decodable, Encodable)]
 pub struct MintOOBStatesCreated {
     pub(crate) amount: Amount,
     pub(crate) spendable_note: SpendableNote,
     pub(crate) timeout: SystemTime,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Decodable, Encodable)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Decodable, Encodable)]
 pub struct MintOOBStatesUserRefund {
     pub(crate) refund_txid: TransactionId,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Decodable, Encodable)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Decodable, Encodable)]
 pub struct MintOOBStatesTimeoutRefund {
     pub(crate) refund_txid: TransactionId,
 }
 
 impl State for MintOOBStateMachine {
     type ModuleContext = MintClientContext;
-    type GlobalContext = DynGlobalClientContext;
 
     fn transitions(
         &self,
         context: &Self::ModuleContext,
-        global_context: &Self::GlobalContext,
+        global_context: &DynGlobalClientContext,
     ) -> Vec<StateTransition<Self>> {
         match &self.state {
             MintOOBStates::Created(created) => {
@@ -142,7 +141,7 @@ async fn transition_user_cancel(
 
 async fn await_timeout_cancel(deadline: SystemTime) {
     if let Ok(time_until_deadline) = deadline.duration_since(fedimint_core::time::now()) {
-        task::sleep(time_until_deadline).await;
+        runtime::sleep(time_until_deadline).await;
     }
 }
 

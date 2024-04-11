@@ -12,6 +12,7 @@ macro_rules! declare_vars {
             $($env_name:ident : $env_ty:ty = $env_value:expr;)*
         }
     ) => {
+        #[derive(Clone)]
         pub struct $name {
             $(
                 #[allow(unused)]
@@ -76,6 +77,7 @@ async fn mkdir(dir: PathBuf) -> anyhow::Result<PathBuf> {
     Ok(dir)
 }
 
+use fedimint_core::envs::FM_USE_UNKNOWN_MODULE_ENV;
 use fedimint_portalloc::port_alloc;
 use fedimint_server::config::ConfigGenParams;
 use format as f;
@@ -85,9 +87,12 @@ pub fn utf8(path: &Path) -> &str {
 }
 
 declare_vars! {
-    Global = (test_dir: &Path, fed_size: usize) =>
+    Global = (test_dir: &Path, fed_size: usize, offline_nodes: usize) =>
     {
+        FM_USE_UNKNOWN_MODULE : String = std::env::var(FM_USE_UNKNOWN_MODULE_ENV).unwrap_or_else(|_| "1".into());
+
         FM_FED_SIZE: usize = fed_size;
+        FM_OFFLINE_NODES: usize = offline_nodes;
         FM_TMP_DIR: PathBuf = mkdir(test_dir.into()).await?;
         FM_TEST_DIR: PathBuf = FM_TMP_DIR.clone();
         FM_TEST_FAST_WEAK_CRYPTO: String = "1";
@@ -116,7 +121,7 @@ declare_vars! {
         FM_BTC_DIR: PathBuf = mkdir(FM_TEST_DIR.join("bitcoin")).await?;
         FM_DATA_DIR: PathBuf = FM_TEST_DIR.clone();
         FM_CLIENT_BASE_DIR: PathBuf = mkdir(FM_TEST_DIR.join("clients")).await?;
-        FM_CLIENT_DIR: PathBuf = mkdir(FM_TEST_DIR.join("clients").join("default")).await?;
+        FM_CLIENT_DIR: PathBuf = mkdir(FM_TEST_DIR.join("clients").join("default-0")).await?;
         FM_ELECTRS_DIR: PathBuf = mkdir(FM_TEST_DIR.join("electrs")).await?;
         FM_ESPLORA_DIR: PathBuf = mkdir(FM_TEST_DIR.join("esplora")).await?;
         FM_READY_FILE: PathBuf = FM_TEST_DIR.join("ready");
@@ -164,8 +169,12 @@ declare_vars! {
 }
 
 impl Global {
-    pub async fn new(test_dir: &Path, fed_size: usize) -> anyhow::Result<Self> {
-        let this = Self::init(test_dir, fed_size).await?;
+    pub async fn new(
+        test_dir: &Path,
+        fed_size: usize,
+        offline_nodes: usize,
+    ) -> anyhow::Result<Self> {
+        let this = Self::init(test_dir, fed_size, offline_nodes).await?;
         Ok(this)
     }
 }

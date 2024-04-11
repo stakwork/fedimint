@@ -16,9 +16,8 @@ use fedimint_client::transaction::ClientInput;
 use fedimint_client::DynGlobalClientContext;
 use fedimint_core::core::OperationId;
 use fedimint_core::encoding::{Decodable, Encodable};
-use fedimint_core::task::sleep;
+use fedimint_core::runtime::sleep;
 use fedimint_core::{Amount, OutPoint, TransactionId};
-use fedimint_ln_common::api::LnFederationApi;
 use fedimint_ln_common::contracts::incoming::IncomingContractAccount;
 use fedimint_ln_common::contracts::{ContractId, Preimage};
 use fedimint_ln_common::{LightningInput, LightningOutputOutcome};
@@ -27,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
 
+use crate::api::LnFederationApi;
 use crate::{set_payment_result, LightningClientContext, PayType};
 
 #[cfg_attr(doc, aquamarine::aquamarine)]
@@ -44,7 +44,7 @@ use crate::{set_payment_result, LightningClientContext, PayType};
 ///    DecryptingPreimage -- invalid preimage --> RefundSubmitted
 ///    DecryptingPreimage -- error decrypting preimage --> Failure
 /// ```
-#[derive(Debug, Clone, Eq, PartialEq, Decodable, Encodable)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Decodable, Encodable)]
 pub enum IncomingSmStates {
     FundingOffer(FundingOfferState),
     DecryptingPreimage(DecryptingPreimageState),
@@ -59,14 +59,14 @@ pub enum IncomingSmStates {
     Failure(String),
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Decodable, Encodable)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Decodable, Encodable)]
 pub struct IncomingSmCommon {
     pub operation_id: OperationId,
     pub contract_id: ContractId,
     pub payment_hash: sha256::Hash,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Decodable, Encodable)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Decodable, Encodable)]
 pub struct IncomingStateMachine {
     pub common: IncomingSmCommon,
     pub state: IncomingSmStates,
@@ -74,12 +74,11 @@ pub struct IncomingStateMachine {
 
 impl State for IncomingStateMachine {
     type ModuleContext = LightningClientContext;
-    type GlobalContext = DynGlobalClientContext;
 
     fn transitions(
         &self,
         context: &Self::ModuleContext,
-        global_context: &Self::GlobalContext,
+        global_context: &DynGlobalClientContext,
     ) -> Vec<fedimint_client::sm::StateTransition<Self>> {
         match &self.state {
             IncomingSmStates::FundingOffer(state) => state.transitions(global_context, context),
@@ -97,7 +96,9 @@ impl State for IncomingStateMachine {
     }
 }
 
-#[derive(Error, Debug, Serialize, Deserialize, Encodable, Decodable, Clone, Eq, PartialEq)]
+#[derive(
+    Error, Debug, Serialize, Deserialize, Encodable, Decodable, Hash, Clone, Eq, PartialEq,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum IncomingSmError {
     #[error("Violated fee policy. Offer amount {offer_amount} Payment amount: {payment_amount}")]
@@ -127,7 +128,7 @@ pub enum IncomingSmError {
     AmountError { invoice: Bolt11Invoice },
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Decodable, Encodable)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Decodable, Encodable)]
 pub struct FundingOfferState {
     pub txid: TransactionId,
 }
@@ -184,7 +185,7 @@ impl FundingOfferState {
                 }
             }
             // give some time for other things to run
-            fedimint_core::task::sleep(Duration::from_secs(sleep)).await;
+            fedimint_core::runtime::sleep(Duration::from_secs(sleep)).await;
         }
 
         unreachable!("there is too many u64s to ever get here")
@@ -212,7 +213,7 @@ impl FundingOfferState {
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Decodable, Encodable)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Decodable, Encodable)]
 pub struct DecryptingPreimageState {
     txid: TransactionId,
 }

@@ -17,7 +17,9 @@ use fedimint_ln_server::LightningInit;
 use fedimint_testing::federation::FederationTest;
 use fedimint_testing::fixtures::Fixtures;
 use fedimint_testing::gateway::{GatewayTest, DEFAULT_GATEWAY_PASSWORD};
-use lightning_invoice::Bolt11Invoice;
+use lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescription, Description};
+use rand::rngs::OsRng;
+use secp256k1::KeyPair;
 
 fn fixtures() -> Fixtures {
     let fixtures = Fixtures::new_primary(DummyClientInit, DummyInit, DummyGenParams::default());
@@ -38,66 +40,15 @@ async fn gateway(fixtures: &Fixtures, fed: &FederationTest) -> GatewayTest {
 async fn pay_invoice(
     client: &Client,
     invoice: Bolt11Invoice,
+    gateway_id: Option<secp256k1::PublicKey>,
 ) -> anyhow::Result<OutgoingLightningPayment> {
     let ln_module = client.get_first_module::<LightningClientModule>();
-    let gateway = ln_module.select_active_gateway_opt().await;
+    let gateway = if let Some(gateway_id) = gateway_id {
+        ln_module.select_gateway(&gateway_id).await
+    } else {
+        None
+    };
     ln_module.pay_bolt11_invoice(gateway, invoice, ()).await
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn can_switch_active_gateway() -> anyhow::Result<()> {
-    let fixtures = fixtures();
-    let fed = fixtures.new_fed().await;
-    let client = fed.new_client().await;
-    let mut gateway1 = fixtures
-        .new_gateway(
-            fixtures.lnd().await,
-            0,
-            Some(DEFAULT_GATEWAY_PASSWORD.to_string()),
-        )
-        .await;
-    let mut gateway2 = fixtures
-        .new_gateway(
-            fixtures.cln().await,
-            0,
-            Some(DEFAULT_GATEWAY_PASSWORD.to_string()),
-        )
-        .await;
-
-    // Client selects a gateway by default
-    gateway1.connect_fed(&fed).await;
-    let key1 = gateway1.get_gateway_id();
-    assert_eq!(
-        client
-            .get_first_module::<LightningClientModule>()
-            .select_active_gateway()
-            .await?
-            .gateway_id,
-        key1
-    );
-
-    gateway2.connect_fed(&fed).await;
-    let key2 = gateway1.get_gateway_id();
-    let gateways = client
-        .get_first_module::<LightningClientModule>()
-        .fetch_registered_gateways()
-        .await
-        .unwrap();
-    assert_eq!(gateways.len(), 2);
-
-    client
-        .get_first_module::<LightningClientModule>()
-        .set_active_gateway(&key2)
-        .await?;
-    assert_eq!(
-        client
-            .get_first_module::<LightningClientModule>()
-            .select_active_gateway()
-            .await?
-            .gateway_id,
-        key2
-    );
-    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -112,13 +63,15 @@ async fn test_can_attach_extra_meta_to_receive_operation() -> anyhow::Result<()>
     client2.await_primary_module_output(op, outpoint).await?;
 
     let extra_meta = "internal payment with no gateway registered".to_string();
+    let desc = Description::new("with-markers".to_string())?;
     let (op, invoice, _) = client1
         .get_first_module::<LightningClientModule>()
         .create_bolt11_invoice(
             sats(250),
-            "with-markers".to_string(),
+            Bolt11InvoiceDescription::Direct(&desc),
             None,
             extra_meta.clone(),
+            None,
         )
         .await?;
     let mut sub1 = client1
@@ -134,7 +87,7 @@ async fn test_can_attach_extra_meta_to_receive_operation() -> anyhow::Result<()>
         payment_type,
         contract_id: _,
         fee: _,
-    } = pay_invoice(&client2, invoice).await?;
+    } = pay_invoice(&client2, invoice, None).await?;
     match payment_type {
         PayType::Internal(op_id) => {
             let mut sub2 = client2
@@ -172,9 +125,16 @@ async fn cannot_pay_same_internal_invoice_twice() -> anyhow::Result<()> {
     client2.await_primary_module_output(op, outpoint).await?;
 
     // TEST internal payment when there are no gateways registered
+    let desc = Description::new("with-markers".to_string())?;
     let (op, invoice, _) = client1
         .get_first_module::<LightningClientModule>()
-        .create_bolt11_invoice(sats(250), "with-markers".to_string(), None, ())
+        .create_bolt11_invoice(
+            sats(250),
+            Bolt11InvoiceDescription::Direct(&desc),
+            None,
+            (),
+            None,
+        )
         .await?;
     let mut sub1 = client1
         .get_first_module::<LightningClientModule>()
@@ -188,7 +148,7 @@ async fn cannot_pay_same_internal_invoice_twice() -> anyhow::Result<()> {
         payment_type,
         contract_id: _,
         fee: _,
-    } = pay_invoice(&client2, invoice.clone()).await?;
+    } = pay_invoice(&client2, invoice.clone(), None).await?;
     match payment_type {
         PayType::Internal(op_id) => {
             let mut sub2 = client2
@@ -212,7 +172,7 @@ async fn cannot_pay_same_internal_invoice_twice() -> anyhow::Result<()> {
         payment_type,
         contract_id: _,
         fee: _,
-    } = pay_invoice(&client2, invoice).await?;
+    } = pay_invoice(&client2, invoice, None).await?;
     match payment_type {
         PayType::Internal(op_id) => {
             let mut sub2 = client2
@@ -236,8 +196,8 @@ async fn cannot_pay_same_internal_invoice_twice() -> anyhow::Result<()> {
 async fn gateway_protects_preimage_for_payment() -> anyhow::Result<()> {
     let fixtures = fixtures();
     let fed = fixtures.new_fed().await;
-    let (client1, client2) = fed.two_clients().await;
     let gw = gateway(&fixtures, &fed).await;
+    let (client1, client2) = fed.two_clients().await;
     let client1_dummy_module = client1.get_first_module::<DummyClientModule>();
     let client2_dummy_module = client2.get_first_module::<DummyClientModule>();
 
@@ -257,7 +217,7 @@ async fn gateway_protects_preimage_for_payment() -> anyhow::Result<()> {
         payment_type,
         contract_id: _,
         fee: _,
-    } = pay_invoice(&client1, invoice.clone()).await?;
+    } = pay_invoice(&client1, invoice.clone(), Some(gw.gateway.gateway_id)).await?;
     match payment_type {
         PayType::Lightning(operation_id) => {
             let mut sub = client1
@@ -279,7 +239,7 @@ async fn gateway_protects_preimage_for_payment() -> anyhow::Result<()> {
         payment_type,
         contract_id: _,
         fee: _,
-    } = pay_invoice(&client2, invoice.clone()).await?;
+    } = pay_invoice(&client2, invoice.clone(), Some(gw.gateway.gateway_id)).await?;
     match payment_type {
         PayType::Lightning(operation_id) => {
             let mut sub = client2
@@ -304,8 +264,8 @@ async fn gateway_protects_preimage_for_payment() -> anyhow::Result<()> {
 async fn cannot_pay_same_external_invoice_twice() -> anyhow::Result<()> {
     let fixtures = fixtures();
     let fed = fixtures.new_fed().await;
-    let client = fed.new_client().await;
     let gw = gateway(&fixtures, &fed).await;
+    let client = fed.new_client().await;
     let dummy_module = client.get_first_module::<DummyClientModule>();
 
     // Print money for client
@@ -320,7 +280,7 @@ async fn cannot_pay_same_external_invoice_twice() -> anyhow::Result<()> {
         payment_type,
         contract_id: _,
         fee: _,
-    } = pay_invoice(&client, invoice.clone()).await?;
+    } = pay_invoice(&client, invoice.clone(), Some(gw.gateway.gateway_id)).await?;
     match payment_type {
         PayType::Lightning(operation_id) => {
             let mut sub = client
@@ -344,7 +304,7 @@ async fn cannot_pay_same_external_invoice_twice() -> anyhow::Result<()> {
         payment_type,
         contract_id: _,
         fee: _,
-    } = pay_invoice(&client, invoice).await?;
+    } = pay_invoice(&client, invoice, Some(gw.gateway.gateway_id)).await?;
     match payment_type {
         PayType::Lightning(operation_id) => {
             let mut sub = client
@@ -380,9 +340,16 @@ async fn makes_internal_payments_within_federation() -> anyhow::Result<()> {
     client2.await_primary_module_output(op, outpoint).await?;
 
     // TEST internal payment when there are no gateways registered
+    let desc = Description::new("with-markers".to_string())?;
     let (op, invoice, _) = client1
         .get_first_module::<LightningClientModule>()
-        .create_bolt11_invoice(sats(250), "with-markers".to_string(), None, ())
+        .create_bolt11_invoice(
+            sats(250),
+            Bolt11InvoiceDescription::Direct(&desc),
+            None,
+            (),
+            None,
+        )
         .await?;
     let mut sub1 = client1
         .get_first_module::<LightningClientModule>()
@@ -396,7 +363,7 @@ async fn makes_internal_payments_within_federation() -> anyhow::Result<()> {
         payment_type,
         contract_id: _,
         fee: _,
-    } = pay_invoice(&client2, invoice).await?;
+    } = pay_invoice(&client2, invoice, None).await?;
     match payment_type {
         PayType::Internal(op_id) => {
             let mut sub2 = client2
@@ -414,11 +381,19 @@ async fn makes_internal_payments_within_federation() -> anyhow::Result<()> {
     }
 
     // TEST internal payment when there is a registered gateway
-    gateway(&fixtures, &fed).await;
+    let gw = gateway(&fixtures, &fed).await;
 
-    let (op, invoice, _) = client1
-        .get_first_module::<LightningClientModule>()
-        .create_bolt11_invoice(sats(250), "with-gateway-hint".to_string(), None, ())
+    let ln_module = client1.get_first_module::<LightningClientModule>();
+    let ln_gateway = ln_module.select_gateway(&gw.gateway.gateway_id).await;
+    let desc = Description::new("with-gateway-hint".to_string())?;
+    let (op, invoice, _) = ln_module
+        .create_bolt11_invoice(
+            sats(250),
+            Bolt11InvoiceDescription::Direct(&desc),
+            None,
+            (),
+            ln_gateway,
+        )
         .await?;
     let mut sub1 = client1
         .get_first_module::<LightningClientModule>()
@@ -432,7 +407,7 @@ async fn makes_internal_payments_within_federation() -> anyhow::Result<()> {
         payment_type,
         contract_id: _,
         fee: _,
-    } = pay_invoice(&client2, invoice).await?;
+    } = pay_invoice(&client2, invoice, Some(gw.gateway.gateway_id)).await?;
     match payment_type {
         PayType::Internal(op_id) => {
             let mut sub2 = client2
@@ -453,11 +428,216 @@ async fn makes_internal_payments_within_federation() -> anyhow::Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn can_receive_for_other_user() -> anyhow::Result<()> {
+    let fixtures = fixtures();
+    let fed = fixtures.new_fed().await;
+    let (client1, client2) = fed.two_clients().await;
+    let client2_dummy_module = client2.get_first_module::<DummyClientModule>();
+
+    // generate a new keypair
+    let keypair = KeyPair::new_global(&mut OsRng);
+
+    // Print money for client2
+    let (op, outpoint) = client2_dummy_module.print_money(sats(1000)).await?;
+    client2.await_primary_module_output(op, outpoint).await?;
+
+    // TEST internal payment when there are no gateways registered
+    let desc = Description::new("with-markers".to_string())?;
+    let (op, invoice, _) = client1
+        .get_first_module::<LightningClientModule>()
+        .create_bolt11_invoice_for_user(
+            sats(250),
+            Bolt11InvoiceDescription::Direct(&desc),
+            None,
+            keypair.public_key(),
+            (),
+            None,
+        )
+        .await?;
+    let mut sub1 = client1
+        .get_first_module::<LightningClientModule>()
+        .subscribe_ln_receive(op)
+        .await?
+        .into_stream();
+    assert_eq!(sub1.ok().await?, LnReceiveState::Created);
+    assert_matches!(sub1.ok().await?, LnReceiveState::WaitingForPayment { .. });
+
+    let OutgoingLightningPayment {
+        payment_type,
+        contract_id: _,
+        fee: _,
+    } = pay_invoice(&client2, invoice, None).await?;
+    match payment_type {
+        PayType::Internal(op_id) => {
+            let mut sub2 = client2
+                .get_first_module::<LightningClientModule>()
+                .subscribe_internal_pay(op_id)
+                .await?
+                .into_stream();
+            assert_eq!(sub2.ok().await?, InternalPayState::Funding);
+            assert_matches!(sub2.ok().await?, InternalPayState::Preimage { .. });
+            // goes from preimage to immediate claim because it is for another user
+            assert_eq!(sub1.ok().await?, LnReceiveState::Claimed);
+        }
+        _ => panic!("Expected internal payment!"),
+    }
+
+    // Create a new client and try to receive the locked payment
+    let new_client = fed.new_client().await;
+    let new_ln_module = new_client.get_first_module::<LightningClientModule>();
+    let operation_id = new_ln_module.scan_receive_for_user(keypair, ()).await?;
+    let mut sub3 = new_ln_module
+        .subscribe_ln_claim(operation_id)
+        .await?
+        .into_stream();
+    assert_eq!(sub3.ok().await?, LnReceiveState::AwaitingFunds);
+    assert_eq!(sub3.ok().await?, LnReceiveState::Claimed);
+    assert_eq!(new_client.get_balance().await, sats(250));
+
+    // TEST internal payment when there is a registered gateway
+    let gw = gateway(&fixtures, &fed).await;
+
+    // generate a new keypair
+    let keypair = KeyPair::new_global(&mut OsRng);
+
+    let ln_module = client1.get_first_module::<LightningClientModule>();
+    let ln_gateway = ln_module.select_gateway(&gw.gateway.gateway_id).await;
+    let desc = Description::new("with-gateway-hint".to_string())?;
+    let (op, invoice, _) = ln_module
+        .create_bolt11_invoice_for_user(
+            sats(250),
+            Bolt11InvoiceDescription::Direct(&desc),
+            None,
+            keypair.public_key(),
+            (),
+            ln_gateway,
+        )
+        .await?;
+    let mut sub1 = client1
+        .get_first_module::<LightningClientModule>()
+        .subscribe_ln_receive(op)
+        .await?
+        .into_stream();
+    assert_eq!(sub1.ok().await?, LnReceiveState::Created);
+    assert_matches!(sub1.ok().await?, LnReceiveState::WaitingForPayment { .. });
+
+    let OutgoingLightningPayment {
+        payment_type,
+        contract_id: _,
+        fee: _,
+    } = pay_invoice(&client2, invoice, Some(gw.gateway.gateway_id)).await?;
+    match payment_type {
+        PayType::Internal(op_id) => {
+            let mut sub2 = client2
+                .get_first_module::<LightningClientModule>()
+                .subscribe_internal_pay(op_id)
+                .await?
+                .into_stream();
+            assert_eq!(sub2.ok().await?, InternalPayState::Funding);
+            assert_matches!(sub2.ok().await?, InternalPayState::Preimage { .. });
+            // goes from preimage to immediate claim because it is for another user
+            assert_eq!(sub1.ok().await?, LnReceiveState::Claimed);
+        }
+        _ => panic!("Expected internal payment!"),
+    }
+
+    // Create a new client and try to receive the locked payment
+    let new_client = fed.new_client().await;
+    let new_ln_module = new_client.get_first_module::<LightningClientModule>();
+    let operation_id = new_ln_module.scan_receive_for_user(keypair, ()).await?;
+    let mut sub3 = new_ln_module
+        .subscribe_ln_claim(operation_id)
+        .await?
+        .into_stream();
+    assert_eq!(sub3.ok().await?, LnReceiveState::AwaitingFunds);
+    assert_eq!(sub3.ok().await?, LnReceiveState::Claimed);
+    assert_eq!(new_client.get_balance().await, sats(250));
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn can_receive_for_other_user_tweaked() -> anyhow::Result<()> {
+    let fixtures = fixtures();
+    let fed = fixtures.new_fed().await;
+    let gw = gateway(&fixtures, &fed).await;
+    let (client1, client2) = fed.two_clients().await;
+    let client2_dummy_module = client2.get_first_module::<DummyClientModule>();
+
+    // Print money for client2
+    let (op, outpoint) = client2_dummy_module.print_money(sats(1000)).await?;
+    client2.await_primary_module_output(op, outpoint).await?;
+
+    // generate a new keypair
+    let keypair = KeyPair::new_global(&mut OsRng);
+
+    let ln_module = client1.get_first_module::<LightningClientModule>();
+    let ln_gateway = ln_module.select_gateway(&gw.gateway.gateway_id).await;
+    let desc = Description::new("with-gateway-hint-tweaked".to_string())?;
+    let (op, invoice, _) = ln_module
+        .create_bolt11_invoice_for_user_tweaked(
+            sats(250),
+            Bolt11InvoiceDescription::Direct(&desc),
+            None,
+            keypair.public_key(),
+            1, // tweak with index 1
+            (),
+            ln_gateway,
+        )
+        .await?;
+    let mut sub1 = client1
+        .get_first_module::<LightningClientModule>()
+        .subscribe_ln_receive(op)
+        .await?
+        .into_stream();
+    assert_eq!(sub1.ok().await?, LnReceiveState::Created);
+    assert_matches!(sub1.ok().await?, LnReceiveState::WaitingForPayment { .. });
+
+    let OutgoingLightningPayment {
+        payment_type,
+        contract_id: _,
+        fee: _,
+    } = pay_invoice(&client2, invoice, Some(gw.gateway.gateway_id)).await?;
+    match payment_type {
+        PayType::Internal(op_id) => {
+            let mut sub2 = client2
+                .get_first_module::<LightningClientModule>()
+                .subscribe_internal_pay(op_id)
+                .await?
+                .into_stream();
+            assert_eq!(sub2.ok().await?, InternalPayState::Funding);
+            assert_matches!(sub2.ok().await?, InternalPayState::Preimage { .. });
+            // goes from preimage to immediate claim because it is for another user
+            assert_eq!(sub1.ok().await?, LnReceiveState::Claimed);
+        }
+        _ => panic!("Expected internal payment!"),
+    }
+
+    // Create a new client and try to receive the locked payment
+    let new_client = fed.new_client().await;
+    let new_ln_module = new_client.get_first_module::<LightningClientModule>();
+    let claims = new_ln_module
+        .scan_receive_for_user_tweaked(keypair, vec![1], ())
+        .await;
+    for operation_id in claims {
+        let mut sub3 = new_ln_module
+            .subscribe_ln_claim(operation_id)
+            .await?
+            .into_stream();
+        assert_eq!(sub3.ok().await?, LnReceiveState::AwaitingFunds);
+        assert_eq!(sub3.ok().await?, LnReceiveState::Claimed);
+    }
+    assert_eq!(new_client.get_balance().await, sats(250));
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn rejects_wrong_network_invoice() -> anyhow::Result<()> {
     let fixtures = fixtures();
     let fed = fixtures.new_fed().await;
+    let gw = gateway(&fixtures, &fed).await;
     let client1 = fed.new_client().await;
-    gateway(&fixtures, &fed).await;
 
     // Signet invoice should fail on regtest
     let signet_invoice = Bolt11Invoice::from_str(
@@ -469,7 +649,9 @@ async fn rejects_wrong_network_invoice() -> anyhow::Result<()> {
     )
     .unwrap();
 
-    let error = pay_invoice(&client1, signet_invoice).await.unwrap_err();
+    let error = pay_invoice(&client1, signet_invoice, Some(gw.gateway.gateway_id))
+        .await
+        .unwrap_err();
     assert_eq!(
         error.to_string(),
         "Invalid invoice currency: expected=Regtest, got=Signet"
@@ -481,28 +663,24 @@ async fn rejects_wrong_network_invoice() -> anyhow::Result<()> {
 #[cfg(test)]
 mod fedimint_migration_tests {
     use std::str::FromStr;
-    use std::time::SystemTime;
+    use std::time::Duration;
 
-    use anyhow::{ensure, Context};
+    use anyhow::ensure;
     use bitcoin_hashes::{sha256, Hash};
     use fedimint_client::module::init::DynClientModuleInit;
-    use fedimint_client::module::ClientModule;
-    use fedimint_core::core::{OperationId, LEGACY_HARDCODED_INSTANCE_ID_LN};
+    use fedimint_core::core::OperationId;
     use fedimint_core::db::{
-        apply_migrations, DatabaseTransaction, DatabaseVersion, DatabaseVersionKey,
-        IDatabaseTransactionOpsCoreTyped,
+        Database, DatabaseVersion, DatabaseVersionKeyV0, IDatabaseTransactionOpsCoreTyped,
     };
     use fedimint_core::encoding::Encodable;
-    use fedimint_core::module::registry::ModuleDecoderRegistry;
-    use fedimint_core::module::{CommonModuleInit, DynServerModuleInit};
+    use fedimint_core::module::DynServerModuleInit;
     use fedimint_core::util::SafeUrl;
-    use fedimint_core::{Amount, OutPoint, PeerId, ServerModule, TransactionId};
-    use fedimint_ln_client::db::{
-        MetaOverrides, MetaOverridesKey, MetaOverridesPrefix, PaymentResult, PaymentResultKey,
-        PaymentResultPrefix,
-    };
+    use fedimint_core::{Amount, OutPoint, PeerId, TransactionId};
+    use fedimint_ln_client::db::{PaymentResult, PaymentResultKey, PaymentResultPrefix};
+    use fedimint_ln_client::receive::LightningReceiveStates;
     use fedimint_ln_client::{
-        LightningClientInit, LightningClientModule, OutgoingLightningPayment,
+        LightningClientInit, LightningClientModule, LightningClientStateMachines,
+        OutgoingLightningPayment, ReceivingKey,
     };
     use fedimint_ln_common::contracts::incoming::{
         FundedIncomingContract, IncomingContract, IncomingContractOffer, OfferId,
@@ -511,7 +689,12 @@ mod fedimint_migration_tests {
         outgoing, ContractId, DecryptedPreimage, EncryptedPreimage, FundedContract,
         PreimageDecryptionShare, PreimageKey,
     };
-    use fedimint_ln_common::db::{
+    use fedimint_ln_common::route_hints::{RouteHint, RouteHintHop};
+    use fedimint_ln_common::{
+        ContractAccount, LightningCommonInit, LightningGateway, LightningGatewayRegistration,
+        LightningOutputOutcomeV0,
+    };
+    use fedimint_ln_server::db::{
         AgreedDecryptionShareKey, AgreedDecryptionShareKeyPrefix, BlockCountVoteKey,
         BlockCountVotePrefix, ContractKey, ContractKeyPrefix, ContractUpdateKey,
         ContractUpdateKeyPrefix, DbKeyPrefix, EncryptedPreimageIndexKey,
@@ -519,21 +702,17 @@ mod fedimint_migration_tests {
         LightningGatewayKey, LightningGatewayKeyPrefix, OfferKey, OfferKeyPrefix,
         ProposeDecryptionShareKey, ProposeDecryptionShareKeyPrefix,
     };
-    use fedimint_ln_common::route_hints::{RouteHint, RouteHintHop};
-    use fedimint_ln_common::{
-        ContractAccount, LightningCommonInit, LightningGateway, LightningGatewayRegistration,
-        LightningOutputOutcomeV0,
-    };
-    use fedimint_ln_server::Lightning;
     use fedimint_logging::TracingSetup;
     use fedimint_testing::db::{
-        prepare_db_migration_snapshot, validate_migrations, BYTE_32, BYTE_33, BYTE_8, STRING_64,
+        snapshot_db_migrations, snapshot_db_migrations_client, validate_migrations_client,
+        validate_migrations_server, BYTE_32, BYTE_33, BYTE_8, STRING_64, TEST_MODULE_INSTANCE_ID,
     };
     use futures::StreamExt;
-    use lightning_invoice::RoutingFees;
+    use lightning_invoice::{Currency, InvoiceBuilder, PaymentSecret, RoutingFees};
     use rand::distributions::Standard;
     use rand::prelude::Distribution;
     use rand::rngs::OsRng;
+    use secp256k1::{All, KeyPair, Secp256k1, SecretKey};
     use strum::IntoEnumIterator;
     use threshold_crypto::G1Projective;
     use tracing::info;
@@ -546,8 +725,11 @@ mod fedimint_migration_tests {
     /// in future code versions. This function should not be updated when
     /// database keys/values change - instead a new function should be added
     /// that creates a new database backup that can be tested.
-    async fn create_server_db_with_v0_data(mut dbtx: DatabaseTransaction<'_>) {
-        dbtx.insert_new_entry(&DatabaseVersionKey, &DatabaseVersion(0))
+    async fn create_server_db_with_v0_data(db: Database) {
+        let mut dbtx = db.begin_transaction().await;
+
+        // Will be migrated to `DatabaseVersionKey` during `apply_migrations`
+        dbtx.insert_new_entry(&DatabaseVersionKeyV0, &DatabaseVersion(0))
             .await;
 
         let contract_id = ContractId::from_str(STRING_64).unwrap();
@@ -663,10 +845,15 @@ mod fedimint_migration_tests {
             &amount,
         )
         .await;
+
+        dbtx.commit_tx().await;
     }
 
-    async fn create_client_db_with_v0_data(mut dbtx: DatabaseTransaction<'_>) {
-        dbtx.insert_new_entry(&DatabaseVersionKey, &DatabaseVersion(0))
+    async fn create_client_db_with_v0_data(db: Database) {
+        let mut dbtx = db.begin_transaction().await;
+
+        // Will be migrated to `DatabaseVersionKey` during `apply_migrations`
+        dbtx.insert_new_entry(&DatabaseVersionKeyV0, &DatabaseVersion(0))
             .await;
 
         // Generate fake private/public key
@@ -701,11 +888,17 @@ mod fedimint_migration_tests {
         let lightning_gateway_registration = LightningGatewayRegistration {
             info: gateway_info,
             vetted: false,
-            valid_until: SystemTime::now(),
+            valid_until: fedimint_core::time::now(),
         };
 
         dbtx.insert_new_entry(
-            &fedimint_ln_client::db::LightningGatewayKey,
+            &fedimint_ln_client::db::ActiveGatewayKey,
+            &lightning_gateway_registration,
+        )
+        .await;
+
+        dbtx.insert_new_entry(
+            &fedimint_ln_client::db::LightningGatewayKey(pk),
             &lightning_gateway_registration,
         )
         .await;
@@ -725,55 +918,139 @@ mod fedimint_migration_tests {
         )
         .await;
 
-        dbtx.insert_new_entry(
-            &MetaOverridesKey,
-            &MetaOverrides {
-                value: "META OVERRIDE".to_string(),
-                fetched_at: SystemTime::now(),
-            },
+        dbtx.commit_tx().await;
+    }
+
+    fn create_client_states() -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        let secp: Secp256k1<All> = Secp256k1::gen_new();
+        let invoice = InvoiceBuilder::new(Currency::Regtest)
+            .amount_milli_satoshis(1000)
+            .payment_hash(sha256::Hash::hash(&BYTE_32))
+            .description("".to_string())
+            .payment_secret(PaymentSecret([0; 32]))
+            .current_timestamp()
+            .min_final_cltv_expiry_delta(18)
+            .expiry_time(Duration::from_secs(86400))
+            .build_signed(|m| secp.sign_ecdsa_recoverable(m, &SecretKey::new(&mut OsRng)))
+            .expect("Invoice creation failed");
+
+        // Create an active state and inactive state that will not be migrated.
+        let operation_id = OperationId::new_random();
+        let submitted_offer_variant_new = {
+            let mut submitted_offer_variant = Vec::<u8>::new();
+            TransactionId::all_zeros()
+                .consensus_encode(&mut submitted_offer_variant)
+                .expect("TransactionId is encodable");
+            invoice
+                .consensus_encode(&mut submitted_offer_variant)
+                .expect("Invoice is encodable");
+            let receiving_key = ReceivingKey::Personal(KeyPair::new_global(&mut OsRng));
+            receiving_key
+                .consensus_encode(&mut submitted_offer_variant)
+                .expect("ReceivingKey is encodable");
+
+            submitted_offer_variant
+        };
+        let new_receive_bytes =
+            create_receive_state_machine(submitted_offer_variant_new, operation_id, 0);
+
+        // Create and active state and inactive state that will be migrated.
+        let submitted_offer_variant_old = {
+            let mut submitted_offer_variant = Vec::<u8>::new();
+            TransactionId::all_zeros()
+                .consensus_encode(&mut submitted_offer_variant)
+                .expect("TransactionId is encodable");
+            invoice
+                .consensus_encode(&mut submitted_offer_variant)
+                .expect("Invoice is encodable");
+            let keypair = KeyPair::new_global(&mut OsRng);
+            keypair
+                .consensus_encode(&mut submitted_offer_variant)
+                .expect("Keypair is encodable");
+
+            submitted_offer_variant
+        };
+        let old_receive_bytes =
+            create_receive_state_machine(submitted_offer_variant_old, operation_id, 0);
+
+        let confirmed_offer_variant_old = {
+            let mut confirmed_variant = Vec::<u8>::new();
+            invoice
+                .consensus_encode(&mut confirmed_variant)
+                .expect("Invoice is encodable");
+            let keypair = KeyPair::new_global(&mut OsRng);
+            keypair
+                .consensus_encode(&mut confirmed_variant)
+                .expect("Keypair is encodable");
+            confirmed_variant
+        };
+        let old_confirmed_bytes =
+            create_receive_state_machine(confirmed_offer_variant_old, operation_id, 2);
+
+        (
+            vec![
+                old_receive_bytes.clone(),
+                new_receive_bytes.clone(),
+                old_confirmed_bytes.clone(),
+            ],
+            vec![old_receive_bytes, new_receive_bytes, old_confirmed_bytes],
         )
-        .await;
+    }
+
+    /// Creates a vector of bytes that contains consensus encoded
+    /// `LightningClientStateMachines::Receive` state machine. `sm_state` is
+    /// the u64 representation of the state enum.
+    fn create_receive_state_machine(
+        state: Vec<u8>,
+        operation_id: OperationId,
+        sm_state: u64,
+    ) -> Vec<u8> {
+        let receive_variant = {
+            let mut receive_variant = Vec::<u8>::new();
+            operation_id
+                .consensus_encode(&mut receive_variant)
+                .expect("OperationId is encodable");
+            sm_state
+                .consensus_encode(&mut receive_variant)
+                .expect("u64 is encodable");
+            state
+                .consensus_encode(&mut receive_variant)
+                .expect("State is encodable");
+            receive_variant
+        };
+
+        let mut sm_bytes = Vec::<u8>::new();
+        TEST_MODULE_INSTANCE_ID
+            .consensus_encode(&mut sm_bytes)
+            .expect("u16 is encodable");
+        2u64.consensus_encode(&mut sm_bytes)
+            .expect("u64 is encodable"); // Receive state machine variant
+        receive_variant
+            .consensus_encode(&mut sm_bytes)
+            .expect("receive variant is encodable");
+        sm_bytes
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn prepare_server_db_migration_snapshots() -> anyhow::Result<()> {
-        prepare_db_migration_snapshot(
-            "lightning-server-v0",
-            |dbtx| {
-                Box::pin(async move {
-                    create_server_db_with_v0_data(dbtx).await;
-                })
-            },
-            ModuleDecoderRegistry::from_iter([(
-                LEGACY_HARDCODED_INSTANCE_ID_LN,
-                LightningCommonInit::KIND,
-                <Lightning as ServerModule>::decoder(),
-            )]),
-        )
+    async fn snapshot_server_db_migrations() -> anyhow::Result<()> {
+        snapshot_db_migrations::<_, LightningCommonInit>("lightning-server-v0", |db| {
+            Box::pin(async move {
+                create_server_db_with_v0_data(db).await;
+            })
+        })
         .await
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_migrations() -> anyhow::Result<()> {
+    async fn test_server_db_migrations() -> anyhow::Result<()> {
         let _ = TracingSetup::default().init();
+        let module = DynServerModuleInit::from(LightningInit);
 
-        validate_migrations(
+        validate_migrations_server(
+            module,
             "lightning-server",
             |db| async move {
-                let module = DynServerModuleInit::from(LightningInit);
-                apply_migrations(
-                    &db,
-                    module.module_kind().to_string(),
-                    module.database_version(),
-                    module.get_database_migrations(),
-                )
-                .await
-                .context("Error applying migrations to temp database")?;
-
-                // Verify that all of the data from the lightning namespace can be read. If a
-                // database migration failed or was not properly supplied,
-                // the struct will fail to be read.
-                let mut dbtx = db.begin_transaction().await;
+                let mut dbtx = db.begin_transaction_nc().await;
 
                 for prefix in DbKeyPrefix::iter() {
                     match prefix {
@@ -788,6 +1065,7 @@ mod fedimint_migration_tests {
                                 num_contracts > 0,
                                 "validate_migrations was not able to read any contracts"
                             );
+                            info!("Validated Contracts");
                         }
                         DbKeyPrefix::AgreedDecryptionShare => {
                             let agreed_decryption_shares = dbtx
@@ -800,6 +1078,7 @@ mod fedimint_migration_tests {
                                 num_shares > 0,
                                 "validate_migrations was not able to read any AgreedDecryptionShares"
                             );
+                            info!("Validated AgreedDecryptionShares");
                         }
                         DbKeyPrefix::ContractUpdate => {
                             let contract_updates = dbtx
@@ -812,6 +1091,7 @@ mod fedimint_migration_tests {
                                 num_updates > 0,
                                 "validate_migrations was not able to read any ContractUpdates"
                             );
+                            info!("Validated ContractUpdates");
                         }
                         DbKeyPrefix::LightningGateway => {
                             let gateways = dbtx
@@ -824,6 +1104,7 @@ mod fedimint_migration_tests {
                                 num_gateways > 0,
                                 "validate_migrations was not able to read any LightningGateways"
                             );
+                            info!("Validated LightningGateway");
                         }
                         DbKeyPrefix::Offer => {
                             let offers = dbtx
@@ -836,6 +1117,7 @@ mod fedimint_migration_tests {
                                 num_offers > 0,
                                 "validate_migrations was not able to read any Offers"
                             );
+                            info!("Validated Offer");
                         }
                         DbKeyPrefix::ProposeDecryptionShare => {
                             let proposed_decryption_shares = dbtx
@@ -848,6 +1130,7 @@ mod fedimint_migration_tests {
                                 num_shares > 0,
                                 "validate_migrations was not able to read any ProposeDecryptionShares"
                             );
+                            info!("Validated ProposeDecryptionShare");
                         }
                         DbKeyPrefix::BlockCountVote => {
                             let block_count_vote = dbtx
@@ -860,6 +1143,7 @@ mod fedimint_migration_tests {
                                 num_votes > 0,
                                 "validate_migrations was not able to read any BlockCountVote"
                             );
+                            info!("Validated BlockCountVote");
                         }
                         DbKeyPrefix::EncryptedPreimageIndex => {
                             let encrypted_preimage_index = dbtx
@@ -872,6 +1156,7 @@ mod fedimint_migration_tests {
                                 num_shares > 0,
                                 "validate_migrations was not able to read any EncryptedPreimageIndexKeys"
                             );
+                            info!("Validated EncryptedPreimageIndex");
                         }
                         DbKeyPrefix::LightningAuditItem => {
                             let audit_keys = dbtx
@@ -885,67 +1170,48 @@ mod fedimint_migration_tests {
                                 num_audit_items == 2,
                                 "validate_migrations was not able to read both LightningAuditItemKeys"
                             );
+                            info!("Validated LightningAuditItem");
                         }
                     }
                 }
+
                 Ok(())
-            },
-            ModuleDecoderRegistry::from_iter([(
-                LEGACY_HARDCODED_INSTANCE_ID_LN,
-                LightningCommonInit::KIND,
-                <Lightning as ServerModule>::decoder(),
-            )]),
-        )
-        .await
+            }
+        ).await
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn prepare_client_db_migration_snapshots() -> anyhow::Result<()> {
-        prepare_db_migration_snapshot(
+    async fn snapshot_client_db_migrations() -> anyhow::Result<()> {
+        snapshot_db_migrations_client::<_, _, LightningCommonInit>(
             "lightning-client-v0",
-            |dbtx| Box::pin(async move { create_client_db_with_v0_data(dbtx).await }),
-            ModuleDecoderRegistry::from_iter([(
-                LEGACY_HARDCODED_INSTANCE_ID_LN,
-                LightningCommonInit::KIND,
-                <LightningClientModule as ClientModule>::decoder(),
-            )]),
+            |db| Box::pin(async move { create_client_db_with_v0_data(db).await }),
+            create_client_states,
         )
         .await
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_client_migrations() -> anyhow::Result<()> {
-        TracingSetup::default().init()?;
+    async fn test_client_db_migrations() -> anyhow::Result<()> {
+        let _ = TracingSetup::default().init();
 
-        validate_migrations(
+        let module = DynClientModuleInit::from(LightningClientInit);
+        validate_migrations_client::<_, _, LightningClientModule>(
+            module,
             "lightning-client",
-            |db| async move {
-                let module = DynClientModuleInit::from(LightningClientInit);
-                apply_migrations(
-                    &db,
-                    LightningCommonInit::KIND.to_string(),
-                    module.database_version(),
-                    module.get_database_migrations(),
-                )
-                .await
-                .context("Error applying migrations to client database")?;
-
-                let mut dbtx = db.begin_transaction().await;
+            |db, active_states, inactive_states| async move {
+                let mut dbtx = db.begin_transaction_nc().await;
 
                 for prefix in fedimint_ln_client::db::DbKeyPrefix::iter() {
                     match prefix {
-                        fedimint_ln_client::db::DbKeyPrefix::LightningGateway => {
-                            let gateways = dbtx
-                                .find_by_prefix(&fedimint_ln_client::db::LightningGatewayKeyPrefix)
-                                .await
-                                .collect::<Vec<_>>()
+                        fedimint_ln_client::db::DbKeyPrefix::ActiveGateway => {
+                            // Active gateway is deprecated, there should be no records
+                            let active_gateway = dbtx
+                                .get_value(&fedimint_ln_client::db::ActiveGatewayKey)
                                 .await;
-                            let num_gateways = gateways.len();
                             ensure!(
-                                num_gateways > 0,
-                                "validate_migrations was not able to read any LightningGateways"
+                                active_gateway.is_none(),
+                                "validate migrations found an active gateway"
                             );
-                            info!("Validated LightningGateways");
                         }
                         fedimint_ln_client::db::DbKeyPrefix::PaymentResult => {
                             let payment_results = dbtx
@@ -960,29 +1226,60 @@ mod fedimint_migration_tests {
                             );
                             info!("Validated PaymentResults");
                         }
-                        fedimint_ln_client::db::DbKeyPrefix::MetaOverrides => {
-                            let meta_overrides = dbtx
-                                .find_by_prefix(&MetaOverridesPrefix)
+                        fedimint_ln_client::db::DbKeyPrefix::MetaOverridesDeprecated => {
+                            // MetaOverrides is never read anywhere
+                        }
+                        fedimint_ln_client::db::DbKeyPrefix::LightningGateway => {
+                            let gateways = dbtx
+                                .find_by_prefix(&LightningGatewayKeyPrefix)
                                 .await
                                 .collect::<Vec<_>>()
                                 .await;
-                            let num_meta_overrides = meta_overrides.len();
+                            let num_gateways = gateways.len();
                             ensure!(
-                                num_meta_overrides > 0,
-                                "validate_migrations was not able to read any MetaOverrides"
+                                num_gateways > 0,
+                                "validate_migrations was not able to read any LightningGateways"
                             );
-                            info!("Validated MetaOverrides");
+                            info!("Validated LightningGateways");
                         }
                     }
                 }
 
+                // Verify that after the state machine migrations, there is two `SubmittedOffer` state and no `SubmittedOfferV0` states.
+                let mut input_count = 0;
+                let mut confirmed_count = 0;
+                for active_state in active_states {
+                    if let LightningClientStateMachines::Receive(machine) = active_state {
+                        match machine.state {
+                            LightningReceiveStates::SubmittedOffer(_) => input_count += 1,
+                            LightningReceiveStates::ConfirmedInvoice(_) => confirmed_count += 1,
+                            _ => panic!("State machine migration failed, active states contain unexpected state"),
+                        }
+                    }
+                }
+
+                // expecting two, one starting in `SubmittedOffer` and one from migrated from `SubmittedOfferV0`
+                ensure!(input_count == 2, "Expecting two `SubmittedOffer` active state, found {input_count}");
+                ensure!(confirmed_count == 1, "Expecting one `ConfirmedInvoice` active state, found {confirmed_count}");
+
+                let mut input_count = 0;
+                let mut confirmed_count = 0;
+                for inactive_state in inactive_states {
+                    if let LightningClientStateMachines::Receive(machine) = inactive_state {
+                        match machine.state {
+                            LightningReceiveStates::SubmittedOffer(_) => input_count += 1,
+                            LightningReceiveStates::ConfirmedInvoice(_) => confirmed_count += 1,
+                            _ => panic!("State machine migration failed, active states contain unexpected state"),
+                        }
+                    }
+                }
+
+                // expecting two, one starting in `SubmittedOffer` and one from migrated from `SubmittedOfferV0`
+                ensure!(input_count == 2, "Expecting two `SubmittedOffer` inactive state, found {input_count}");
+                ensure!(confirmed_count == 1, "Expecting two `ConfirmedInvoice` inactive state, found {confirmed_count}");
+
                 Ok(())
             },
-            ModuleDecoderRegistry::from_iter([(
-                LEGACY_HARDCODED_INSTANCE_ID_LN,
-                LightningCommonInit::KIND,
-                <LightningClientModule as ClientModule>::decoder(),
-            )]),
         )
         .await
     }

@@ -1,9 +1,7 @@
 use std::collections::BTreeMap;
-use std::iter::FromIterator;
 
 use fedimint_core::Amount;
 use serde::{Deserialize, Serialize};
-use tbs::{PublicKeyShare, SecretKeyShare};
 
 use crate::encoding::{Decodable, DecodeError, Encodable};
 use crate::module::registry::ModuleDecoderRegistry;
@@ -85,18 +83,8 @@ impl<T> Tiered<T> {
     }
 }
 
-impl Tiered<SecretKeyShare> {
-    pub fn to_public(&self) -> Tiered<PublicKeyShare> {
-        Tiered(
-            self.iter()
-                .map(|(amt, key)| (amt, key.to_pub_key_share()))
-                .collect(),
-        )
-    }
-}
-
 impl Tiered<()> {
-    /// Generates denominations of a give base up to and including `max`
+    /// Generates denominations of a given base up to and including `max`
     pub fn gen_denominations(denomination_base: u16, max: Amount) -> Tiered<()> {
         let mut amounts = vec![];
 

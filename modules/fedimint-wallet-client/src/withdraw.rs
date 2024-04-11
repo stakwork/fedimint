@@ -19,7 +19,7 @@ const RETRY_DELAY: Duration = Duration::from_secs(1);
 /// graph LR
 ///     Created --> Success
 ///     Created --> Aborted
-#[derive(Debug, Clone, Eq, PartialEq, Decodable, Encodable)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Decodable, Encodable)]
 pub struct WithdrawStateMachine {
     pub(crate) operation_id: OperationId,
     pub(crate) state: WithdrawStates,
@@ -27,12 +27,11 @@ pub struct WithdrawStateMachine {
 
 impl State for WithdrawStateMachine {
     type ModuleContext = WalletClientContext;
-    type GlobalContext = DynGlobalClientContext;
 
     fn transitions(
         &self,
         context: &Self::ModuleContext,
-        global_context: &Self::GlobalContext,
+        global_context: &DynGlobalClientContext,
     ) -> Vec<StateTransition<Self>> {
         match &self.state {
             WithdrawStates::Created(created) => {
@@ -67,7 +66,7 @@ async fn await_withdraw_processed(
     created: CreatedWithdrawState,
 ) -> Result<Txid, String> {
     global_context
-        .await_tx_accepted(operation_id, created.fm_outpoint.txid)
+        .await_tx_accepted(created.fm_outpoint.txid)
         .await?;
 
     loop {
@@ -93,9 +92,12 @@ async fn await_withdraw_processed(
 
                 e.report_if_important();
                 debug!(
-                    "Awaiting output outcome failed, retrying in {}s",
+                    error = e.to_string(),
+                    operation_id = operation_id.to_string(),
+                    "Retrying in {}s",
                     RETRY_DELAY.as_secs_f64()
                 );
+
                 sleep(RETRY_DELAY).await;
             }
         }
@@ -123,24 +125,24 @@ async fn transition_withdraw_processed(
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Decodable, Encodable)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Decodable, Encodable)]
 pub enum WithdrawStates {
     Created(CreatedWithdrawState),
     Success(SuccessWithdrawState),
     Aborted(AbortedWithdrawState),
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Decodable, Encodable)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Decodable, Encodable)]
 pub struct CreatedWithdrawState {
     pub(crate) fm_outpoint: OutPoint,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Decodable, Encodable)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Decodable, Encodable)]
 pub struct SuccessWithdrawState {
     pub(crate) txid: Txid,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Decodable, Encodable)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Decodable, Encodable)]
 pub struct AbortedWithdrawState {
     pub(crate) error: String,
 }

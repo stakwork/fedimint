@@ -24,8 +24,9 @@
 //! interaction is required to drive them forward.
 //!
 //! ### State Machine Contexts
-//! State machines have access to both a [global context](sm::GlobalContext) as
-//! well as to a [module-specific context](module::ClientModule::context).
+//! State machines have access to both a [global
+//! context](`DynGlobalClientContext`) as well as to a [module-specific
+//! context](module::ClientModule::context).
 //!
 //! The global context provides access to the federation API and allows to claim
 //! module outputs (and transferring the value into the client's wallet), which
@@ -71,7 +72,6 @@ use std::collections::{BTreeMap, HashSet};
 use std::fmt::{Debug, Formatter};
 use std::ops::{self, Range};
 use std::pin::Pin;
-use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -79,13 +79,12 @@ use anyhow::{anyhow, bail, ensure, Context};
 use async_stream::stream;
 use backup::ClientBackup;
 use db::{
-    CachedApiVersionSet, CachedApiVersionSetKey, ClientConfigKey, ClientConfigKeyPrefix,
-    ClientInitStateKey, ClientInviteCodeKey, ClientInviteCodeKeyPrefix, ClientModuleRecovery,
-    EncodedClientSecretKey, InitMode,
+    apply_migrations_client, CachedApiVersionSet, CachedApiVersionSetKey, ClientConfigKey,
+    ClientConfigKeyPrefix, ClientInitStateKey, ClientModuleRecovery, EncodedClientSecretKey,
+    InitMode,
 };
-use fedimint_core::api::{
-    ApiVersionSet, DynGlobalApi, DynModuleApi, IGlobalFederationApi, InviteCode,
-};
+use envs::get_discover_api_version_timeout;
+use fedimint_core::api::{ApiVersionSet, DynGlobalApi, DynModuleApi, IGlobalFederationApi};
 use fedimint_core::config::{
     ClientConfig, ClientModuleConfig, FederationId, JsonClientConfig, JsonWithKind,
     ModuleInitRegistry,
@@ -94,26 +93,27 @@ use fedimint_core::core::{
     DynInput, DynOutput, IInput, IOutput, ModuleInstanceId, ModuleKind, OperationId,
 };
 use fedimint_core::db::{
-    apply_migrations, AutocommitError, Database, DatabaseTransaction,
-    IDatabaseTransactionOpsCoreTyped,
+    AutocommitError, Database, DatabaseTransaction, IDatabaseTransactionOpsCoreTyped,
 };
 use fedimint_core::encoding::{Decodable, Encodable};
 use fedimint_core::module::registry::ModuleDecoderRegistry;
 use fedimint_core::module::{
-    ApiVersion, MultiApiVersion, SupportedApiVersionsSummary, SupportedCoreApiVersions,
+    ApiAuth, ApiVersion, MultiApiVersion, SupportedApiVersionsSummary, SupportedCoreApiVersions,
     SupportedModuleApiVersions,
 };
-use fedimint_core::task::{sleep, MaybeSend, MaybeSync, TaskGroup};
+use fedimint_core::task::{MaybeSend, MaybeSync, TaskGroup};
 use fedimint_core::transaction::Transaction;
 use fedimint_core::util::{BoxStream, NextOrPending};
 use fedimint_core::{
-    apply, async_trait_maybe_send, dyn_newtype_define, maybe_add_send, maybe_add_send_sync, Amount,
-    OutPoint, TransactionId,
+    apply, async_trait_maybe_send, dyn_newtype_define, fedimint_build_code_version_env,
+    maybe_add_send, maybe_add_send_sync, runtime, Amount, NumPeers, OutPoint, PeerId,
+    TransactionId,
 };
 pub use fedimint_derive_secret as derivable_secret;
 use fedimint_derive_secret::DerivableSecret;
-use fedimint_logging::LOG_CLIENT;
-use futures::{Future, StreamExt};
+use fedimint_logging::{LOG_CLIENT, LOG_CLIENT_RECOVERY};
+use futures::{Future, Stream, StreamExt};
+use meta::{LegacyMetaSource, MetaService};
 use module::recovery::RecoveryProgress;
 use module::{DynClientModule, FinalClient};
 use rand::thread_rng;
@@ -123,6 +123,7 @@ use thiserror::Error;
 #[cfg(not(target_family = "wasm"))]
 use tokio::runtime::{Handle as RuntimeHandle, RuntimeFlavor};
 use tokio::sync::watch;
+use tokio_stream::wrappers::WatchStream;
 use tracing::{debug, error, info, warn};
 
 use crate::backup::Metadata;
@@ -136,8 +137,7 @@ use crate::sm::executor::{
     ActiveOperationStateKeyPrefix, ContextGen, InactiveOperationStateKeyPrefix,
 };
 use crate::sm::{
-    ClientSMDatabaseTransaction, DynState, Executor, GlobalContext, IState, Notifier,
-    OperationState, State,
+    ClientSMDatabaseTransaction, DynState, Executor, IState, Notifier, OperationState, State,
 };
 use crate::transaction::{
     tx_submission_sm_decoder, ClientInput, ClientOutput, TransactionBuilder,
@@ -149,6 +149,8 @@ use crate::transaction::{
 pub mod backup;
 /// Database keys used by the client
 pub mod db;
+/// Environment variables
+pub mod envs;
 /// Module client interface definitions
 pub mod module;
 /// Operation log subsystem of the client
@@ -160,14 +162,17 @@ pub mod sm;
 /// Structs and interfaces to construct Fedimint transactions
 pub mod transaction;
 
+/// Management of meta fields
+pub mod meta;
+
 pub type InstancelessDynClientInput = ClientInput<
     Box<maybe_add_send_sync!(dyn IInput + 'static)>,
-    Box<maybe_add_send_sync!(dyn IState<DynGlobalClientContext> + 'static)>,
+    Box<maybe_add_send_sync!(dyn IState + 'static)>,
 >;
 
 pub type InstancelessDynClientOutput = ClientOutput<
     Box<maybe_add_send_sync!(dyn IOutput + 'static)>,
-    Box<maybe_add_send_sync!(dyn IState<DynGlobalClientContext> + 'static)>,
+    Box<maybe_add_send_sync!(dyn IState + 'static)>,
 >;
 
 #[derive(Debug, Error)]
@@ -176,6 +181,13 @@ pub enum AddStateMachinesError {
     StateAlreadyExists,
     #[error("Got {0}")]
     Other(#[from] anyhow::Error),
+}
+
+pub enum DiscoverCommonApiVersionMode {
+    /// Get the response from only a few peers, or until a timeout
+    Fast,
+    /// Try to get a response from all peers, or until a timeout
+    Full,
 }
 
 pub type AddStateMachinesResult = Result<(), AddStateMachinesError>;
@@ -221,13 +233,57 @@ pub trait IGlobalClientContext: Debug + MaybeSend + MaybeSync + 'static {
     async fn add_state_machine_dyn(
         &self,
         dbtx: &mut ClientSMDatabaseTransaction<'_, '_>,
-        sm: Box<maybe_add_send_sync!(dyn IState<DynGlobalClientContext>)>,
+        sm: Box<maybe_add_send_sync!(dyn IState)>,
     ) -> AddStateMachinesResult;
 
-    async fn transaction_update_stream(
+    async fn transaction_update_stream(&self) -> BoxStream<OperationState<TxSubmissionStates>>;
+}
+
+#[apply(async_trait_maybe_send!)]
+impl IGlobalClientContext for () {
+    fn module_api(&self) -> DynModuleApi {
+        unimplemented!("fake implementation, only for tests");
+    }
+
+    fn client_config(&self) -> &ClientConfig {
+        unimplemented!("fake implementation, only for tests");
+    }
+
+    fn api(&self) -> &DynGlobalApi {
+        unimplemented!("fake implementation, only for tests");
+    }
+
+    fn decoders(&self) -> &ModuleDecoderRegistry {
+        unimplemented!("fake implementation, only for tests");
+    }
+
+    async fn claim_input_dyn(
         &self,
-        operation_id: OperationId,
-    ) -> BoxStream<OperationState<TxSubmissionStates>>;
+        _dbtx: &mut ClientSMDatabaseTransaction<'_, '_>,
+        _input: InstancelessDynClientInput,
+    ) -> (TransactionId, Vec<OutPoint>) {
+        unimplemented!("fake implementation, only for tests");
+    }
+
+    async fn fund_output_dyn(
+        &self,
+        _dbtx: &mut ClientSMDatabaseTransaction<'_, '_>,
+        _output: InstancelessDynClientOutput,
+    ) -> anyhow::Result<(TransactionId, Vec<OutPoint>)> {
+        unimplemented!("fake implementation, only for tests");
+    }
+
+    async fn add_state_machine_dyn(
+        &self,
+        _dbtx: &mut ClientSMDatabaseTransaction<'_, '_>,
+        _sm: Box<maybe_add_send_sync!(dyn IState)>,
+    ) -> AddStateMachinesResult {
+        unimplemented!("fake implementation, only for tests");
+    }
+
+    async fn transaction_update_stream(&self) -> BoxStream<OperationState<TxSubmissionStates>> {
+        unimplemented!("fake implementation, only for tests");
+    }
 }
 
 dyn_newtype_define! {
@@ -238,12 +294,12 @@ dyn_newtype_define! {
 }
 
 impl DynGlobalClientContext {
-    pub async fn await_tx_accepted(
-        &self,
-        operation_id: OperationId,
-        query_txid: TransactionId,
-    ) -> Result<(), String> {
-        self.transaction_update_stream(operation_id)
+    pub fn new_fake() -> Self {
+        DynGlobalClientContext::from(())
+    }
+
+    pub async fn await_tx_accepted(&self, query_txid: TransactionId) -> Result<(), String> {
+        self.transaction_update_stream()
             .await
             .filter_map(|tx_update| {
                 std::future::ready(match tx_update.state {
@@ -273,7 +329,7 @@ impl DynGlobalClientContext {
     ) -> (TransactionId, Vec<OutPoint>)
     where
         I: IInput + MaybeSend + MaybeSync + 'static,
-        S: IState<DynGlobalClientContext> + MaybeSend + MaybeSync + 'static,
+        S: IState + MaybeSend + MaybeSync + 'static,
     {
         self.claim_input_dyn(
             dbtx,
@@ -301,7 +357,7 @@ impl DynGlobalClientContext {
     ) -> anyhow::Result<(TransactionId, Vec<OutPoint>)>
     where
         O: IOutput + MaybeSend + MaybeSync + 'static,
-        S: IState<DynGlobalClientContext> + MaybeSend + MaybeSync + 'static,
+        S: IState + MaybeSend + MaybeSync + 'static,
     {
         self.fund_output_dyn(
             dbtx,
@@ -322,17 +378,15 @@ impl DynGlobalClientContext {
         sm: S,
     ) -> AddStateMachinesResult
     where
-        S: State<GlobalContext = DynGlobalClientContext> + MaybeSend + MaybeSync + 'static,
+        S: State + MaybeSend + MaybeSync + 'static,
     {
         self.add_state_machine_dyn(dbtx, box_up_state(sm)).await
     }
 }
 
-fn states_to_instanceless_dyn<
-    S: IState<DynGlobalClientContext> + MaybeSend + MaybeSync + 'static,
->(
+fn states_to_instanceless_dyn<S: IState + MaybeSend + MaybeSync + 'static>(
     state_gen: StateGenerator<S>,
-) -> StateGenerator<Box<maybe_add_send_sync!(dyn IState<DynGlobalClientContext> + 'static)>> {
+) -> StateGenerator<Box<maybe_add_send_sync!(dyn IState + 'static)>> {
     Arc::new(move |txid, out_idx| {
         let states: Vec<S> = state_gen(txid, out_idx);
         states
@@ -344,9 +398,7 @@ fn states_to_instanceless_dyn<
 
 /// Not sure why I couldn't just directly call `Box::new` ins
 /// [`states_to_instanceless_dyn`], but this fixed it.
-fn box_up_state(
-    state: impl IState<DynGlobalClientContext> + 'static,
-) -> Box<maybe_add_send_sync!(dyn IState<DynGlobalClientContext> + 'static)> {
+fn box_up_state(state: impl IState + 'static) -> Box<maybe_add_send_sync!(dyn IState + 'static)> {
     Box::new(state)
 }
 
@@ -358,8 +410,6 @@ where
         DynGlobalClientContext { inner }
     }
 }
-
-impl GlobalContext for DynGlobalClientContext {}
 
 // TODO: impl `Debug` for `Client` and derive here
 impl Debug for Client {
@@ -439,7 +489,7 @@ impl IGlobalClientContext for ModuleGlobalClientContext {
     async fn add_state_machine_dyn(
         &self,
         dbtx: &mut ClientSMDatabaseTransaction<'_, '_>,
-        sm: Box<maybe_add_send_sync!(dyn IState<DynGlobalClientContext>)>,
+        sm: Box<maybe_add_send_sync!(dyn IState)>,
     ) -> AddStateMachinesResult {
         let state = DynState::from_parts(self.module_instance_id, sm);
 
@@ -449,20 +499,15 @@ impl IGlobalClientContext for ModuleGlobalClientContext {
             .await
     }
 
-    async fn transaction_update_stream(
-        &self,
-        operation_id: OperationId,
-    ) -> BoxStream<OperationState<TxSubmissionStates>> {
-        self.client.transaction_update_stream(operation_id).await
+    async fn transaction_update_stream(&self) -> BoxStream<OperationState<TxSubmissionStates>> {
+        self.client.transaction_update_stream(self.operation).await
     }
 }
 
 fn states_add_instance(
     module_instance_id: ModuleInstanceId,
-    state_gen: StateGenerator<
-        Box<maybe_add_send_sync!(dyn IState<DynGlobalClientContext> + 'static)>,
-    >,
-) -> StateGenerator<DynState<DynGlobalClientContext>> {
+    state_gen: StateGenerator<Box<maybe_add_send_sync!(dyn IState + 'static)>>,
+) -> StateGenerator<DynState> {
     Arc::new(move |txid, out_idx| {
         let states = state_gen(txid, out_idx);
         Iterator::collect(
@@ -473,63 +518,142 @@ fn states_add_instance(
     })
 }
 
-/// Atomically-counted ([`Arc`]) handle to [`Client`]
+/// User handle to [`Client`]
 ///
-/// Notably it `deref`-s to the [`Client`] where most
+/// On the drop of [`ClientHandle`] the client will be shut-down, and resources
+/// it used freed.
+///
+/// Notably it [`ops::Deref`]s to the [`Client`] where most
 /// methods live.
+///
+/// Put this in an Arc to clone it.
 #[derive(Debug)]
-pub struct ClientArc {
-    // Use [`ClientArc::new`] instead
-    inner: Arc<Client>,
-
-    __use_constructor_to_create: (),
+pub struct ClientHandle {
+    inner: Option<Arc<Client>>,
 }
 
-impl ClientArc {
+pub type ClientHandleArc = Arc<ClientHandle>;
+
+impl ClientHandle {
     /// Create
     fn new(inner: Arc<Client>) -> Self {
-        inner
-            .client_count
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Self {
-            inner,
-            // this is the constructor
-            __use_constructor_to_create: (),
+        ClientHandle {
+            inner: inner.into(),
         }
+    }
+
+    fn as_inner(&self) -> &Arc<Client> {
+        self.inner.as_ref().expect("Inner always set")
+    }
+
+    pub async fn start_executor(&self) {
+        self.as_inner().start_executor().await
+    }
+
+    /// Shutdown the client.
+    pub async fn shutdown(mut self) {
+        self.shutdown_inner().await
+    }
+
+    async fn shutdown_inner(&mut self) {
+        let Some(inner) = self.inner.take() else {
+            error!("ClientHandleShared::shutdown called twice");
+            return;
+        };
+        inner.executor.stop_executor();
+        let db = inner.db.clone();
+        debug!(target: LOG_CLIENT, "Waiting for client task group to shut down");
+        if let Err(err) = inner
+            .task_group
+            .clone()
+            .shutdown_join_all(Some(Duration::from_secs(30)))
+            .await
+        {
+            warn!(target: LOG_CLIENT, %err, "Error waiting for client task group to shut down");
+        }
+
+        let client_strong_count = Arc::strong_count(&inner);
+        debug!(target: LOG_CLIENT, "Dropping last handle to Client");
+        // We are sure that no background tasks are running in the client anymore, so we
+        // can drop the (usually) last inner reference.
+        drop(inner);
+
+        if client_strong_count != 1 {
+            debug!(target: LOG_CLIENT, count = client_strong_count - 1, LOG_CLIENT, "External Client references remaining after last handle dropped");
+        }
+
+        let db_strong_count = db.strong_count();
+        if db_strong_count != 1 {
+            debug!(target: LOG_CLIENT, count = db_strong_count - 1, "External DB references remaining after last handle dropped");
+        }
+    }
+
+    /// Restart the client
+    ///
+    /// Returns false if there are other clones of [`ClientHandle`], or starting
+    /// the client again failed for some reason.
+    ///
+    /// Notably it will re-use the original [`Database`] handle, and not attempt
+    /// to open it again.
+    pub async fn restart(self) -> anyhow::Result<ClientHandle> {
+        let (builder, config, root_secret) = {
+            let client = self
+                .inner
+                .as_ref()
+                .ok_or_else(|| anyhow::format_err!("Already stopped"))?;
+            let builder = ClientBuilder::from_existing(client);
+            let config = client.config.clone();
+            let root_secret = client.root_secret.clone();
+
+            (builder, config, root_secret)
+        };
+        self.shutdown().await;
+
+        builder.build(root_secret, config, false).await
     }
 }
 
-impl ops::Deref for ClientArc {
-    type Target = Arc<Client>;
+impl ops::Deref for ClientHandle {
+    type Target = Client;
 
     fn deref(&self) -> &Self::Target {
-        &self.inner
+        self.inner.as_ref().expect("Must have inner client set")
     }
 }
 
-impl ClientArc {
-    pub fn downgrade(&self) -> ClientWeak {
+impl ClientHandle {
+    pub(crate) fn downgrade(&self) -> ClientWeak {
         ClientWeak {
-            inner: Arc::downgrade(&self.inner),
+            inner: Arc::downgrade(self.inner.as_ref().expect("Inner always set")),
         }
     }
 }
 
-impl Clone for ClientArc {
-    fn clone(&self) -> Self {
-        ClientArc::new(self.inner.clone())
+/// Internal self-reference to [`Client`]
+#[derive(Debug, Clone)]
+pub(crate) struct ClientStrong {
+    inner: Arc<Client>,
+}
+
+impl ops::Deref for ClientStrong {
+    type Target = Client;
+
+    fn deref(&self) -> &Self::Target {
+        self.inner.deref()
     }
 }
 
-/// Like [`ClientArc`] but using a [`Weak`] handle to [`Client`]
+/// Like [`ClientStrong`] but using a [`Weak`] handle to [`Client`]
+///
+/// This is not meant to be used by external code.
 #[derive(Debug, Clone)]
-pub struct ClientWeak {
+pub(crate) struct ClientWeak {
     inner: Weak<Client>,
 }
 
 impl ClientWeak {
-    pub fn upgrade(&self) -> Option<ClientArc> {
-        Weak::upgrade(&self.inner).map(ClientArc::new)
+    pub fn upgrade(&self) -> Option<ClientStrong> {
+        Weak::upgrade(&self.inner).map(|inner| ClientStrong { inner })
     }
 }
 
@@ -538,45 +662,34 @@ impl ClientWeak {
 /// `ExecutorInner` should already take care of that. The reason is that as long
 /// as the executor task is active there may be a cycle in the
 /// `Arc<Client>`s such that at least one `Executor` never gets dropped.
-impl Drop for ClientArc {
+impl Drop for ClientHandle {
     fn drop(&mut self) {
-        // Not sure if Ordering::SeqCst is strictly needed here, but better safe than
-        // sorry.
-        let client_count = self
-            .inner
-            .client_count
-            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-
-        // `fetch_sub` returns previous value, so if it is 1, it means this is the last
-        // client reference
-        if client_count == 1 {
-            info!("Last client reference dropped, shutting down client task group");
-            let maybe_shutdown_confirmation = self.inner.executor.stop_executor();
-
-            // Just in case the shutdown does not take immediate effect we block here if
-            // possible. If running as WASM we are running in single-threaded mode and
-            // cannot use block_on.
-            #[cfg(not(target_family = "wasm"))]
-            {
-                if RuntimeHandle::current().runtime_flavor() == RuntimeFlavor::CurrentThread {
-                    // We can't use block_on in single-threaded mode
-                    return;
-                }
-
-                let Some(shutdown_confirmation) = maybe_shutdown_confirmation else {
-                    // Already shut down
-                    return;
-                };
-
-                tokio::task::block_in_place(move || {
-                    futures::executor::block_on(async {
-                        if shutdown_confirmation.await.is_err() {
-                            error!("Error while awaiting client shutdown confirmation");
-                        }
-                    });
-                });
-            }
+        if self.inner.is_none() {
+            return;
         }
+
+        // We can't use block_on in single-threaded mode or wasm
+        #[cfg(target_family = "wasm")]
+        let can_block = false;
+        #[cfg(not(target_family = "wasm"))]
+        // nosemgrep: ban-raw-block-on
+        let can_block = RuntimeHandle::current().runtime_flavor() != RuntimeFlavor::CurrentThread;
+        if !can_block {
+            let inner = self.inner.take().expect("Must have inner client set");
+            inner.executor.stop_executor();
+            if cfg!(target_family = "wasm") {
+                error!(target: LOG_CLIENT, "Automatic client shutdown is not possible on wasm, call ClientHandle::shutdown manually.");
+            } else {
+                error!(target: LOG_CLIENT, "Automatic client shutdown is not possible on current thread runtime, call ClientHandle::shutdown manually.");
+            }
+            return;
+        }
+
+        debug!(target: LOG_CLIENT, "Shutting down the Client on last handle drop");
+        #[cfg(not(target_family = "wasm"))]
+        runtime::block_in_place(|| {
+            runtime::block_on(self.shutdown_inner());
+        });
     }
 }
 
@@ -586,7 +699,7 @@ impl Drop for ClientArc {
 const SUPPORTED_CORE_API_VERSIONS: &[fedimint_core::module::ApiVersion] =
     &[ApiVersion { major: 0, minor: 0 }];
 
-pub type ModuleGlobalContextGen = ContextGen<DynGlobalClientContext>;
+pub type ModuleGlobalContextGen = ContextGen;
 
 /// Resources particular to a module instance
 pub struct ClientModuleInstance<'m, M: ClientModule> {
@@ -611,6 +724,16 @@ where
     }
 }
 
+/// Main client type
+///
+/// A handle and API to interacting with a single Federation.
+///
+/// Under the hood managing service tasks, state machines,
+/// database and other resources required.
+///
+/// This type is shared externally and internally, and
+/// [`ClientHandle`] is responsible for external lifecycle management
+/// and resource freeing of the [`Client`].
 pub struct Client {
     config: ClientConfig,
     decoders: ModuleDecoderRegistry,
@@ -620,20 +743,14 @@ pub struct Client {
     primary_module_instance: ModuleInstanceId,
     modules: ClientModuleRegistry,
     module_inits: ClientModuleInitRegistry,
-    executor: Executor<DynGlobalClientContext>,
+    executor: Executor,
     api: DynGlobalApi,
     root_secret: DerivableSecret,
     operation_log: OperationLog,
     secp_ctx: Secp256k1<secp256k1_zkp::All>,
+    meta_service: Arc<MetaService>,
 
     task_group: TaskGroup,
-    /// Number of [`ClientArc`] instances using this `Client`.
-    ///
-    /// The `Client` struct is both used for the client itself as well as
-    /// for the global context used in the state machine executor. This means we
-    /// cannot rely on the reference count of the `Arc<Client>` to
-    /// determine if the client should shut down.
-    client_count: AtomicUsize,
 
     /// Updates about client recovery progress
     client_recovery_progress_receiver:
@@ -653,6 +770,11 @@ impl Client {
 
     pub fn api_clone(&self) -> DynGlobalApi {
         self.api.clone()
+    }
+
+    /// Get the [`TaskGroup`] that is tied to Client's lifetime.
+    pub fn task_group(&self) -> &TaskGroup {
+        &self.task_group
     }
 
     pub async fn get_config_from_db(db: &Database) -> Option<ClientConfig> {
@@ -730,7 +852,7 @@ impl Client {
     pub async fn start_executor(self: &Arc<Self>) {
         debug!(
             "Starting fedimint client executor (version: {})",
-            env!("FEDIMINT_BUILD_CODE_VERSION")
+            fedimint_build_code_version_env!()
         );
         self.executor.start_executor(self.context_gen()).await;
     }
@@ -773,6 +895,10 @@ impl Client {
         instance: ModuleInstanceId,
     ) -> Option<&maybe_add_send_sync!(dyn IClientModule)> {
         Some(self.modules.get(instance)?.as_ref())
+    }
+
+    pub fn has_module(&self, instance: ModuleInstanceId) -> bool {
+        self.modules.get(instance).is_some()
     }
 
     /// Determines if a transaction is underfunded, overfunded or balanced
@@ -833,7 +959,7 @@ impl Client {
     pub async fn add_state_machines(
         &self,
         dbtx: &mut DatabaseTransaction<'_>,
-        states: Vec<DynState<DynGlobalClientContext>>,
+        states: Vec<DynState>,
     ) -> AddStateMachinesResult {
         self.executor.add_state_machines_dbtx(dbtx, states).await
     }
@@ -860,17 +986,18 @@ impl Client {
         &self.operation_log
     }
 
+    /// Get the meta manager to read meta fields.
+    pub fn meta_service(&self) -> &Arc<MetaService> {
+        &self.meta_service
+    }
+
     /// Adds funding to a transaction or removes over-funding via change.
     async fn finalize_transaction(
         &self,
         dbtx: &mut DatabaseTransaction<'_>,
         operation_id: OperationId,
         mut partial_transaction: TransactionBuilder,
-    ) -> anyhow::Result<(
-        Transaction,
-        Vec<DynState<DynGlobalClientContext>>,
-        Range<u64>,
-    )> {
+    ) -> anyhow::Result<(Transaction, Vec<DynState>, Range<u64>)> {
         if let TransactionBuilderBalance::Underfunded(missing_amount) =
             self.transaction_builder_balance(&partial_transaction)
         {
@@ -957,7 +1084,7 @@ impl Client {
                     let tx_builder = tx_builder.clone();
                     let operation_meta = operation_meta.clone();
                     Box::pin(async move {
-                        if Client::operation_exists(dbtx, operation_id).await {
+                        if Client::operation_exists_dbtx(dbtx, operation_id).await {
                             bail!("There already exists an operation with id {operation_id:?}")
                         }
 
@@ -1041,25 +1168,25 @@ impl Client {
             .await
     }
 
-    async fn operation_exists(
+    pub async fn operation_exists(&self, operation_id: OperationId) -> bool {
+        let mut dbtx = self.db().begin_transaction_nc().await;
+
+        Client::operation_exists_dbtx(&mut dbtx, operation_id).await
+    }
+
+    pub async fn operation_exists_dbtx(
         dbtx: &mut DatabaseTransaction<'_>,
         operation_id: OperationId,
     ) -> bool {
         let active_state_exists = dbtx
-            .find_by_prefix(&ActiveOperationStateKeyPrefix::<DynGlobalClientContext> {
-                operation_id,
-                _pd: Default::default(),
-            })
+            .find_by_prefix(&ActiveOperationStateKeyPrefix { operation_id })
             .await
             .next()
             .await
             .is_some();
 
         let inactive_state_exists = dbtx
-            .find_by_prefix(&InactiveOperationStateKeyPrefix::<DynGlobalClientContext> {
-                operation_id,
-                _pd: Default::default(),
-            })
+            .find_by_prefix(&InactiveOperationStateKeyPrefix { operation_id })
             .await
             .next()
             .await
@@ -1192,7 +1319,11 @@ impl Client {
                         *instance_id,
                         JsonWithKind::new(
                             kind.clone(),
-                            config.clone().expect_decoded().to_json().into(),
+                            config
+                                .clone()
+                                .decoded()
+                                .map(|decoded| decoded.to_json().into())
+                                .unwrap_or(serde_json::Value::Null),
                         ),
                     )
                 })
@@ -1244,12 +1375,17 @@ impl Client {
         })
     }
 
-    pub async fn discover_common_api_version(&self) -> anyhow::Result<ApiVersionSet> {
+    pub async fn discover_common_api_version(
+        &self,
+        threshold: Option<usize>,
+    ) -> anyhow::Result<ApiVersionSet> {
         Ok(self
             .api()
             .discover_api_version_set(
                 &Self::supported_api_versions_summary_static(self.get_config(), &self.module_inits)
                     .await,
+                get_discover_api_version_timeout(),
+                threshold,
             )
             .await?)
     }
@@ -1260,10 +1396,18 @@ impl Client {
         config: &ClientConfig,
         client_module_init: &ClientModuleInitRegistry,
         api: &DynGlobalApi,
+        mode: DiscoverCommonApiVersionMode,
     ) -> anyhow::Result<ApiVersionSet> {
         Ok(api
             .discover_api_version_set(
                 &Self::supported_api_versions_summary_static(config, client_module_init).await,
+                get_discover_api_version_timeout(),
+                match mode {
+                    DiscoverCommonApiVersionMode::Fast => {
+                        Some((config.global.api_endpoints.len() / 2).min(1))
+                    }
+                    DiscoverCommonApiVersionMode::Full => None,
+                },
             )
             .await?)
     }
@@ -1310,6 +1454,7 @@ impl Client {
         module_inits: &ModuleInitRegistry<DynClientModuleInit>,
         api: &DynGlobalApi,
         db: &Database,
+        task_group: &TaskGroup,
     ) -> anyhow::Result<ApiVersionSet> {
         if let Some(v) = db
             .begin_transaction()
@@ -1324,22 +1469,32 @@ impl Client {
             let db = db.clone();
             // Separate task group, because we actually don't want to be waiting for this to
             // finish, and it's just best effort.
-            TaskGroup::new()
-                .spawn("refresh_common_api_version_static", |_| async move {
-                    if let Err(e) =
-                        Self::refresh_common_api_version_static(&config, &module_inits, &api, &db)
-                            .await
-                    {
-                        warn!("Failed to discover common api versions: {e}");
-                    }
-                })
-                .await;
+            task_group.spawn_cancellable("refresh_common_api_version_static", async move {
+                if let Err(error) = Self::refresh_common_api_version_static(
+                    &config,
+                    &module_inits,
+                    &api,
+                    &db,
+                    DiscoverCommonApiVersionMode::Full,
+                )
+                .await
+                {
+                    warn!(%error, "Failed to discover common api versions");
+                }
+            });
 
             return Ok(v.0);
         }
 
         debug!("No existing cached common api versions found, waiting for initial discovery");
-        Self::refresh_common_api_version_static(config, module_inits, api, db).await
+        Self::refresh_common_api_version_static(
+            config,
+            module_inits,
+            api,
+            db,
+            DiscoverCommonApiVersionMode::Fast,
+        )
+        .await
     }
 
     async fn refresh_common_api_version_static(
@@ -1347,13 +1502,17 @@ impl Client {
         module_inits: &ModuleInitRegistry<DynClientModuleInit>,
         api: &DynGlobalApi,
         db: &Database,
+        mode: DiscoverCommonApiVersionMode,
     ) -> anyhow::Result<ApiVersionSet> {
         debug!("Refreshing common api versions");
 
         let common_api_versions =
-            Client::discover_common_api_version_static(config, module_inits, api).await?;
+            Client::discover_common_api_version_static(config, module_inits, api, mode).await?;
 
-        debug!("Updating the cached common api versions");
+        debug!(
+            value = ?common_api_versions,
+            "Updating the cached common api versions"
+        );
         let mut dbtx = db.begin_transaction().await;
         let _ = dbtx
             .insert_entry(
@@ -1401,7 +1560,7 @@ impl Client {
             .client_recovery_progress_receiver
             .borrow()
             .iter()
-            .any(|(_id, progress)| !progress.is_done())
+            .all(|(_id, progress)| progress.is_done())
     }
 
     /// Wait for all module recoveries to finish
@@ -1415,14 +1574,25 @@ impl Client {
         let mut recovery_receiver = self.client_recovery_progress_receiver.clone();
         recovery_receiver
             .wait_for(|in_progress| {
-                !in_progress
+                in_progress
                     .iter()
-                    .any(|(_id, progress)| !progress.is_done())
+                    .all(|(_id, progress)| progress.is_done())
             })
             .await
             .context("Recovery task completed and update receiver disconnected, but some modules failed to recover")?;
 
         Ok(())
+    }
+
+    /// Subscribe to recover progress for all the modules.
+    ///
+    /// This stream can contain duplicate progress for a module.
+    /// Don't use this stream for detecting completion of recovery.
+    pub fn subscribe_to_recovery_progress(
+        &self,
+    ) -> impl Stream<Item = (ModuleInstanceId, RecoveryProgress)> {
+        WatchStream::new(self.client_recovery_progress_receiver.clone())
+            .flat_map(futures::stream::iter)
     }
 
     pub async fn wait_for_module_kind_recovery(
@@ -1450,7 +1620,7 @@ impl Client {
             if self.executor.get_active_states().await.is_empty() {
                 break;
             }
-            fedimint_core::task::sleep(Duration::from_millis(100)).await;
+            fedimint_core::runtime::sleep(Duration::from_millis(100)).await;
         }
         Ok(())
     }
@@ -1482,8 +1652,7 @@ impl Client {
                     module_recovery_progress_receivers,
                 )
                 .await
-            })
-            .await;
+            });
     }
 
     async fn run_module_recoveries_task(
@@ -1533,14 +1702,18 @@ impl Client {
         while let Some((module_instance_id, progress)) = futures.next().await {
             let mut dbtx = db.begin_transaction().await;
 
-            let progress = if let Some(progress) = progress {
+            let prev_progress = *recovery_sender
+                .borrow()
+                .get(&module_instance_id)
+                .expect("existing progress must be present");
+
+            let progress = if prev_progress.is_done() {
+                // since updates might be out of order, once done, stick with it
+                prev_progress
+            } else if let Some(progress) = progress {
                 progress
             } else {
-                recovery_sender
-                    .borrow()
-                    .get(&module_instance_id)
-                    .expect("existing progress must be present")
-                    .to_complete()
+                prev_progress.to_complete()
             };
 
             info!(
@@ -1560,6 +1733,7 @@ impl Client {
                 v.insert(module_instance_id, progress);
             });
         }
+        debug!(target: LOG_CLIENT_RECOVERY, "Recovery executor stopped");
     }
 }
 
@@ -1587,78 +1761,46 @@ impl TransactionUpdates {
     }
 }
 
-/// Federation config and meta data that can be used to show a preview of the
-/// federation one is about to join or to initialize a client.
-#[derive(Debug, Clone)]
-pub struct FederationInfo {
-    config: ClientConfig,
-    // TODO: make non-optional or remove
-    invite_code: Option<InviteCode>,
+/// Admin (guardian) identification and authentication
+pub struct AdminCreds {
+    /// Guardian's own `peer_id`
+    pub peer_id: PeerId,
+    /// Authentication details
+    pub auth: ApiAuth,
 }
 
-impl FederationInfo {
-    /// Download federation info using invitation code
-    pub async fn from_invite_code(invite: InviteCode) -> anyhow::Result<FederationInfo> {
-        let config = try_download_config(invite.clone(), 10).await?;
-        Ok(FederationInfo {
-            config,
-            invite_code: Some(invite),
-        })
-    }
-
-    /// Create `FederationInfo` from config, may download further meta data in
-    /// the future
-    pub async fn from_config(config: ClientConfig) -> anyhow::Result<FederationInfo> {
-        // The return type is a result in case we want to fallibly fetch additional meta
-        // data in the future
-        Ok(FederationInfo {
-            config,
-            invite_code: None,
-        })
-    }
-
-    /// Returns the federations configuration
-    pub fn config(&self) -> &ClientConfig {
-        &self.config
-    }
-
-    /// If the federation info was created from
-    pub fn invite_code(&self) -> Option<InviteCode> {
-        self.invite_code.clone()
-    }
-
-    /// Get the value of a given meta field
-    pub fn meta<V: serde::de::DeserializeOwned>(&self, key: &str) -> anyhow::Result<Option<V>> {
-        let Some(str_value) = self.config.global.meta.get(key) else {
-            return Ok(None);
-        };
-        serde_json::from_str(str_value).context(format!("Decoding meta field '{key}' failed"))
-    }
-
-    /// Creates an API client for the federation
-    pub fn api(&self) -> DynGlobalApi {
-        DynGlobalApi::from_config(&self.config)
-    }
-
-    pub fn federation_id(&self) -> FederationId {
-        self.config.global.federation_id()
-    }
-}
-
+/// Used to configure, assemble and build [`Client`]
 pub struct ClientBuilder {
     module_inits: ClientModuleInitRegistry,
     primary_module_instance: Option<ModuleInstanceId>,
-    db: Database,
+    admin_creds: Option<AdminCreds>,
+    db_no_decoders: Database,
+    meta_service: Arc<MetaService>,
     stopped: bool,
 }
 
 impl ClientBuilder {
     fn new(db: Database) -> Self {
+        let meta_service = MetaService::new(LegacyMetaSource::default());
         ClientBuilder {
             module_inits: Default::default(),
             primary_module_instance: Default::default(),
-            db,
+            admin_creds: None,
+            db_no_decoders: db,
             stopped: false,
+            meta_service,
+        }
+    }
+
+    fn from_existing(client: &Client) -> Self {
+        ClientBuilder {
+            module_inits: client.module_inits.clone(),
+            primary_module_instance: Some(client.primary_module_instance),
+            admin_creds: None,
+            db_no_decoders: client.db.with_decoders(Default::default()),
+            stopped: false,
+            // non unique
+            meta_service: client.meta_service.clone(),
         }
     }
 
@@ -1692,24 +1834,32 @@ impl ClientBuilder {
         )
     }
 
-    async fn migrate_database(&self) -> anyhow::Result<()> {
+    pub fn with_meta_service(&mut self, meta_service: Arc<MetaService>) {
+        self.meta_service = meta_service;
+    }
+
+    async fn migrate_database(
+        &self,
+        db: &Database,
+        decoders: ModuleDecoderRegistry,
+    ) -> anyhow::Result<()> {
         // Only apply the client database migrations if the database has been
         // initialized.
         if let Ok(client_config) = self.load_existing_config().await {
             for (module_id, module_cfg) in client_config.modules {
                 let kind = module_cfg.kind.clone();
                 let Some(init) = self.module_inits.get(&kind) else {
-                    warn!("Detected configuration for unsupported module id: {module_id}, kind: {kind}");
+                    // normal, expected and already logged about when building the client
                     continue;
                 };
 
-                let isolated_db = self.db().with_prefix_module_id(module_id);
-
-                apply_migrations(
-                    &isolated_db,
+                apply_migrations_client(
+                    db,
                     kind.to_string(),
                     init.database_version(),
                     init.get_database_migrations(),
+                    module_id,
+                    decoders.clone(),
                 )
                 .await?;
             }
@@ -1718,26 +1868,29 @@ impl ClientBuilder {
         Ok(())
     }
 
-    pub fn db(&self) -> &Database {
-        &self.db
+    pub fn db_no_decoders(&self) -> &Database {
+        &self.db_no_decoders
     }
 
     pub async fn load_existing_config(&self) -> anyhow::Result<ClientConfig> {
-        let Some(config) = Client::get_config_from_db(&self.db).await else {
+        let Some(config) = Client::get_config_from_db(&self.db_no_decoders).await else {
             bail!("Client database not initialized")
         };
 
         Ok(config)
     }
 
+    pub fn set_admin_creds(&mut self, creds: AdminCreds) {
+        self.admin_creds = Some(creds);
+    }
+
     async fn init(
         self,
         root_secret: DerivableSecret,
         config: ClientConfig,
-        invite_code: InviteCode,
         init_mode: InitMode,
-    ) -> anyhow::Result<ClientArc> {
-        if Client::is_initialized(&self.db).await {
+    ) -> anyhow::Result<ClientHandle> {
+        if Client::is_initialized(&self.db_no_decoders).await {
             bail!("Client database already initialized")
         }
 
@@ -1745,17 +1898,15 @@ impl ClientBuilder {
         // transaction to avoid half-initialized client state.
         {
             debug!(target: LOG_CLIENT, "Initializing client database");
-            let mut dbtx = self.db.begin_transaction().await;
+            let mut dbtx = self.db_no_decoders.begin_transaction().await;
             // Save config to DB
             dbtx.insert_new_entry(
                 &ClientConfigKey {
-                    id: config.federation_id(),
+                    id: config.calculate_federation_id(),
                 },
                 &config,
             )
             .await;
-            dbtx.insert_new_entry(&ClientInviteCodeKey {}, &invite_code)
-                .await;
 
             let init_state = InitState::Pending(init_mode);
             dbtx.insert_entry(&ClientInitStateKey, &init_state).await;
@@ -1770,16 +1921,17 @@ impl ClientBuilder {
 
             dbtx.commit_tx_result().await?;
         }
-        let stopped = self.stopped;
 
-        let client = self.build_stopped(root_secret, config).await?;
-        if !stopped {
-            client.start_executor().await;
-        }
-        Ok(client)
+        let stopped = self.stopped;
+        self.build(root_secret, config, stopped).await
     }
 
     /// Join a new Federation
+    ///
+    /// When a user wants to connect to a new federation this function fetches
+    /// the federation config and initializes the client database. If a user
+    /// already joined the federation in the past and has a preexisting database
+    /// use [`ClientBuilder::open`] instead.
     ///
     /// **Warning**: Calling `join` with a `root_secret` key that was used
     /// previous to `join` a Federation will lead to all sorts of malfunctions
@@ -1790,14 +1942,84 @@ impl ClientBuilder {
     /// that might have been previous used (e.g. provided by the user),
     /// it's safer to call [`Self::recover`] which will attempt to recover
     /// client module states for the Federation.
+    ///
+    /// A typical "join federation" flow would look as follows:
+    /// ```no_run
+    /// # use std::str::FromStr;
+    /// # use fedimint_core::api::InviteCode;
+    /// # use fedimint_core::config::ClientConfig;
+    /// # use fedimint_derive_secret::DerivableSecret;
+    /// # use fedimint_client::{Client, ClientBuilder};
+    /// # use fedimint_core::db::Database;
+    /// # use fedimint_core::config::META_FEDERATION_NAME_KEY;
+    /// #
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// # let root_secret: DerivableSecret = unimplemented!();
+    /// // Create a root secret, e.g. via fedimint-bip39, see also:
+    /// // https://github.com/fedimint/fedimint/blob/master/docs/secret_derivation.md
+    /// // let root_secret = …;
+    ///
+    /// // Get invite code from user
+    /// let invite_code = InviteCode::from_str("fed11qgqpw9thwvaz7te3xgmjuvpwxqhrzw3jxumrvvf0qqqjpetvlg8glnpvzcufhffgzhv8m75f7y34ryk7suamh8x7zetly8h0v9v0rm")
+    ///     .expect("Invalid invite code");
+    /// let config = ClientConfig::download_from_invite_code(&invite_code).await
+    ///     .expect("Error downloading config");
+    ///
+    /// // Tell the user the federation name, bitcoin network
+    /// // (e.g. from wallet module config), and other details
+    /// // that are typically contained in the federation's
+    /// // meta fields.
+    ///
+    /// // let network = config.get_first_module_by_kind::<WalletClientConfig>("wallet")
+    /// //     .expect("Module not found")
+    /// //     .network;
+    ///
+    /// println!(
+    ///     "The federation name is: {}",
+    ///     config.meta::<String>(META_FEDERATION_NAME_KEY)
+    ///         .expect("Could not decode name field")
+    ///         .expect("Name isn't set")
+    /// );
+    ///
+    /// // Open the client's database, using the federation ID
+    /// // as the DB name is a common pattern:
+    ///
+    /// // let db_path = format!("./path/to/db/{}", config.federation_id());
+    /// // let db = RocksDb::open(db_path).expect("error opening DB");
+    /// # let db: Database = unimplemented!();
+    ///
+    /// let client = Client::builder(db)
+    ///     // Mount the modules the client should support:
+    ///     // .with_module(LightningClientInit)
+    ///     // .with_module(MintClientInit)
+    ///     // .with_module(WalletClientInit::default())
+    ///     .join(root_secret, config)
+    ///     .await
+    ///     .expect("Error joining federation");
+    /// # }
+    /// ```
     pub async fn join(
         self,
         root_secret: DerivableSecret,
         config: ClientConfig,
-        invite_code: InviteCode,
-    ) -> anyhow::Result<ClientArc> {
-        self.init(root_secret, config, invite_code, InitMode::Fresh)
-            .await
+    ) -> anyhow::Result<ClientHandle> {
+        self.init(root_secret, config, InitMode::Fresh).await
+    }
+
+    /// Download most recent valid backup found from the Federation
+    pub async fn download_backup_from_federation(
+        &self,
+        root_secret: &DerivableSecret,
+        config: &ClientConfig,
+    ) -> anyhow::Result<Option<ClientBackup>> {
+        let api = DynGlobalApi::from_config(config);
+        Client::download_backup_from_federation_static(
+            &api,
+            &Self::federation_root_secret(root_secret, config),
+            &self.decoders(config),
+        )
+        .await
     }
 
     /// Join a (possibly) previous joined Federation
@@ -1814,23 +2036,14 @@ impl ClientBuilder {
         self,
         root_secret: DerivableSecret,
         config: ClientConfig,
-        invite_code: InviteCode,
-    ) -> anyhow::Result<ClientArc> {
-        let api = DynGlobalApi::from_config(&config);
-        let snapshot = Client::download_backup_from_federation_static(
-            &api,
-            &Self::federation_root_secret(&root_secret, &config),
-            &self.decoders(&config),
-        )
-        .await?;
-
+        backup: Option<ClientBackup>,
+    ) -> anyhow::Result<ClientHandle> {
         let client = self
             .init(
                 root_secret,
                 config,
-                invite_code,
                 InitMode::Recover {
-                    snapshot: snapshot.clone(),
+                    snapshot: backup.clone(),
                 },
             )
             .await?;
@@ -1838,16 +2051,42 @@ impl ClientBuilder {
         Ok(client)
     }
 
-    pub async fn open(self, root_secret: DerivableSecret) -> anyhow::Result<ClientArc> {
-        let Some(config) = Client::get_config_from_db(&self.db).await else {
+    pub async fn open(self, root_secret: DerivableSecret) -> anyhow::Result<ClientHandle> {
+        let Some(config) = Client::get_config_from_db(&self.db_no_decoders).await else {
             bail!("Client database not initialized")
         };
         let stopped = self.stopped;
 
         let client = self.build_stopped(root_secret, config).await?;
         if !stopped {
-            client.start_executor().await;
+            client.as_inner().start_executor().await;
         }
+        Ok(client)
+    }
+
+    fn admin_api_from_id(id: PeerId, cfg: &ClientConfig) -> anyhow::Result<DynGlobalApi> {
+        let url = cfg
+            .global
+            .api_endpoints
+            .get(&id)
+            .ok_or_else(|| anyhow::format_err!("Invalid admin peer_id: {id}"))?
+            .url
+            .clone();
+        Ok(DynGlobalApi::from_single_endpoint(id, url))
+    }
+
+    /// Build a [`Client`] but do not start the executor
+    async fn build(
+        self,
+        root_secret: DerivableSecret,
+        config: ClientConfig,
+        stopped: bool,
+    ) -> anyhow::Result<ClientHandle> {
+        let client = self.build_stopped(root_secret, config).await?;
+        if !stopped {
+            client.as_inner().start_executor().await;
+        }
+
         Ok(client)
     }
 
@@ -1856,15 +2095,21 @@ impl ClientBuilder {
         self,
         root_secret: DerivableSecret,
         config: ClientConfig,
-    ) -> anyhow::Result<ClientArc> {
+    ) -> anyhow::Result<ClientHandle> {
         let decoders = self.decoders(&config);
         let config = Self::config_decoded(config, &decoders)?;
-        let db = self.db.with_decoders(decoders.clone());
-        let api = DynGlobalApi::from_config(&config);
+        let fed_id = config.calculate_federation_id();
+        let db = self.db_no_decoders.with_decoders(decoders.clone());
+        let api = if let Some(admin_creds) = self.admin_creds.as_ref() {
+            Self::admin_api_from_id(admin_creds.peer_id, &config)?
+        } else {
+            DynGlobalApi::from_config(&config)
+        };
+        let task_group = TaskGroup::new();
 
         // Migrate the database before interacting with it in case any on-disk data
         // structures have changed.
-        self.migrate_database().await?;
+        self.migrate_database(&db, decoders.clone()).await?;
 
         let init_state = Self::load_init_state(&db).await;
 
@@ -1879,8 +2124,11 @@ impl ClientBuilder {
             &self.module_inits,
             &api,
             &db,
+            &task_group,
         )
         .await?;
+
+        debug!(?common_api_versions, "Completed api version negotiation");
 
         let mut module_recoveries: BTreeMap<
             ModuleInstanceId,
@@ -1900,7 +2148,7 @@ impl ClientBuilder {
             for (module_instance_id, module_config) in config.modules.clone() {
                 let kind = module_config.kind().clone();
                 let Some(module_init) = self.module_inits.get(&kind).cloned() else {
-                    warn!("Module kind {kind} of instance {module_instance_id} not found in module gens, skipping");
+                    debug!("Module kind {kind} of instance {module_instance_id} not found in module gens, skipping");
                     continue;
                 };
 
@@ -1914,13 +2162,14 @@ impl ClientBuilder {
                 // the recovery call is extracted here.
                 let start_module_recover_fn =
                     |snapshot: Option<ClientBackup>, progress: RecoveryProgress| {
-                        let config = config.clone();
                         let module_config = module_config.clone();
+                        let num_peers = NumPeers::from(config.global.api_endpoints.len());
                         let db = db.clone();
                         let kind = kind.clone();
                         let notifier = notifier.clone();
                         let api = api.clone();
                         let root_secret = root_secret.clone();
+                        let admin_auth = self.admin_creds.as_ref().map(|creds| creds.auth.clone());
                         let final_client = final_client.clone();
                         let (progress_tx, progress_rx) = tokio::sync::watch::channel(progress);
                         let module_init = module_init.clone();
@@ -1929,14 +2178,17 @@ impl ClientBuilder {
                                 module_init
                                         .recover(
                                             final_client.clone(),
-                                            config.global.federation_id(),
+                                            fed_id,
+                                        num_peers,
                                             module_config.clone(),
                                             db.clone(),
                                             module_instance_id,
+                                            common_api_versions.core,
                                             api_version,
                                             root_secret.derive_module_secret(module_instance_id),
                                             notifier.clone(),
                                             api.clone(),
+                                        admin_auth,
                                             snapshot.as_ref().and_then(|s| s.modules.get(&module_instance_id).to_owned()),
                                             progress_tx,
                                         )
@@ -1996,10 +2248,12 @@ impl ClientBuilder {
                     let module = module_init
                         .init(
                             final_client.clone(),
-                            config.global.federation_id(),
+                            fed_id,
+                            config.global.api_endpoints.len(),
                             module_config,
                             db.clone(),
                             module_instance_id,
+                            common_api_versions.core,
                             api_version,
                             // This is a divergence from the legacy client, where the child secret
                             // keys were derived using *module kind*-specific derivation paths.
@@ -2008,6 +2262,8 @@ impl ClientBuilder {
                             root_secret.derive_module_secret(module_instance_id),
                             notifier.clone(),
                             api.clone(),
+                            self.admin_creds.as_ref().map(|cred| cred.auth.clone()),
+                            task_group.clone(),
                         )
                         .await?;
 
@@ -2031,7 +2287,7 @@ impl ClientBuilder {
         }
 
         let executor = {
-            let mut executor_builder = Executor::<DynGlobalClientContext>::builder();
+            let mut executor_builder = Executor::builder();
             executor_builder
                 .with_module(TRANSACTION_SUBMISSION_MODULE_INSTANCE, TxSubmissionContext);
 
@@ -2043,7 +2299,9 @@ impl ClientBuilder {
                 executor_builder.with_valid_module_id(*module_instance_id);
             }
 
-            executor_builder.build(db.clone(), notifier).await
+            executor_builder
+                .build(db.clone(), notifier, task_group.clone())
+                .await
         };
 
         let recovery_receiver_init_val = BTreeMap::from_iter(
@@ -2058,7 +2316,7 @@ impl ClientBuilder {
             config: config.clone(),
             decoders,
             db: db.clone(),
-            federation_id: config.global.federation_id(),
+            federation_id: fed_id,
             federation_meta: config.global.meta,
             primary_module_instance,
             modules,
@@ -2067,13 +2325,24 @@ impl ClientBuilder {
             api,
             secp_ctx: Secp256k1::new(),
             root_secret,
-            task_group: TaskGroup::new(),
+            task_group,
             operation_log: OperationLog::new(db),
-            client_count: Default::default(),
             client_recovery_progress_receiver,
+            meta_service: self.meta_service,
         });
+        client_inner
+            .task_group
+            .spawn_cancellable("MetaService::update_continuously", {
+                let client_inner = client_inner.clone();
+                async move {
+                    client_inner
+                        .meta_service
+                        .update_continuously(&client_inner)
+                        .await
+                }
+            });
 
-        let client_arc = ClientArc::new(client_inner);
+        let client_arc = ClientHandle::new(client_inner);
 
         final_client.set(client_arc.downgrade());
 
@@ -2134,46 +2403,7 @@ impl ClientBuilder {
         root_secret: &DerivableSecret,
         config: &ClientConfig,
     ) -> DerivableSecret {
-        root_secret.federation_key(&config.global.federation_id())
-    }
-}
-
-pub async fn get_invite_code_from_db(db: &Database) -> Option<InviteCode> {
-    let mut dbtx = db.begin_transaction().await;
-    #[allow(clippy::let_and_return)]
-    let invite = dbtx
-        .find_by_prefix(&ClientInviteCodeKeyPrefix)
-        .await
-        .next()
-        .await
-        .map(|(_, invite)| invite);
-    invite
-}
-
-/// Tries to download the client config from the federation,
-/// attempts up to `retries` number times
-async fn try_download_config(
-    invite_code: InviteCode,
-    max_retries: usize,
-) -> anyhow::Result<ClientConfig> {
-    debug!(target: LOG_CLIENT, "Download client config");
-    let api = DynGlobalApi::from_invite_code(&[invite_code.clone()]);
-    let mut num_retries = 0;
-    let wait_millis = 500;
-    loop {
-        if num_retries > max_retries {
-            break Err(anyhow!("Failed to download client config"));
-        }
-        match api.download_client_config(&invite_code).await {
-            Ok(cfg) => {
-                break Ok(cfg);
-            }
-            Err(e) => {
-                debug!("Failed to download client config {:?}", e);
-                sleep(Duration::from_millis(wait_millis)).await;
-            }
-        }
-        num_retries += 1;
+        root_secret.federation_key(&config.global.calculate_federation_id())
     }
 }
 
@@ -2201,7 +2431,7 @@ pub fn client_decoders<'a>(
     let mut modules = BTreeMap::new();
     for (id, kind) in module_kinds {
         let Some(init) = registry.get(kind) else {
-            info!("Detected configuration for unsupported module id: {id}, kind: {kind}");
+            debug!("Detected configuration for unsupported module id: {id}, kind: {kind}");
             continue;
         };
 

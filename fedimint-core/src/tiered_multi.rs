@@ -1,6 +1,5 @@
 use std::cmp::min;
 use std::collections::BTreeMap;
-use std::iter::FromIterator;
 use std::marker::PhantomData;
 
 use fedimint_core::encoding::{Decodable, DecodeError, Encodable};
@@ -83,7 +82,7 @@ impl<T> TieredMulti<T> {
     /// Note: The order of the elements is important:
     /// from the lowest tier to the highest, then in order of elements in the
     /// Vec
-    pub fn iter_items(&self) -> impl Iterator<Item = (Amount, &T)> + DoubleEndedIterator {
+    pub fn iter_items(&self) -> impl DoubleEndedIterator<Item = (Amount, &T)> {
         // Note: If you change the method implementation, make sure that the returned
         // order of the elements stays consistent.
         self.0
@@ -96,7 +95,7 @@ impl<T> TieredMulti<T> {
     /// Note: The order of the elements is important:
     /// from the lowest tier to the highest, then in order of elements in the
     /// Vec
-    pub fn into_iter_items(self) -> impl Iterator<Item = (Amount, T)> + DoubleEndedIterator {
+    pub fn into_iter_items(self) -> impl DoubleEndedIterator<Item = (Amount, T)> {
         // Note: If you change the method implementation, make sure that the returned
         // order of the elements stays consistent.
         self.0
@@ -192,11 +191,13 @@ impl<C> Decodable for TieredMulti<C>
 where
     C: Decodable + 'static,
 {
-    fn consensus_decode<D: std::io::Read>(
+    fn consensus_decode_from_finite_reader<D: std::io::Read>(
         d: &mut D,
         modules: &ModuleDecoderRegistry,
     ) -> Result<Self, DecodeError> {
-        Ok(TieredMulti(BTreeMap::consensus_decode(d, modules)?))
+        Ok(TieredMulti(BTreeMap::consensus_decode_from_finite_reader(
+            d, modules,
+        )?))
     }
 }
 
@@ -334,7 +335,6 @@ impl FromIterator<(Amount, usize)> for TieredSummary {
 
 #[cfg(test)]
 mod test {
-    use fedimint_core::Amount;
 
     use super::*;
 

@@ -5,19 +5,20 @@
 
 use std::collections::BTreeMap;
 
-use bls12_381::{pairing, G1Affine, G1Projective, G2Affine, G2Projective};
-pub use bls12_381::{G1Affine as MessagePoint, G2Affine as PubKeyPoint, Scalar};
+use bls12_381::{pairing, G1Affine, G1Projective, G2Affine, G2Projective, Scalar};
+use fedimint_core::bls12_381_serde;
+use fedimint_core::encoding::{Decodable, Encodable};
 use ff::Field;
 use group::{Curve, Group};
+use hex::encode;
 use rand::rngs::OsRng;
 use rand::SeedableRng;
 use rand_chacha::ChaChaRng;
 use serde::{Deserialize, Serialize};
 use sha3::Digest;
 
-pub mod serde_impl;
-
 const HASH_TAG: &[u8] = b"TBS_BLS12-381_";
+const FINGERPRINT_TAG: &[u8] = b"TBS_KFP24_";
 
 fn hash_bytes_to_g1(data: &[u8]) -> G1Projective {
     let mut hash_engine = sha3::Sha3_256::new();
@@ -30,39 +31,38 @@ fn hash_bytes_to_g1(data: &[u8]) -> G1Projective {
     G1Projective::random(&mut prng)
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct SecretKeyShare(#[serde(with = "serde_impl::scalar")] pub Scalar);
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Encodable, Decodable, Serialize, Deserialize)]
+pub struct SecretKeyShare(#[serde(with = "bls12_381_serde::scalar")] pub Scalar);
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct PublicKeyShare(#[serde(with = "serde_impl::g2")] pub G2Affine);
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Encodable, Decodable, Serialize, Deserialize)]
+pub struct PublicKeyShare(#[serde(with = "bls12_381_serde::g2")] pub G2Affine);
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct AggregatePublicKey(#[serde(with = "serde_impl::g2")] pub G2Affine);
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Encodable, Decodable, Serialize, Deserialize)]
+pub struct AggregatePublicKey(#[serde(with = "bls12_381_serde::g2")] pub G2Affine);
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct Message(#[serde(with = "serde_impl::g1")] pub G1Affine);
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Encodable, Decodable, Serialize, Deserialize)]
+pub struct Message(#[serde(with = "bls12_381_serde::g1")] pub G1Affine);
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct BlindingKey(#[serde(with = "serde_impl::scalar")] pub Scalar);
+#[derive(Copy, Clone, Eq, PartialEq, Encodable, Decodable, Serialize, Deserialize)]
+pub struct BlindingKey(#[serde(with = "bls12_381_serde::scalar")] pub Scalar);
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct BlindedMessage(#[serde(with = "serde_impl::g1")] pub G1Affine);
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Encodable, Decodable, Serialize, Deserialize)]
+pub struct BlindedMessage(#[serde(with = "bls12_381_serde::g1")] pub G1Affine);
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct BlindedSignatureShare(#[serde(with = "serde_impl::g1")] pub G1Affine);
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Encodable, Decodable, Serialize, Deserialize)]
+pub struct BlindedSignatureShare(#[serde(with = "bls12_381_serde::g1")] pub G1Affine);
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct BlindedSignature(#[serde(with = "serde_impl::g1")] pub G1Affine);
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Encodable, Decodable, Serialize, Deserialize)]
+pub struct BlindedSignature(#[serde(with = "bls12_381_serde::g1")] pub G1Affine);
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct Signature(#[serde(with = "serde_impl::g1")] pub G1Affine);
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Encodable, Decodable, Serialize, Deserialize)]
+pub struct Signature(#[serde(with = "bls12_381_serde::g1")] pub G1Affine);
 
 macro_rules! point_hash_impl {
     ($type:ty) => {
         impl std::hash::Hash for $type {
             fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-                let serialized = self.0.to_compressed();
-                state.write(&serialized);
+                self.0.to_compressed().hash(state);
             }
         }
     };
@@ -86,6 +86,30 @@ impl BlindingKey {
     pub fn random() -> BlindingKey {
         // TODO: fix rand incompatibities
         BlindingKey(Scalar::random(OsRng))
+    }
+
+    fn fingerprint(&self) -> [u8; 32] {
+        let mut hash_engine = sha3::Sha3_256::new();
+        hash_engine.update(FINGERPRINT_TAG);
+        hash_engine.update(self.0.to_bytes());
+        let result = hash_engine.finalize();
+        result.into()
+    }
+}
+
+impl ::core::fmt::Debug for BlindingKey {
+    fn fmt(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+        let fingerprint = self.fingerprint();
+        let fingerprint_hex = encode(&fingerprint[..]);
+        write!(f, "BlindingKey({fingerprint_hex})")
+    }
+}
+
+impl ::core::fmt::Display for BlindingKey {
+    fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+        let fingerprint = self.fingerprint();
+        let fingerprint_hex = encode(&fingerprint[..]);
+        write!(f, "{fingerprint_hex}")
     }
 }
 
@@ -185,6 +209,14 @@ fn lagrange_multipliers(scalars: Vec<Scalar>) -> Vec<Scalar> {
         .collect()
 }
 
+pub fn verify_blinded_signature(
+    msg: BlindedMessage,
+    sig: BlindedSignature,
+    pk: AggregatePublicKey,
+) -> bool {
+    pairing(&msg.0, &pk.0) == pairing(&sig.0, &G2Affine::generator())
+}
+
 pub fn unblind_signature(blinding_key: BlindingKey, blinded_sig: BlindedSignature) -> Signature {
     let sig = blinded_sig.0 * blinding_key.0.invert().unwrap();
     Signature(sig.to_affine())
@@ -265,5 +297,17 @@ mod tests {
         let sig = unblind_signature(bkey, bsig);
 
         assert!(verify(msg, sig, pk));
+    }
+
+    #[test]
+    fn test_blindingkey_fingerprint_multiple_calls_same_result() {
+        let bkey = BlindingKey::random();
+        assert_eq!(bkey.fingerprint(), bkey.fingerprint());
+    }
+
+    #[test]
+    fn test_blindingkey_fingerprint_ne_scalar() {
+        let bkey = BlindingKey::random();
+        assert_ne!(bkey.fingerprint(), bkey.0.to_bytes());
     }
 }

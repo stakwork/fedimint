@@ -12,19 +12,37 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-      - uses: cachix/install-nix-action@v25
+      - uses: cachix/install-nix-action@v26
         with:
           name: fedimint
           authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
         continue-on-error: true
 
       - name: Build docs
-        run: nix build -L .#ci.workspaceDocExport
+        run: nix build -L .#nightly.ci.workspaceDocExport
 
       - if: github.repository == 'fedimint/fedimint'
         name: Deploy docs
-        uses: peaceiris/actions-gh-pages@v3
+        uses: peaceiris/actions-gh-pages@v4
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: ./result/
+          publish_dir: ./result/share/doc/
           cname: docs.fedimint.org
+
+  notifications:
+    if: always() && github.repository == 'fedimint/fedimint' && github.event_name != 'merge_group'
+    name: "Notifications"
+    timeout-minutes: 1
+    runs-on: ubuntu-22.04
+    needs: [ docs ]
+
+    steps:
+    - name: Discord notifications on failure
+      # https://stackoverflow.com/a/74562058/134409
+      if: ${{ always() && contains(needs.*.result, 'failure') }}
+      # https://github.com/marketplace/actions/actions-status-discord
+      uses: sarisia/actions-status-discord@v1
+      with:
+        webhook: ${{ secrets.DISCORD_WEBHOOK }}
+        # current job is a success, but that's not what we're interested in
+        status: failure

@@ -1,3 +1,4 @@
+pub mod db;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
@@ -9,26 +10,29 @@ use fedimint_core::config::{
     TypedServerModuleConfig, TypedServerModuleConsensusConfig,
 };
 use fedimint_core::core::ModuleInstanceId;
-use fedimint_core::db::{DatabaseTransaction, DatabaseVersion, IDatabaseTransactionOpsCoreTyped};
+use fedimint_core::db::{
+    DatabaseTransaction, DatabaseValue, DatabaseVersion, IDatabaseTransactionOpsCoreTyped,
+};
 use fedimint_core::encoding::Encodable;
 use fedimint_core::endpoint_constants::{
     ACCOUNT_ENDPOINT, AWAIT_ACCOUNT_ENDPOINT, AWAIT_BLOCK_HEIGHT_ENDPOINT, AWAIT_OFFER_ENDPOINT,
     AWAIT_OUTGOING_CONTRACT_CANCELLED_ENDPOINT, AWAIT_PREIMAGE_DECRYPTION, BLOCK_COUNT_ENDPOINT,
     GET_DECRYPTED_PREIMAGE_STATUS, LIST_GATEWAYS_ENDPOINT, OFFER_ENDPOINT,
-    REGISTER_GATEWAY_ENDPOINT,
+    REGISTER_GATEWAY_ENDPOINT, REMOVE_GATEWAY_CHALLENGE_ENDPOINT, REMOVE_GATEWAY_ENDPOINT,
 };
 use fedimint_core::module::audit::Audit;
 use fedimint_core::module::{
-    api_endpoint, ApiEndpoint, ApiEndpointContext, CoreConsensusVersion, InputMeta,
+    api_endpoint, ApiEndpoint, ApiEndpointContext, ApiVersion, CoreConsensusVersion, InputMeta,
     ModuleConsensusVersion, ModuleInit, PeerHandle, ServerModuleInit, ServerModuleInitArgs,
     SupportedModuleApiVersions, TransactionItemAmount,
 };
 use fedimint_core::server::DynServerModule;
 use fedimint_core::task::{sleep, TaskGroup};
 use fedimint_core::{
-    apply, async_trait_maybe_send, push_db_pair_items, Amount, NumPeers, OutPoint, PeerId,
+    apply, async_trait_maybe_send, push_db_pair_items, Amount, NumPeersExt, OutPoint, PeerId,
     ServerModule,
 };
+pub use fedimint_ln_common as common;
 use fedimint_ln_common::config::{
     FeeConsensus, LightningClientConfig, LightningConfig, LightningConfigConsensus,
     LightningConfigLocal, LightningConfigPrivate, LightningGenParams,
@@ -39,7 +43,21 @@ use fedimint_ln_common::contracts::{
     EncryptedPreimage, FundedContract, IdentifiableContract, Preimage, PreimageDecryptionShare,
     PreimageKey,
 };
-use fedimint_ln_common::db::{
+use fedimint_ln_common::{
+    create_gateway_remove_message, ContractAccount, LightningCommonInit, LightningConsensusItem,
+    LightningGatewayAnnouncement, LightningGatewayRegistration, LightningInput,
+    LightningInputError, LightningModuleTypes, LightningOutput, LightningOutputError,
+    LightningOutputOutcome, LightningOutputOutcomeV0, LightningOutputV0, RemoveGatewayRequest,
+};
+use fedimint_server::config::distributedgen::PeerHandleOps;
+use futures::StreamExt;
+use metrics::{LN_CANCEL_OUTGOING_CONTRACTS, LN_FUNDED_CONTRACT_SATS, LN_INCOMING_OFFER};
+use rand::rngs::OsRng;
+use secp256k1::PublicKey;
+use strum::IntoEnumIterator;
+use tracing::{debug, error, info, info_span, trace, warn};
+
+use crate::db::{
     AgreedDecryptionShareContractIdPrefix, AgreedDecryptionShareKey,
     AgreedDecryptionShareKeyPrefix, BlockCountVoteKey, BlockCountVotePrefix, ContractKey,
     ContractKeyPrefix, ContractUpdateKey, ContractUpdateKeyPrefix, DbKeyPrefix,
@@ -47,87 +65,15 @@ use fedimint_ln_common::db::{
     LightningAuditItemKeyPrefix, LightningGatewayKey, LightningGatewayKeyPrefix, OfferKey,
     OfferKeyPrefix, ProposeDecryptionShareKey, ProposeDecryptionShareKeyPrefix,
 };
-use fedimint_ln_common::{
-    ContractAccount, LightningCommonInit, LightningConsensusItem, LightningGatewayAnnouncement,
-    LightningGatewayRegistration, LightningInput, LightningInputError, LightningModuleTypes,
-    LightningOutput, LightningOutputError, LightningOutputOutcome, LightningOutputOutcomeV0,
-    LightningOutputV0,
-};
-use fedimint_metrics::{
-    histogram_opts, lazy_static, opts, prometheus, register_histogram, register_int_counter,
-    Histogram, IntCounter,
-};
-use fedimint_server::config::distributedgen::PeerHandleOps;
-use futures::StreamExt;
-use rand::rngs::OsRng;
-use strum::IntoEnumIterator;
-use tracing::{debug, error, info_span, trace};
 
-lazy_static! {
-    static ref LN_INCOMING_OFFER: IntCounter = register_int_counter!(opts!(
-        "ln_incoming_offer",
-        "contracts::IncomingContractOffer"
-    ))
-    .unwrap();
-    static ref LN_OUTPUT_OUTCOME_CANCEL_OUTGOING_CONTRACT: IntCounter =
-        register_int_counter!(opts!(
-            "ln_output_outcome_cancel_outgoing_contract",
-            "LightningOutputOutcome::CancelOutgoingContract"
-        ))
-        .unwrap();
-    static ref LN_FUNDED_CONTRACT_INCOMING: IntCounter = register_int_counter!(opts!(
-        "ln_funded_contract_incoming",
-        "contracts::FundedContract::Incoming"
-    ))
-    .unwrap();
-    static ref LN_FUNDED_CONTRACT_OUTGOING: IntCounter = register_int_counter!(opts!(
-        "ln_funded_contract_outgoing",
-        "contracts::FundedContract::Outgoing"
-    ))
-    .unwrap();
-    static ref AMOUNTS_BUCKETS_SATS: Vec<f64> = vec![
-        0.0,
-        0.1,
-        1.0,
-        10.0,
-        100.0,
-        1000.0,
-        10000.0,
-        100000.0,
-        1000000.0,
-        10000000.0,
-        100000000.0
-    ];
-    static ref LN_FUNDED_CONTRACT_INCOMING_ACCOUNT_AMOUNTS_SATS: Histogram =
-        register_histogram!(histogram_opts!(
-            "ln_funded_contract_incoming_account_amounts_sats",
-            "contracts::FundedContract::Incoming account amount in sats",
-            AMOUNTS_BUCKETS_SATS.clone()
-        ))
-        .unwrap();
-    static ref LN_FUNDED_CONTRACT_OUTGOING_ACCOUNT_AMOUNTS_SATS: Histogram =
-        register_histogram!(histogram_opts!(
-            "ln_funded_contract_outgoing_account_amounts_sats",
-            "contracts::FundedContract::Outgoing account amounts in sats",
-            AMOUNTS_BUCKETS_SATS.clone()
-        ))
-        .unwrap();
-    static ref ALL_METRICS: [Box<dyn prometheus::core::Collector>; 6] = [
-        Box::new(LN_INCOMING_OFFER.clone()),
-        Box::new(LN_OUTPUT_OUTCOME_CANCEL_OUTGOING_CONTRACT.clone()),
-        Box::new(LN_FUNDED_CONTRACT_INCOMING.clone()),
-        Box::new(LN_FUNDED_CONTRACT_OUTGOING.clone()),
-        Box::new(LN_FUNDED_CONTRACT_INCOMING_ACCOUNT_AMOUNTS_SATS.clone()),
-        Box::new(LN_FUNDED_CONTRACT_OUTGOING_ACCOUNT_AMOUNTS_SATS.clone()),
-    ];
-}
+mod metrics;
 
 #[derive(Debug, Clone)]
 pub struct LightningInit;
 
-#[apply(async_trait_maybe_send!)]
 impl ModuleInit for LightningInit {
     type Common = LightningCommonInit;
+    const DATABASE_VERSION: DatabaseVersion = DatabaseVersion(0);
 
     async fn dump_database(
         &self,
@@ -241,7 +187,6 @@ impl ModuleInit for LightningInit {
 #[apply(async_trait_maybe_send!)]
 impl ServerModuleInit for LightningInit {
     type Params = LightningGenParams;
-    const DATABASE_VERSION: DatabaseVersion = DatabaseVersion(0);
 
     fn versions(&self, _core: CoreConsensusVersion) -> &[ModuleConsensusVersion] {
         const MODULE_CONSENSUS_VERSION: ModuleConsensusVersion = ModuleConsensusVersion::new(0, 0);
@@ -249,15 +194,19 @@ impl ServerModuleInit for LightningInit {
     }
 
     fn supported_api_versions(&self) -> SupportedModuleApiVersions {
-        SupportedModuleApiVersions::from_raw((u32::MAX, 0), (0, 0), &[(0, 0)])
+        SupportedModuleApiVersions::from_raw((u32::MAX, 0), (0, 0), &[(0, 1)])
     }
 
     async fn init(&self, args: &ServerModuleInitArgs<Self>) -> anyhow::Result<DynServerModule> {
-        // Ensure all metrics are initialized
-        for metric in ALL_METRICS.iter() {
-            metric.collect();
-        }
-        Ok(Lightning::new(args.cfg().to_typed()?, &mut args.task_group().clone())?.into())
+        // Eagerly initialize metrics that trigger infrequently
+        LN_CANCEL_OUTGOING_CONTRACTS.get();
+
+        Ok(Lightning::new(
+            args.cfg().to_typed()?,
+            &mut args.task_group().clone(),
+            args.our_peer_id(),
+        )?
+        .into())
     }
 
     fn trusted_dealer_gen(
@@ -374,6 +323,7 @@ impl ServerModuleInit for LightningInit {
 pub struct Lightning {
     cfg: LightningConfig,
     btc_rpc: DynBitcoindRpc,
+    our_peer_id: PeerId,
 }
 
 #[apply(async_trait_maybe_send!)]
@@ -698,7 +648,9 @@ impl ServerModule for Lightning {
                     .await
                     .is_none()
                 {
-                    calculate_funded_contract_metrics(updated_contract_account, dbtx);
+                    dbtx.on_commit(move || {
+                        record_funded_contract_metric(updated_contract_account);
+                    })
                 }
 
                 dbtx.insert_new_entry(
@@ -764,7 +716,9 @@ impl ServerModule for Lightning {
                 dbtx.insert_new_entry(&OfferKey(offer.hash), &(*offer).clone())
                     .await;
 
-                calculate_incoming_offer_metric(dbtx);
+                dbtx.on_commit(move || {
+                    LN_INCOMING_OFFER.inc();
+                });
 
                 Ok(TransactionItemAmount::ZERO)
             }
@@ -819,7 +773,9 @@ impl ServerModule for Lightning {
                 )
                 .await;
 
-                calculate_output_outcome_cancel_metrics(dbtx);
+                dbtx.on_commit(move || {
+                    LN_CANCEL_OUTGOING_CONTRACTS.inc();
+                });
 
                 Ok(TransactionItemAmount::ZERO)
             }
@@ -858,12 +814,14 @@ impl ServerModule for Lightning {
         vec![
             api_endpoint! {
                 BLOCK_COUNT_ENDPOINT,
+                ApiVersion::new(0, 0),
                 async |module: &Lightning, context, _v: ()| -> Option<u64> {
                     Ok(Some(module.consensus_block_count(&mut context.dbtx().into_nc()).await))
                 }
             },
             api_endpoint! {
                 ACCOUNT_ENDPOINT,
+                ApiVersion::new(0, 0),
                 async |module: &Lightning, context, contract_id: ContractId| -> Option<ContractAccount> {
                     Ok(module
                         .get_contract_account(&mut context.dbtx().into_nc(), contract_id)
@@ -872,6 +830,7 @@ impl ServerModule for Lightning {
             },
             api_endpoint! {
                 AWAIT_ACCOUNT_ENDPOINT,
+                ApiVersion::new(0, 0),
                 async |module: &Lightning, context, contract_id: ContractId| -> ContractAccount {
                     Ok(module
                         .wait_contract_account(context, contract_id)
@@ -880,6 +839,7 @@ impl ServerModule for Lightning {
             },
             api_endpoint! {
                 AWAIT_BLOCK_HEIGHT_ENDPOINT,
+                ApiVersion::new(0, 0),
                 async |module: &Lightning, context, block_height: u64| -> () {
                     module.wait_block_height(block_height, &mut context.dbtx().into_nc()).await;
                     Ok(())
@@ -887,24 +847,28 @@ impl ServerModule for Lightning {
             },
             api_endpoint! {
                 AWAIT_OUTGOING_CONTRACT_CANCELLED_ENDPOINT,
+                ApiVersion::new(0, 0),
                 async |module: &Lightning, context, contract_id: ContractId| -> ContractAccount {
                     Ok(module.wait_outgoing_contract_account_cancelled(context, contract_id).await)
                 }
             },
             api_endpoint! {
                 GET_DECRYPTED_PREIMAGE_STATUS,
+                ApiVersion::new(0, 0),
                 async |module: &Lightning, context, contract_id: ContractId| -> (IncomingContractAccount, DecryptedPreimageStatus) {
                     Ok(module.get_decrypted_preimage_status(context, contract_id).await)
                 }
             },
             api_endpoint! {
                 AWAIT_PREIMAGE_DECRYPTION,
+                ApiVersion::new(0, 0),
                 async |module: &Lightning, context, contract_id: ContractId| -> (IncomingContractAccount, Option<Preimage>) {
                     Ok(module.wait_preimage_decrypted(context, contract_id).await)
                 }
             },
             api_endpoint! {
                 OFFER_ENDPOINT,
+                ApiVersion::new(0, 0),
                 async |module: &Lightning, context, payment_hash: bitcoin_hashes::sha256::Hash| -> Option<IncomingContractOffer> {
                     Ok(module
                         .get_offer(&mut context.dbtx().into_nc(), payment_hash)
@@ -913,6 +877,7 @@ impl ServerModule for Lightning {
             },
             api_endpoint! {
                 AWAIT_OFFER_ENDPOINT,
+                ApiVersion::new(0, 0),
                 async |module: &Lightning, context, payment_hash: bitcoin_hashes::sha256::Hash| -> IncomingContractOffer {
                     Ok(module
                         .wait_offer(context, payment_hash)
@@ -921,15 +886,37 @@ impl ServerModule for Lightning {
             },
             api_endpoint! {
                 LIST_GATEWAYS_ENDPOINT,
+                ApiVersion::new(0, 0),
                 async |module: &Lightning, context, _v: ()| -> Vec<LightningGatewayAnnouncement> {
                     Ok(module.list_gateways(&mut context.dbtx().into_nc()).await)
                 }
             },
             api_endpoint! {
                 REGISTER_GATEWAY_ENDPOINT,
+                ApiVersion::new(0, 0),
                 async |module: &Lightning, context, gateway: LightningGatewayAnnouncement| -> () {
                     module.register_gateway(&mut context.dbtx().into_nc(), gateway).await;
                     Ok(())
+                }
+            },
+            api_endpoint! {
+                REMOVE_GATEWAY_CHALLENGE_ENDPOINT,
+                ApiVersion::new(0, 1),
+                async |module: &Lightning, context, gateway_id: PublicKey| -> Option<sha256::Hash> {
+                    Ok(module.get_gateway_remove_challenge(gateway_id, &mut context.dbtx().into_nc()).await)
+                }
+            },
+            api_endpoint! {
+                REMOVE_GATEWAY_ENDPOINT,
+                ApiVersion::new(0, 1),
+                async |module: &Lightning, context, remove_gateway_request: RemoveGatewayRequest| -> bool {
+                    match module.remove_gateway(remove_gateway_request.clone(), &mut context.dbtx().into_nc()).await {
+                        Ok(_) => Ok(true),
+                        Err(e) => {
+                            warn!("Unable to remove gateway registration {remove_gateway_request:?} Error: {e:?}");
+                            Ok(false)
+                        },
+                    }
                 }
             },
         ]
@@ -937,9 +924,17 @@ impl ServerModule for Lightning {
 }
 
 impl Lightning {
-    fn new(cfg: LightningConfig, task_group: &mut TaskGroup) -> anyhow::Result<Self> {
+    fn new(
+        cfg: LightningConfig,
+        task_group: &mut TaskGroup,
+        our_peer_id: PeerId,
+    ) -> anyhow::Result<Self> {
         let btc_rpc = create_bitcoind(&cfg.local.bitcoin_rpc, task_group.make_handle())?;
-        Ok(Lightning { cfg, btc_rpc })
+        Ok(Lightning {
+            cfg,
+            btc_rpc,
+            our_peer_id,
+        })
     }
 
     async fn block_count(&self) -> anyhow::Result<u64> {
@@ -1162,47 +1157,84 @@ impl Lightning {
             dbtx.remove_entry(&key).await;
         }
     }
-}
 
-fn calculate_funded_contract_metrics(
-    updated_contract_account: ContractAccount,
-    dbtx: &mut DatabaseTransaction<'_>,
-) {
-    dbtx.on_commit(move || match updated_contract_account.contract {
-        FundedContract::Incoming(_) => {
-            LN_FUNDED_CONTRACT_INCOMING_ACCOUNT_AMOUNTS_SATS
-                .observe(updated_contract_account.amount.sats_f64());
-            LN_FUNDED_CONTRACT_INCOMING.inc();
+    /// Returns the challenge to the gateway that must be signed by the
+    /// gateway's private key in order for the gateway registration record
+    /// to be removed. The challenge is the concatenation of the gateway's
+    /// public key and the `valid_until` bytes. This ensures that the
+    /// challenges changes every time the gateway is re-registered and ensures
+    /// that the challenge is unique per-gateway.
+    async fn get_gateway_remove_challenge(
+        &self,
+        gateway_id: PublicKey,
+        dbtx: &mut DatabaseTransaction<'_>,
+    ) -> Option<sha256::Hash> {
+        if let Some(gateway) = dbtx.get_value(&LightningGatewayKey(gateway_id)).await {
+            let mut valid_until_bytes = gateway.valid_until.to_bytes();
+            let mut challenge_bytes = gateway_id.to_bytes();
+            challenge_bytes.append(&mut valid_until_bytes);
+            Some(sha256::Hash::hash(&challenge_bytes))
+        } else {
+            None
         }
-        FundedContract::Outgoing(_) => {
-            LN_FUNDED_CONTRACT_OUTGOING_ACCOUNT_AMOUNTS_SATS
-                .observe(updated_contract_account.amount.sats_f64());
-            LN_FUNDED_CONTRACT_OUTGOING.inc();
-        }
-    });
+    }
+
+    /// Removes the gateway registration record. First the signature provided by
+    /// the gateway is verified by checking if the gateway's challenge has
+    /// been signed by the gateway's private key.
+    async fn remove_gateway(
+        &self,
+        remove_gateway_request: RemoveGatewayRequest,
+        dbtx: &mut DatabaseTransaction<'_>,
+    ) -> anyhow::Result<()> {
+        let fed_public_key = self.cfg.consensus.threshold_pub_keys.public_key();
+        let gateway_id = remove_gateway_request.gateway_id;
+        let our_peer_id = self.our_peer_id;
+        let signature = remove_gateway_request
+            .signatures
+            .get(&our_peer_id)
+            .ok_or_else(|| {
+                warn!("No signature provided for gateway: {gateway_id}");
+                anyhow::anyhow!("No signature provided for gateway {gateway_id}")
+            })?;
+
+        // If there is no challenge, the gateway does not exist in the database and
+        // there is nothing to do
+        let challenge = self
+            .get_gateway_remove_challenge(gateway_id, dbtx)
+            .await
+            .ok_or(anyhow::anyhow!(
+                "Gateway {gateway_id} is not registered with peer {our_peer_id}"
+            ))?;
+
+        // Verify the supplied schnorr signature is valid
+        let msg = create_gateway_remove_message(fed_public_key, our_peer_id, challenge);
+        signature.verify(&msg, &gateway_id.x_only_public_key().0)?;
+
+        dbtx.remove_entry(&LightningGatewayKey(gateway_id)).await;
+        info!("Successfully removed gateway: {gateway_id}");
+        Ok(())
+    }
 }
 
-fn calculate_incoming_offer_metric(dbtx: &mut DatabaseTransaction<'_>) {
-    dbtx.on_commit(move || {
-        LN_INCOMING_OFFER.inc();
-    });
-}
-
-fn calculate_output_outcome_cancel_metrics(dbtx: &mut DatabaseTransaction<'_>) {
-    dbtx.on_commit(move || {
-        LN_OUTPUT_OUTCOME_CANCEL_OUTGOING_CONTRACT.inc();
-    });
+fn record_funded_contract_metric(updated_contract_account: ContractAccount) {
+    LN_FUNDED_CONTRACT_SATS
+        .with_label_values(&[match updated_contract_account.contract {
+            FundedContract::Incoming(_) => "incoming",
+            FundedContract::Outgoing(_) => "outgoing",
+        }])
+        .observe(updated_contract_account.amount.sats_f64());
 }
 
 #[cfg(test)]
 mod tests {
     use assert_matches::assert_matches;
     use bitcoin_hashes::{sha256, Hash as BitcoinHash};
-    use fedimint_core::bitcoinrpc::BitcoinRpcConfig;
     use fedimint_core::config::ConfigGenModuleParams;
     use fedimint_core::db::mem_impl::MemDatabase;
     use fedimint_core::db::{Database, IDatabaseTransactionOpsCoreTyped};
     use fedimint_core::encoding::Encodable;
+    use fedimint_core::envs::BitcoinRpcConfig;
     use fedimint_core::module::{InputMeta, ServerModuleInit, TransactionItemAmount};
     use fedimint_core::task::TaskGroup;
     use fedimint_core::{Amount, OutPoint, PeerId, ServerModule, TransactionId};
@@ -1218,11 +1250,11 @@ mod tests {
         DecryptedPreimage, EncryptedPreimage, FundedContract, IdentifiableContract, Preimage,
         PreimageKey,
     };
-    use fedimint_ln_common::db::{ContractKey, LightningAuditItemKey};
     use fedimint_ln_common::{ContractAccount, LightningInput, LightningOutput};
     use rand::rngs::OsRng;
     use secp256k1::{generate_keypair, PublicKey};
 
+    use crate::db::{ContractKey, LightningAuditItemKey};
     use crate::{Lightning, LightningInit};
 
     const MINTS: usize = 4;
@@ -1272,7 +1304,7 @@ mod tests {
     async fn encrypted_preimage_only_usable_once() {
         let (server_cfg, client_cfg) = build_configs();
         let mut tg = TaskGroup::new();
-        let server = Lightning::new(server_cfg[0].clone(), &mut tg).unwrap();
+        let server = Lightning::new(server_cfg[0].clone(), &mut tg, 0.into()).unwrap();
 
         let preimage = [42u8; 32];
         let encrypted_preimage = EncryptedPreimage(client_cfg.threshold_pub_key.encrypt([42; 32]));
@@ -1334,7 +1366,7 @@ mod tests {
         let mut dbtx = db.begin_transaction().await;
         let mut module_dbtx = dbtx.to_ref_with_prefix_module_id(42);
         let mut tg = TaskGroup::new();
-        let server = Lightning::new(server_cfg[0].clone(), &mut tg).unwrap();
+        let server = Lightning::new(server_cfg[0].clone(), &mut tg, 0.into()).unwrap();
 
         let preimage = PreimageKey(generate_keypair(&mut OsRng).1.serialize());
         let funded_incoming_contract = FundedContract::Incoming(FundedIncomingContract {
@@ -1395,7 +1427,7 @@ mod tests {
         let mut dbtx = db.begin_transaction().await;
         let mut module_dbtx = dbtx.to_ref_with_prefix_module_id(42);
         let mut tg = TaskGroup::new();
-        let server = Lightning::new(server_cfg[0].clone(), &mut tg).unwrap();
+        let server = Lightning::new(server_cfg[0].clone(), &mut tg, 0.into()).unwrap();
 
         let preimage = Preimage([42u8; 32]);
         let gateway_key = random_pub_key();

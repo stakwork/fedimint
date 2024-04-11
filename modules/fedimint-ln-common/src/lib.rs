@@ -9,11 +9,10 @@
 
 extern crate core;
 
-pub mod api;
 pub mod config;
 pub mod contracts;
-pub mod db;
 
+use std::collections::BTreeMap;
 use std::io::{Error, ErrorKind, Read, Write};
 use std::time::{Duration, SystemTime};
 
@@ -22,17 +21,22 @@ use bitcoin_hashes::sha256;
 use config::LightningClientConfig;
 use fedimint_client::oplog::OperationLogEntry;
 use fedimint_client::sm::Context;
-use fedimint_client::ClientArc;
+use fedimint_client::ClientHandleArc;
 use fedimint_core::core::{Decoder, ModuleInstanceId, ModuleKind, OperationId};
 use fedimint_core::encoding::{Decodable, DecodeError, Encodable};
 use fedimint_core::module::registry::ModuleDecoderRegistry;
 use fedimint_core::module::{CommonModuleInit, ModuleCommon, ModuleConsensusVersion};
 use fedimint_core::util::SafeUrl;
-use fedimint_core::{extensible_associated_module_type, plugin_types_trait_impl_common, Amount};
+use fedimint_core::{
+    extensible_associated_module_type, plugin_types_trait_impl_common, Amount, PeerId,
+};
 use lightning::util::ser::{WithoutLength, Writeable};
 use lightning_invoice::{Bolt11Invoice, RoutingFees};
+use secp256k1::schnorr::Signature;
+use secp256k1::Message;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use threshold_crypto::PublicKey;
 use tracing::error;
 pub use {bitcoin, lightning_invoice};
 
@@ -590,7 +594,7 @@ pub mod serde_option_routing_fees {
 
 #[derive(Debug, Error, Eq, PartialEq, Encodable, Decodable, Hash, Clone)]
 pub enum LightningInputError {
-    #[error("The the input contract {0} does not exist")]
+    #[error("The input contract {0} does not exist")]
     UnknownContract(ContractId),
     #[error("The input contract has too little funds, got {0}, input spends {1}")]
     InsufficientFunds(Amount, Amount),
@@ -606,7 +610,7 @@ pub enum LightningInputError {
 
 #[derive(Debug, Error, Eq, PartialEq, Encodable, Decodable, Hash, Clone)]
 pub enum LightningOutputError {
-    #[error("The the input contract {0} does not exist")]
+    #[error("The input contract {0} does not exist")]
     UnknownContract(ContractId),
     #[error("Output contract value may not be zero unless it's an offer output")]
     ZeroOutput,
@@ -627,7 +631,7 @@ pub enum LightningOutputError {
 }
 
 pub async fn ln_operation(
-    client: &ClientArc,
+    client: &ClientHandleArc,
     operation_id: OperationId,
 ) -> anyhow::Result<OperationLogEntry> {
     let operation = client
@@ -647,7 +651,7 @@ pub async fn ln_operation(
 ///
 /// This is a subset of the data from a [`lightning_invoice::Bolt11Invoice`]
 /// that does not contain the description, which increases privacy for the user.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Decodable, Encodable)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize, Decodable, Encodable)]
 pub struct PrunedInvoice {
     pub amount: Amount,
     pub destination: secp256k1::PublicKey,
@@ -701,4 +705,34 @@ impl TryFrom<Bolt11Invoice> for PrunedInvoice {
             expiry_timestamp,
         })
     }
+}
+
+/// Request sent to the federation that requests the removal of a gateway
+/// registration. Each peer is expected to check the `signatures` map for the
+/// signature that validates the gateway authorized the removal of this
+/// registration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoveGatewayRequest {
+    pub gateway_id: secp256k1::PublicKey,
+    pub signatures: BTreeMap<PeerId, Signature>,
+}
+
+/// Creates a message to be signed by the Gateway's private key for the purpose
+/// of removing the gateway's registration record. Message is defined as:
+///
+/// msg = sha256(tag + federation_public_key + peer_id + challenge)
+///
+/// Tag is always `remove_gateway`. Challenge is unique for the registration
+/// record and acquired from each guardian prior to the removal request.
+pub fn create_gateway_remove_message(
+    federation_public_key: PublicKey,
+    peer_id: PeerId,
+    challenge: sha256::Hash,
+) -> Message {
+    let mut message_preimage = "remove-gateway".as_bytes().to_vec();
+    message_preimage.append(&mut federation_public_key.consensus_encode_to_vec());
+    let guardian_id: u16 = peer_id.into();
+    message_preimage.append(&mut guardian_id.consensus_encode_to_vec());
+    message_preimage.append(&mut challenge.consensus_encode_to_vec());
+    Message::from_hashed_data::<sha256::Hash>(message_preimage.as_slice())
 }

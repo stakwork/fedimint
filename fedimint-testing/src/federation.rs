@@ -1,8 +1,9 @@
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 use fedimint_client::module::init::ClientModuleInitRegistry;
 use fedimint_client::secret::{PlainRootSecretStrategy, RootSecretStrategy};
-use fedimint_client::{Client, ClientArc};
+use fedimint_client::{Client, ClientHandleArc};
 use fedimint_core::admin_client::{ConfigGenParamsConsensus, PeerServerParams};
 use fedimint_core::api::InviteCode;
 use fedimint_core::config::{
@@ -16,6 +17,7 @@ use fedimint_core::module::ApiAuth;
 use fedimint_core::task::TaskGroup;
 use fedimint_core::PeerId;
 use fedimint_logging::LOG_TEST;
+use fedimint_rocksdb::RocksDb;
 use fedimint_server::config::api::ConfigGenParamsLocal;
 use fedimint_server::config::{gen_cert_and_key, ConfigGenParams, ServerConfig};
 use fedimint_server::consensus::server::ConsensusServer;
@@ -27,6 +29,7 @@ use tokio_rustls::rustls;
 use tracing::info;
 
 /// Test fixture for a running fedimint federation
+#[derive(Clone)]
 pub struct FederationTest {
     configs: BTreeMap<PeerId, ServerConfig>,
     server_init: ServerModuleInitRegistry,
@@ -37,35 +40,56 @@ pub struct FederationTest {
 
 impl FederationTest {
     /// Create two clients, useful for send/receive tests
-    pub async fn two_clients(&self) -> (ClientArc, ClientArc) {
+    pub async fn two_clients(&self) -> (ClientHandleArc, ClientHandleArc) {
         (self.new_client().await, self.new_client().await)
     }
 
     /// Create a client connected to this fed
-    pub async fn new_client(&self) -> ClientArc {
+    pub async fn new_client(&self) -> ClientHandleArc {
         let client_config = self.configs[&PeerId::from(0)]
             .consensus
             .to_client_config(&self.server_init)
             .unwrap();
 
-        self.new_client_with_config(client_config).await
+        self.new_client_with(client_config, MemDatabase::new().into())
+            .await
     }
 
-    pub async fn new_client_with_config(&self, client_config: ClientConfig) -> ClientArc {
+    /// Create a client connected to this fed but using RocksDB instead of MemDB
+    pub async fn new_client_rocksdb(&self) -> ClientHandleArc {
+        let client_config = self.configs[&PeerId::from(0)]
+            .consensus
+            .to_client_config(&self.server_init)
+            .unwrap();
+
+        self.new_client_with(
+            client_config,
+            RocksDb::open(tempfile::tempdir().expect("Couldn't create temp dir"))
+                .expect("Couldn't open DB")
+                .into(),
+        )
+        .await
+    }
+
+    pub async fn new_client_with(
+        &self,
+        client_config: ClientConfig,
+        db: Database,
+    ) -> ClientHandleArc {
         info!(target: LOG_TEST, "Setting new client with config");
-        let mut client_builder = Client::builder(MemDatabase::new().into());
+        let mut client_builder = Client::builder(db);
         client_builder.with_module_inits(self.client_init.clone());
         client_builder.with_primary_module(self.primary_client);
-        let client_secret = Client::load_or_generate_client_secret(client_builder.db())
+        let client_secret = Client::load_or_generate_client_secret(client_builder.db_no_decoders())
             .await
             .unwrap();
         client_builder
             .join(
                 PlainRootSecretStrategy::to_root_secret(&client_secret),
                 client_config,
-                self.invite_code(),
             )
             .await
+            .map(Arc::new)
             .expect("Failed to build client")
     }
 
@@ -81,11 +105,13 @@ impl FederationTest {
             .to_client_config(&self.server_init)
             .unwrap()
             .global
-            .federation_id()
+            .calculate_federation_id()
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn new(
         num_peers: u16,
+        num_offline: u16,
         base_port: u16,
         params: ServerModuleConfigGenParamsRegistry,
         server_init: ServerModuleInitRegistry,
@@ -93,6 +119,10 @@ impl FederationTest {
         primary_client: ModuleInstanceId,
         version_hash: String,
     ) -> Self {
+        assert!(
+            num_peers > 3 * num_offline,
+            "too many peers offline ({num_offline}) to reach consensus"
+        );
         let peers = (0..num_peers).map(PeerId::from).collect::<Vec<_>>();
         let params =
             local_config_gen_params(&peers, base_port, params).expect("Generates local config");
@@ -100,8 +130,11 @@ impl FederationTest {
         let configs = ServerConfig::trusted_dealer_gen(&params, server_init.clone(), version_hash);
         let network = MockNetwork::new();
 
-        let mut task = TaskGroup::new();
+        let task_group = TaskGroup::new();
         for (peer_id, config) in configs.clone() {
+            if u16::from(peer_id) >= num_peers - num_offline {
+                continue;
+            }
             let reliability = StreamReliability::INTEGRATION_TEST;
             let connections = network.connector(peer_id, reliability).into_dyn();
 
@@ -115,18 +148,17 @@ impl FederationTest {
                 server_init.clone(),
                 connections,
                 DelayCalculator::TEST_DEFAULT,
-                &mut task,
+                &task_group,
             )
             .await
             .expect("Failed to init server");
 
             let api_handle = FedimintServer::spawn_consensus_api(consensus_api, false).await;
 
-            task.spawn("fedimintd", move |handle| async move {
+            task_group.spawn("fedimintd", move |handle| async move {
                 consensus_server.run(handle).await.unwrap();
                 api_handle.stop().await;
-            })
-            .await;
+            });
         }
 
         Self {
@@ -134,7 +166,7 @@ impl FederationTest {
             server_init,
             client_init,
             primary_client,
-            _task: task,
+            _task: task_group,
         }
     }
 }

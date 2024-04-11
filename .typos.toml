@@ -2,3 +2,15 @@
 substituters = "substituters"
 # trips on some base64 string in the test
 wel = "wel"
+# common mistake that typos doesn't detect automatically
+reasponse= "response"
+# useful for "in/out" in the code
+inout="inout"
+
+[files]
+extend-exclude = [
+  "db/**",
+  "hfuzz_target/**",
+  "hfuzz_workspace/**",
+  "releases/**",
+]

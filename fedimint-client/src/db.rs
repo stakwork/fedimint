@@ -1,14 +1,32 @@
-use fedimint_core::api::{ApiVersionSet, InviteCode};
+use std::collections::BTreeMap;
+use std::time::SystemTime;
+
+use fedimint_core::api::ApiVersionSet;
 use fedimint_core::config::{ClientConfig, FederationId};
-use fedimint_core::core::{ModuleInstanceId, OperationId};
+use fedimint_core::core::{IntoDynInstance, ModuleInstanceId, OperationId};
+use fedimint_core::db::{
+    create_database_version, Database, DatabaseTransaction, DatabaseValue, DatabaseVersion,
+    DatabaseVersionKey, IDatabaseTransactionOpsCore, IDatabaseTransactionOpsCoreTyped,
+    MODULE_GLOBAL_PREFIX,
+};
 use fedimint_core::encoding::{Decodable, Encodable};
+use fedimint_core::module::registry::ModuleDecoderRegistry;
+use fedimint_core::util::BoxFuture;
 use fedimint_core::{impl_db_lookup, impl_db_record};
+use fedimint_logging::LOG_CLIENT_DB;
+use futures::StreamExt;
 use serde::Serialize;
 use strum_macros::EnumIter;
+use tracing::{debug, info, trace, warn};
 
 use crate::backup::{ClientBackup, Metadata};
 use crate::module::recovery::RecoveryProgress;
 use crate::oplog::OperationLogEntry;
+use crate::sm::executor::{
+    ActiveStateKey, ActiveStateKeyBytes, ActiveStateKeyPrefixBytes, InactiveStateKey,
+    InactiveStateKeyBytes, InactiveStateKeyPrefixBytes,
+};
+use crate::sm::{ActiveStateMeta, DynState, InactiveStateMeta, State};
 
 #[repr(u8)]
 #[derive(Clone, EnumIter, Debug)]
@@ -19,9 +37,32 @@ pub enum DbKeyPrefix {
     ChronologicalOperationLog = 0x2d,
     CommonApiVersionCache = 0x2e,
     ClientConfig = 0x2f,
-    ClientInviteCode = 0x30,
+    ClientInviteCode = 0x30, // Unused; clean out remnant data before re-using!
     ClientInitState = 0x31,
     ClientMetadata = 0x32,
+    ClientLastBackup = 0x33,
+    ClientMetaField = 0x34,
+    ClientMetaServiceInfo = 0x35,
+    /// Arbitrary data of the applications integrating Fedimint client and
+    /// wanting to store some Federation-specific data in Fedimint client
+    /// database.
+    ///
+    /// New users are encouraged to use this single prefix only.
+    //
+    // TODO: https://github.com/fedimint/fedimint/issues/4444
+    //       in the future, we should make all global access to the db private
+    //       and only expose a getter returning isolated database.
+    UserData = 0xb0,
+    /// Prefixes between 0xb1..=0xcf shall all be considered allocated for
+    /// historical and future external use
+    ExternalReservedStart = 0xb1,
+    /// Prefixes between 0xb1..=0xcf shall all be considered allocated for
+    /// historical and future external use
+    ExternalReservedEnd = 0xcf,
+    /// 0xd0.. reserved for Fedimint internal use
+    InternalReservedStart = 0xd0,
+    /// Per-module instance data
+    ModuleGlobalPrefix = 0xff,
 }
 
 impl std::fmt::Display for DbKeyPrefix {
@@ -105,23 +146,6 @@ impl_db_record!(
 );
 
 impl_db_lookup!(key = ClientConfigKey, query_prefix = ClientConfigKeyPrefix);
-
-#[derive(Debug, Encodable, Decodable)]
-pub struct ClientInviteCodeKey;
-
-#[derive(Debug, Encodable)]
-pub struct ClientInviteCodeKeyPrefix;
-
-impl_db_record!(
-    key = ClientInviteCodeKey,
-    value = InviteCode,
-    db_prefix = DbKeyPrefix::ClientInviteCode
-);
-
-impl_db_lookup!(
-    key = ClientInviteCodeKey,
-    query_prefix = ClientInviteCodeKeyPrefix
-);
 
 /// Client metadata that will be stored/restored on backup&recovery
 #[derive(Debug, Encodable, Decodable, Serialize)]
@@ -262,3 +286,384 @@ impl_db_lookup!(
     key = ClientModuleRecovery,
     query_prefix = ClientModuleRecoveryPrefix
 );
+
+/// Last valid backup the client attempted to make
+///
+/// Can be used to find previous valid versions of
+/// module backup.
+#[derive(Debug, Encodable, Decodable)]
+pub struct LastBackupKey;
+
+impl_db_record!(
+    key = LastBackupKey,
+    value = ClientBackup,
+    db_prefix = DbKeyPrefix::ClientLastBackup
+);
+
+#[derive(Encodable, Decodable, Debug, PartialEq, Eq, PartialOrd, Ord, Clone)]
+pub struct MetaFieldKey(pub String);
+
+#[derive(Encodable, Decodable, Debug, PartialEq, Eq, PartialOrd, Ord, Clone)]
+pub struct MetaFieldPrefix;
+
+#[derive(Encodable, Decodable, Debug, Clone)]
+pub struct MetaFieldValue(pub String);
+
+#[derive(Encodable, Decodable, Debug)]
+pub struct MetaServiceInfoKey;
+
+#[derive(Encodable, Decodable, Debug)]
+pub struct MetaServiceInfo {
+    pub last_updated: SystemTime,
+    pub revision: u64,
+}
+
+impl_db_record!(
+    key = MetaFieldKey,
+    value = MetaFieldValue,
+    db_prefix = DbKeyPrefix::ClientMetaField
+);
+
+impl_db_record!(
+    key = MetaServiceInfoKey,
+    value = MetaServiceInfo,
+    db_prefix = DbKeyPrefix::ClientMetaServiceInfo
+);
+
+impl_db_lookup!(key = MetaFieldKey, query_prefix = MetaFieldPrefix);
+
+/// `ClientMigrationFn` is a function that modules can implement to "migrate"
+/// the database to the next database version.
+pub type ClientMigrationFn =
+    for<'r, 'tx> fn(
+        &'r mut DatabaseTransaction<'tx>,
+        ModuleInstanceId,
+        Vec<(Vec<u8>, OperationId)>, // active states
+        Vec<(Vec<u8>, OperationId)>, // inactive states
+        ModuleDecoderRegistry,
+    ) -> BoxFuture<'r, anyhow::Result<Option<(Vec<DynState>, Vec<DynState>)>>>;
+
+/// `apply_migrations_client` iterates from the on disk database version for the
+/// client module up to `target_db_version` and executes all of the migrations
+/// that exist in the migrations map, including state machine migrations.
+/// Each migration in the migrations map updates the database to have the
+/// correct on-disk data structures that the code is expecting. The entire
+/// process is atomic, (i.e migration from 0->1 and 1->2 happen atomically).
+/// This function is called before the module is initialized and as long as the
+/// correct migrations are supplied in the migrations map, the module
+/// will be able to read and write from the database successfully.
+pub async fn apply_migrations_client(
+    db: &Database,
+    kind: String,
+    target_version: DatabaseVersion,
+    migrations: BTreeMap<DatabaseVersion, ClientMigrationFn>,
+    module_instance_id: ModuleInstanceId,
+    decoders: ModuleDecoderRegistry,
+) -> Result<(), anyhow::Error> {
+    // Newly created databases will not have any data underneath the
+    // `MODULE_GLOBAL_PREFIX` since they have just been instantiated.
+    let mut dbtx = db.begin_transaction_nc().await;
+    let is_new_db = dbtx
+        .raw_find_by_prefix(&[MODULE_GLOBAL_PREFIX])
+        .await?
+        .next()
+        .await
+        .is_none();
+
+    // First write the database version to disk if it does not exist.
+    create_database_version(
+        db,
+        target_version,
+        Some(module_instance_id),
+        kind.clone(),
+        is_new_db,
+    )
+    .await?;
+
+    let mut global_dbtx = db.begin_transaction().await;
+    let current_version = global_dbtx
+        .get_value(&DatabaseVersionKey(module_instance_id))
+        .await;
+
+    let db_version = if let Some(mut current_version) = current_version {
+        if current_version == target_version {
+            trace!(
+                target: LOG_CLIENT_DB,
+                %current_version,
+                %target_version,
+                module_instance_id,
+                kind,
+                "Database version up to date"
+            );
+            global_dbtx.ignore_uncommitted();
+            return Ok(());
+        }
+
+        if target_version < current_version {
+            return Err(anyhow::anyhow!(format!(
+                "On disk database version for module {kind} was higher ({}) than the target database version ({}).",
+                current_version,
+                target_version,
+            )));
+        }
+
+        info!(
+            target: LOG_CLIENT_DB,
+            %current_version,
+            %target_version,
+            module_instance_id,
+            kind,
+            "Migrating client module database"
+        );
+        let mut active_states =
+            get_active_states(&mut global_dbtx.to_ref_nc(), module_instance_id).await;
+        let mut inactive_states =
+            get_inactive_states(&mut global_dbtx.to_ref_nc(), module_instance_id).await;
+
+        while current_version < target_version {
+            let new_states = if let Some(migration) = migrations.get(&current_version) {
+                debug!(
+                     target: LOG_CLIENT_DB,
+                     module_instance_id,
+                     %kind,
+                     %current_version,
+                     %target_version,
+                     "Running module db migration");
+
+                migration(
+                    &mut global_dbtx
+                        .to_ref_with_prefix_module_id(module_instance_id)
+                        .into_nc(),
+                    module_instance_id,
+                    active_states.clone(),
+                    inactive_states.clone(),
+                    decoders.clone(),
+                )
+                .await?
+            } else {
+                warn!(
+                    target: LOG_CLIENT_DB,
+                    ?current_version, "Missing client db migration");
+                None
+            };
+
+            // If the client migration returned new states, a state machine migration has
+            // occurred, and the new states need to be persisted to the database.
+            if let Some((new_active_states, new_inactive_states)) = new_states {
+                remove_old_and_persist_new_active_states(
+                    &mut global_dbtx.to_ref_nc(),
+                    new_active_states.clone(),
+                    active_states.clone(),
+                    module_instance_id,
+                )
+                .await;
+                remove_old_and_persist_new_inactive_states(
+                    &mut global_dbtx.to_ref_nc(),
+                    new_inactive_states.clone(),
+                    inactive_states.clone(),
+                    module_instance_id,
+                )
+                .await;
+
+                // the new states become the old states for the next migration
+                active_states = new_active_states
+                    .into_iter()
+                    .map(|state| (state.to_bytes(), state.operation_id()))
+                    .collect::<Vec<_>>();
+                inactive_states = new_inactive_states
+                    .into_iter()
+                    .map(|state| (state.to_bytes(), state.operation_id()))
+                    .collect::<Vec<_>>();
+            }
+
+            current_version.increment();
+            global_dbtx
+                .insert_entry(&DatabaseVersionKey(module_instance_id), &current_version)
+                .await;
+        }
+
+        current_version
+    } else {
+        target_version
+    };
+
+    global_dbtx.commit_tx_result().await?;
+    info!(
+        target: LOG_CLIENT_DB,
+        ?kind, ?db_version, "Migration complete");
+    Ok(())
+}
+
+/// Reads all active states from the database and returns `Vec<DynState>`.
+/// TODO: It is unfortunate that we can't read states by the module's instance
+/// id so we are forced to return all active states. Once we do a db migration
+/// to add `module_instance_id` to `ActiveStateKey`, this can be improved to
+/// only read the module's relevant states.
+pub async fn get_active_states(
+    dbtx: &mut DatabaseTransaction<'_>,
+    module_instance_id: ModuleInstanceId,
+) -> Vec<(Vec<u8>, OperationId)> {
+    dbtx.find_by_prefix(&ActiveStateKeyPrefixBytes)
+        .await
+        .filter_map(|(state, _)| async move {
+            if module_instance_id == state.module_instance_id {
+                Some((state.state, state.operation_id))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>()
+        .await
+}
+
+/// Reads all inactive states from the database and returns `Vec<DynState>`.
+/// TODO: It is unfortunate that we can't read states by the module's instance
+/// id so we are forced to return all inactive states. Once we do a db migration
+/// to add `module_instance_id` to `InactiveStateKey`, this can be improved to
+/// only read the module's relevant states.
+pub async fn get_inactive_states(
+    dbtx: &mut DatabaseTransaction<'_>,
+    module_instance_id: ModuleInstanceId,
+) -> Vec<(Vec<u8>, OperationId)> {
+    dbtx.find_by_prefix(&InactiveStateKeyPrefixBytes)
+        .await
+        .filter_map(|(state, _)| async move {
+            if module_instance_id == state.module_instance_id {
+                Some((state.state, state.operation_id))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>()
+        .await
+}
+
+/// Persists new active states by first removing all current active states, and
+/// re-writing with the new set of active states. `new_active_states` is
+/// expected to contain all active states, not just the newly created states.
+pub async fn remove_old_and_persist_new_active_states(
+    dbtx: &mut DatabaseTransaction<'_>,
+    new_active_states: Vec<DynState>,
+    states_to_remove: Vec<(Vec<u8>, OperationId)>,
+    module_instance_id: ModuleInstanceId,
+) {
+    // Remove all existing active states
+    for (bytes, operation_id) in states_to_remove {
+        dbtx.remove_entry(&ActiveStateKeyBytes {
+            operation_id,
+            module_instance_id,
+            state: bytes,
+        })
+        .await
+        .expect("Did not delete anything");
+    }
+
+    let new_active_states = new_active_states
+        .into_iter()
+        .map(|state| {
+            (
+                ActiveStateKey::from_state(state),
+                ActiveStateMeta::default(),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    // Insert new "migrated" active states
+    for (state, active_state) in new_active_states {
+        dbtx.insert_new_entry(&state, &active_state).await;
+    }
+}
+
+/// Persists new inactive states by first removing all current inactive states,
+/// and re-writing with the new set of inactive states. `new_inactive_states` is
+/// expected to contain all inactive states, not just the newly created states.
+pub async fn remove_old_and_persist_new_inactive_states(
+    dbtx: &mut DatabaseTransaction<'_>,
+    new_inactive_states: Vec<DynState>,
+    states_to_remove: Vec<(Vec<u8>, OperationId)>,
+    module_instance_id: ModuleInstanceId,
+) {
+    // Remove all existing active states
+    for (bytes, operation_id) in states_to_remove {
+        dbtx.remove_entry(&InactiveStateKeyBytes {
+            operation_id,
+            module_instance_id,
+            state: bytes,
+        })
+        .await
+        .expect("Did not delete anything");
+    }
+
+    let new_inactive_states = new_inactive_states
+        .into_iter()
+        .map(|state| {
+            (
+                InactiveStateKey::from_state(state),
+                InactiveStateMeta {
+                    created_at: fedimint_core::time::now(),
+                    exited_at: fedimint_core::time::now(),
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+
+    // Insert new "migrated" inactive states
+    for (state, inactive_state) in new_inactive_states {
+        dbtx.insert_new_entry(&state, &inactive_state).await;
+    }
+}
+
+/// Migrates a particular state by looping over all active and inactive states.
+/// If the `migrate` closure returns `None`, this state was not migrated and
+/// should be added to the new state machine vectors.
+pub async fn migrate_state<S: State + IntoDynInstance<DynType = DynState>>(
+    module_instance_id: ModuleInstanceId,
+    active_states: Vec<(Vec<u8>, OperationId)>,
+    inactive_states: Vec<(Vec<u8>, OperationId)>,
+    decoders: ModuleDecoderRegistry,
+    migrate: fn(
+        &[u8],
+        ModuleInstanceId,
+        &ModuleDecoderRegistry,
+    ) -> anyhow::Result<Option<DynState>>,
+) -> anyhow::Result<Option<(Vec<DynState>, Vec<DynState>)>> {
+    let mut new_active_states = Vec::with_capacity(active_states.len());
+    for (active_state, _) in active_states {
+        let bytes = active_state.as_slice();
+        let state = match migrate(bytes, module_instance_id, &decoders)? {
+            Some(state) => state,
+            None => {
+                // Try to decode the bytes as a `DynState`
+                let dynstate = DynState::from_bytes(bytes, &decoders)?;
+                let state_machine = dynstate
+                    .as_any()
+                    .downcast_ref::<S>()
+                    .expect("Unexpected DynState supplied to migration function");
+                state_machine.clone().into_dyn(module_instance_id)
+            }
+        };
+
+        new_active_states.push(state);
+    }
+
+    let mut new_inactive_states = Vec::with_capacity(inactive_states.len());
+    for (inactive_state, _) in inactive_states {
+        let bytes = inactive_state.as_slice();
+        let state = match migrate(bytes, module_instance_id, &decoders)? {
+            Some(state) => state,
+            None => {
+                // Try to decode the bytes as a `DynState`
+                let dynstate = DynState::from_bytes(bytes, &decoders)?;
+                let state_machine = dynstate
+                    .as_any()
+                    .downcast_ref::<S>()
+                    .expect("Unexpected DynState supplied to migration function");
+                state_machine.clone().into_dyn(module_instance_id)
+            }
+        };
+
+        new_inactive_states.push(state);
+    }
+
+    Ok(Some((new_active_states, new_inactive_states)))
+}

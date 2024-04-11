@@ -2,15 +2,20 @@
   inputs = {
     nixpkgs = {
       url = "github:nixos/nixpkgs/nixos-23.11";
-      # We use nixpkgs as input of `flakebox`, as it locks things like
-      # toolchains, in versions that are actually tested in flakebox's CI to
-      # cross-compile things well. This also saves us download and Nix
-      # evaluation time.
-      follows = "flakebox/nixpkgs";
     };
     flake-utils.url = "github:numtide/flake-utils";
+    fenix = {
+      url = "github:nix-community/fenix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
     flakebox = {
-      url = "github:dpc/flakebox?rev=d7f57f94f2dca67dafd02b31b030b62f6fefecbc";
+      url = "github:dpc/flakebox?rev=34ce1b8f8c60661e06dc54ce07deb1ff0ed2b7f5";
+      inputs.nixpkgs.follows = "nixpkgs";
+      inputs.fenix.follows = "fenix";
+    };
+    bundlers = {
+      # TODO: switch back to upstream after https://github.com/matthewbauer/nix-bundle/pull/103 is available
+      url = "github:dpc/bundlers?branch=24-02-21-tar-deterministic&rev=e8aafe89a11ae0a5f3ce97d1d7d0fcfb354c79eb";
     };
     advisory-db = {
       url = "github:rustsec/advisory-db";
@@ -18,96 +23,46 @@
     };
   };
 
-  outputs = { self, nixpkgs, flake-utils, flakebox, advisory-db }:
+  outputs = { self, nixpkgs, flake-utils, flakebox, advisory-db, bundlers, ... }:
+    let
+      # overlay combining all overlays we use
+      overlayAll =
+        nixpkgs.lib.composeManyExtensions
+          [
+            (import ./nix/overlays/rocksdb.nix)
+            (import ./nix/overlays/wasm-bindgen.nix)
+            (import ./nix/overlays/cargo-nextest.nix)
+            (import ./nix/overlays/cargo-llvm-cov.nix)
+            (import ./nix/overlays/esplora-electrs.nix)
+            (import ./nix/overlays/clightning.nix)
+            (import ./nix/overlays/darwin-compile-fixes.nix)
+            (import ./nix/overlays/cargo-honggfuzz.nix)
+          ];
+    in
+    {
+      overlays = {
+        # technically overlay outputs are supposed to be just a function,
+        # instead of a list, but keeping this one just to phase it out smoothly
+        fedimint = [ overlayAll ];
+        all = overlayAll;
+        wasm-bindgen = import ./nix/overlays/wasm-bindgen.nix;
+        darwin-compile-fixes = import ./nix/overlays/darwin-compile-fixes.nix;
+        cargo-honggfuzz = import ./nix/overlays/cargo-honggfuzz.nix;
+      };
+
+      bundlers = bundlers.bundlers;
+      defaultBundler = bundlers.defaultBundler;
+
+      nixosModules = {
+        fedimintd = import ./nix/modules/fedimintd.nix;
+      };
+    } //
     flake-utils.lib.eachDefaultSystem
       (system:
         let
-
           pkgs = import nixpkgs {
             inherit system;
-            overlays = [
-              (final: prev: {
-
-                wasm-bindgen-cli = final.rustPlatform.buildRustPackage rec {
-                  pname = "wasm-bindgen-cli";
-                  version = "0.2.89";
-                  hash = "sha256-IPxP68xtNSpwJjV2yNMeepAS0anzGl02hYlSTvPocz8=";
-                  cargoHash = "sha256-pBeQaG6i65uJrJptZQLuIaCb/WCQMhba1Z1OhYqA8Zc=";
-
-                  src = final.fetchCrate {
-                    inherit pname version hash;
-                  };
-
-                  nativeBuildInputs = [ final.pkg-config ];
-
-                  buildInputs = [ final.openssl ] ++ lib.optionals stdenv.isDarwin [
-                    final.curl
-                    final.darwin.apple_sdk.frameworks.Security
-                  ];
-
-                  nativeCheckInputs = [ final.nodejs ];
-
-                  # tests require it to be ran in the wasm-bindgen monorepo
-                  doCheck = false;
-                };
-
-                rocksdb_7_10 = prev.rocksdb_7_10.overrideAttrs (oldAttrs:
-                  pkgs.lib.optionalAttrs pkgs.stdenv.isDarwin {
-                    # C++ and its damn super-fragie compilation
-                    env = oldAttrs.env // {
-                      NIX_CFLAGS_COMPILE = oldAttrs.env.NIX_CFLAGS_COMPILE + " -Wno-error=unused-but-set-variable";
-                    };
-                  });
-
-                rocksdb_6_23 = prev.rocksdb_6_23.overrideAttrs (oldAttrs:
-                  pkgs.lib.optionalAttrs pkgs.stdenv.isDarwin {
-                    # C++ and its damn super-fragie compilation
-                    env = oldAttrs.env // {
-                      NIX_CFLAGS_COMPILE = oldAttrs.env.NIX_CFLAGS_COMPILE + " -Wno-error=unused-but-set-variable -Wno-error=deprecated-copy";
-                    };
-                  });
-
-                esplora-electrs = prev.callPackage ./nix/esplora-electrs.nix {
-                  inherit (prev.darwin.apple_sdk.frameworks) Security;
-                };
-
-                bitcoind = prev.bitcoind.overrideAttrs (oldAttrs: {
-                  # tests broken on Mac for some reason
-                  doCheck = !prev.stdenv.isDarwin;
-                });
-
-                # syncing channels doesn't work right on newer versions, exactly like described here
-                # https://bitcoin.stackexchange.com/questions/84765/how-can-channel-policy-be-missing
-                # note that config-time `--enable-developer` turns into run-time `--developer` at some
-                # point
-                clightning = prev.clightning.overrideAttrs (oldAttrs: rec {
-                  version = "23.05.2";
-                  src = prev.fetchurl {
-                    url = "https://github.com/ElementsProject/lightning/releases/download/v${version}/clightning-v${version}.zip";
-                    sha256 = "sha256-Tj5ybVaxpk5wmOw85LkeU4pgM9NYl6SnmDG2gyXrTHw=";
-                  };
-                  makeFlags = [ "VERSION=v${version}" ];
-                  configureFlags = [ "--enable-developer" "--disable-valgrind" ];
-                  NIX_CFLAGS_COMPILE = "-w";
-                });
-
-                # Note: shell script adding DYLD_FALLBACK_LIBRARY_PATH because of: https://github.com/nextest-rs/nextest/issues/962
-                cargo-nextest = pkgs.writeShellScriptBin "cargo-nextest" "exec env DYLD_FALLBACK_LIBRARY_PATH=\"$(dirname $(${pkgs.which}/bin/which rustc))/../lib\" ${prev.cargo-nextest}/bin/cargo-nextest \"$@\"";
-
-                cargo-llvm-cov = prev.rustPlatform.buildRustPackage rec {
-                  pname = "cargo-llvm-cov";
-                  version = "0.5.31";
-                  buildInputs = [ ];
-
-                  src = pkgs.fetchCrate {
-                    inherit pname version;
-                    sha256 = "sha256-HjnP9H1t660PJ5eXzgAhrdDEgqdzzb+9Dbk5RGUPjaQ=";
-                  };
-                  doCheck = false;
-                  cargoHash = "sha256-p6zpRRNX4g+jESNSwouWMjZlFhTBFJhe7LirYtFrZ1g=";
-                };
-              })
-            ];
+            overlays = [ overlayAll ];
           };
 
           lib = pkgs.lib;
@@ -121,9 +76,9 @@
                 "rustc"
                 "cargo"
                 "clippy"
-                "rust-analysis"
+                "rust-analyzer"
                 "rust-src"
-                "llvm-tools-preview"
+                "llvm-tools"
               ];
 
               motd = {
@@ -136,7 +91,7 @@
               };
               # we have our own weird CI workflows
               github.ci.enable = false;
-              just.includePaths = [
+              just.importPaths = [
                 "justfile.fedimint.just"
               ];
               # we have a custom final check
@@ -156,56 +111,57 @@
             stdenv = pkgs.clang11Stdenv;
           };
 
-          # all standard toolchains provided by flakebox
-          toolchainsStd =
-            flakeboxLib.mkStdFenixToolchains toolchainArgs;
+          stdTargets = flakeboxLib.mkStdTargets { };
+          stdToolchains = flakeboxLib.mkStdToolchains toolchainArgs;
+
 
           # toolchains for the native build (default shell)
-          toolchainsNative = (pkgs.lib.getAttrs
-            [
-              "default"
-            ]
-            toolchainsStd
-          );
+          toolchainNative = flakeboxLib.mkFenixToolchain (toolchainArgs
+          // {
+            targets = (pkgs.lib.getAttrs
+              [
+                "default"
+                "wasm32-unknown"
+              ]
+              stdTargets
+            );
+          });
 
-          # toolchains for the `cross` shell
-          toolchainsCross = (pkgs.lib.getAttrs
-            ([
-              "default"
-              "nightly"
-              "aarch64-android"
-              "x86_64-android"
-              "arm-android"
-              "armv7-android"
-              "wasm32-unknown"
-            ] ++ lib.optionals pkgs.stdenv.isDarwin [
-              "aarch64-ios"
-              "aarch64-ios-sim"
-              "x86_64-ios"
-            ])
-            toolchainsStd
-          );
+          # toolchains for the native + wasm build
+          toolchainWasm = flakeboxLib.mkFenixToolchain (toolchainArgs
+          // {
+            defaultTarget = "wasm32-unknown-unknown";
+            targets = (pkgs.lib.getAttrs
+              [
+                "default"
+                "wasm32-unknown"
+              ]
+              stdTargets
+            );
 
-          # toolchains for the wasm build (`crossWasm` shell)
-          toolchainsWasm = (pkgs.lib.getAttrs
-            [
-              "default"
-              "wasm32-unknown"
-            ]
-            toolchainsStd
-          );
+            args = {
+              nativeBuildInputs = [ pkgs.firefox pkgs.wasm-bindgen-cli pkgs.geckodriver pkgs.wasm-pack ];
+            };
+          });
 
-          toolchainNative = flakeboxLib.mkFenixMultiToolchain {
-            toolchains = toolchainsNative;
-          };
-
-          toolchainAll = flakeboxLib.mkFenixMultiToolchain {
-            toolchains = toolchainsCross;
-          };
-          toolchainWasm = flakeboxLib.mkFenixMultiToolchain {
-            toolchains = toolchainsWasm;
-          };
-
+          # toolchains for the native + wasm build
+          toolchainAll = flakeboxLib.mkFenixToolchain (toolchainArgs
+          // {
+            targets = (pkgs.lib.getAttrs
+              ([
+                "default"
+                "aarch64-android"
+                "x86_64-android"
+                "arm-android"
+                "armv7-android"
+                "wasm32-unknown"
+              ] ++ lib.optionals pkgs.stdenv.isDarwin [
+                "aarch64-ios"
+                "aarch64-ios-sim"
+                "x86_64-ios"
+              ])
+              stdTargets);
+          });
           # Replace placeholder git hash in a binary
           #
           # To avoid impurity, we use a git hash placeholder when building binaries
@@ -250,7 +206,7 @@
             # to it.
             inherit craneMultiBuild;
 
-            toolchains = toolchainsCross;
+            toolchains = stdToolchains // { "wasm32-unknown" = toolchainWasm; };
             profiles = [ "dev" "ci" "test" "release" ];
           };
 
@@ -267,6 +223,8 @@
                   pkgs.cargo-deny
                   pkgs.parallel
                   pkgs.just
+                  pkgs.time
+                  pkgs.gawk
 
                   (pkgs.writeShellScriptBin "git-recommit" "exec git commit --edit -F <(cat \"$(git rev-parse --git-path COMMIT_EDITMSG)\" | grep -v -E '^#.*') \"$@\"")
 
@@ -291,18 +249,21 @@
                   # Nix
                   pkgs.nixpkgs-fmt
                   pkgs.shellcheck
-                  pkgs.rnix-lsp
                   pkgs.nil
                   pkgs.convco
                   pkgs.nodePackages.bash-language-server
+                  pkgs.sccache
                 ] ++ lib.optionals (!stdenv.isAarch64 && !stdenv.isDarwin) [
                   pkgs.semgrep
-                ] ++ lib.optionals (stdenv.isLinux) [
-                  pkgs.xclip
-                  pkgs.wl-clipboard
+                ] ++ lib.optionals (!stdenv.isDarwin) [
+                  # broken on MacOS?
+                  pkgs.cargo-workspaces
                 ];
 
                 shellHook = ''
+                  export REPO_ROOT="$(git rev-parse --show-toplevel)"
+                  export PATH="$REPO_ROOT/bin:$PATH"
+
                   # workaround https://github.com/rust-lang/cargo/issues/11020
                   cargo_cmd_bins=( $(ls $HOME/.cargo/bin/cargo-{clippy,udeps,llvm-cov} 2>/dev/null) )
                   if (( ''${#cargo_cmd_bins[@]} != 0 )); then
@@ -320,8 +281,15 @@
                     fi
                   fi
 
+                  export RUSTC_WRAPPER=${pkgs.sccache}/bin/sccache
+                  export CARGO_BUILD_TARGET_DIR="''${CARGO_BUILD_TARGET_DIR:-''${REPO_ROOT}/target-nix}"
+                  export FM_DISCOVER_API_VERSION_TIMEOUT=10
+                  [ -f "$REPO_ROOT/.shrc.local" ] && source "$REPO_ROOT/.shrc.local"
+
                   if [ ''${#TMPDIR} -ge 40 ]; then
-                      >&2 echo "⚠️  TMPDIR too long. This might lead to problems running tests and regtest fed. Are you nesting 'nix develop' invocations?"
+                      >&2 echo "⚠️  TMPDIR too long. This might lead to problems running tests and regtest fed. Will try to use /tmp/ instead"
+                      # Note: this seems to work fine in `nix develop`, but doesn't work on some `direnv` implementations (doesn't work for dpc at least)
+                      export TMPDIR="/tmp"
                   fi
 
                   if [ "$(ulimit -Sn)" -lt "1024" ]; then
@@ -340,6 +308,18 @@
               # the settings and tools necessary to build and work with the codebase.
               default = flakeboxLib.mkDevShell (commonShellArgs // { });
 
+              fuzz = flakeboxLib.mkDevShell (commonShellArgs // {
+                nativeBuildInputs = with pkgs; [
+                  cargo-hongfuzz
+                  libbfd_2_38
+                  libunwind.dev
+                  libopcodes_2_38
+                  libblocksruntime
+                  lldb
+                  clang
+                ];
+              });
+
               lint = flakeboxLib.mkLintShell { };
 
               # Shell with extra stuff to support cross-compilation with `cargo build --target <target>`
@@ -351,8 +331,9 @@
                 shellHook = ''
                   # hijack cargo for our evil purposes
                   export CARGO_ORIG_BIN="$(${pkgs.which}/bin/which cargo)"
-                  git_root="$(git rev-parse --show-toplevel)"
-                  export PATH="''${git_root}/nix/cargo-wrapper/:$PATH"
+                  export REPO_ROOT="$(git rev-parse --show-toplevel)"
+                  export PATH="$REPO_ROOT/bin:$PATH"
+                  export PATH="''${REPO_ROOT}/nix/cargo-wrapper/:$PATH"
                 '';
               });
 

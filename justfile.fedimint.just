@@ -22,6 +22,15 @@ test-ci-all:
 test-count:
   ./scripts/tests/test-cov.sh
 
+test-compatibility *VERSIONS="v0.2.1":
+  ./scripts/tests/test-ci-all-backcompat.sh {{VERSIONS}}
+
+test-full-compatibility *VERSIONS="v0.2.1":
+  env FM_FULL_VERSION_MATRIX=1 ./scripts/tests/test-ci-all-backcompat.sh {{VERSIONS}}
+
+test-upgrades *VERSIONS="v0.2.1 v0.2.2":
+  ./scripts/tests/upgrade-test.sh {{VERSIONS}}
+
 # `cargo udeps` check
 udeps:
   nix build -L .#debug.workspaceCargoUdeps
@@ -34,24 +43,64 @@ final-check: lint
   just test
 
 check-wasm:
-  nix develop .#crossWasm -c cargo check --target wasm32-unknown-unknown --package fedimint-client
+  #!/usr/bin/env bash
+  env CARGO_BUILD_TARGET_DIR=${CARGO_BUILD_TARGET_DIR:-$(pwd)/target}/pkgs/check-wasm \
+    nix develop .#crossWasm -c \
+      cargo check --target wasm32-unknown-unknown \
+        --package fedimint-client \
+        --package fedimint-wasm-tests
 
 # regenerate server db migration snapshots
-# ex: `just prepare_server_db_migration_snapshots fedimint-server`
-# ex: `just prepare_server_db_migration_snapshots fedimint-mint-tests`
-# ex: `just prepare_server_db_migration_snapshots fedimint-ln-tests`
-# ex: `just prepare_server_db_migration_snapshots fedimint-wallet-tests`
-# ex: `just prepare_server_db_migration_snapshots fedimint-dummy-tests`
-prepare_server_db_migration_snapshots +extra_args:
-  env FM_PREPARE_DB_MIGRATION_SNAPSHOTS=force cargo test ${CARGO_PROFILE:+--profile ${CARGO_PROFILE}} -p {{extra_args}} prepare_server_db_migration_snapshots
+# ex: `just snapshot-server-db-migrations fedimint-server`
+# ex: `just snapshot-server-db-migrations fedimint-mint-tests`
+# ex: `just snapshot-server-db-migrations fedimint-ln-tests`
+# ex: `just snapshot-server-db-migrations fedimint-wallet-tests`
+# ex: `just snapshot-server-db-migrations fedimint-dummy-tests`
+# ex: `just snapshot-server-db-migrations fedimint-ln-gateway`
+snapshot-server-db-migrations PACKAGE *EXTRA_ARGS:
+  env FM_PREPARE_DB_MIGRATION_SNAPSHOTS=force cargo nextest run --workspace --all-targets ${CARGO_PROFILE:+--profile ${CARGO_PROFILE}} -E 'package({{PACKAGE}})' snapshot_server_db_migrations {{EXTRA_ARGS}}
+  just test-server-db-migrations {{PACKAGE}} {{EXTRA_ARGS}}
+
+test-server-db-migrations PACKAGE *EXTRA_ARGS:
+  env FM_PREPARE_DB_MIGRATION_SNAPSHOTS=force cargo nextest run --workspace --all-targets ${CARGO_PROFILE:+--profile ${CARGO_PROFILE}} -E 'package({{PACKAGE}})' test_server_db_migrations {{EXTRA_ARGS}}
+
 
 # regenerate client db migration snapshots
-# ex: `just prepare_client_db_migration_snapshots fedimint-dummy-tests`
-# ex: `just prepare_client_db_migration_snapshots fedimint-mint-tests`
-# ex: `just prepare_client_db_migration_snapshots fedimint-ln-tests`
-# ex: `just prepare_client_db_migration_snapshots fedimint-wallet-tests`
-prepare_client_db_migration_snapshots +extra_args:
-  env FM_PREPARE_DB_MIGRATION_SNAPSHOTS=force cargo test ${CARGO_PROFILE:+--profile ${CARGO_PROFILE}} -p {{extra_args}} prepare_client_db_migration_snapshots
+# ex: `just snapshot-client-db-migrations fedimint-dummy-tests`
+# ex: `just snapshot-client-db-migrations fedimint-mint-tests`
+# ex: `just snapshot-client-db-migrations fedimint-ln-tests`
+# ex: `just snapshot-client-db-migrations fedimint-wallet-tests`
+snapshot-client-db-migrations PACKAGE *EXTRA_ARGS:
+  env FM_PREPARE_DB_MIGRATION_SNAPSHOTS=force cargo nextest run --workspace --all-targets ${CARGO_PROFILE:+--profile ${CARGO_PROFILE}} -E 'package({{PACKAGE}})' snapshot_client_db_migrations {{EXTRA_ARGS}}
+  just test-client-db-migrations {{PACKAGE}} {{EXTRA_ARGS}}
+
+test-client-db-migrations PACKAGE *EXTRA_ARGS:
+  env FM_PREPARE_DB_MIGRATION_SNAPSHOTS=force cargo nextest run --workspace --all-targets ${CARGO_PROFILE:+--profile ${CARGO_PROFILE}} -E 'package({{PACKAGE}})' test_client_db_migrations {{EXTRA_ARGS}}
+
+test-db-migrations:
+  just test-client-db-migrations fedimint-dummy-tests
+  just test-client-db-migrations fedimint-mint-tests
+  just test-client-db-migrations fedimint-ln-tests
+  just test-client-db-migrations fedimint-wallet-tests
+  just test-server-db-migrations fedimint-dummy-tests
+  just test-server-db-migrations fedimint-mint-tests
+  just test-server-db-migrations fedimint-ln-tests
+  just test-server-db-migrations fedimint-wallet-tests
+  just test-server-db-migrations fedimint-server
+  just test-server-db-migrations fedimint-ln-gateway
+
+snapshot-db-migrations:
+  just snapshot-client-db-migrations fedimint-dummy-tests
+  just snapshot-client-db-migrations fedimint-mint-tests
+  just snapshot-client-db-migrations fedimint-ln-tests
+  just snapshot-client-db-migrations fedimint-wallet-tests
+  just snapshot-server-db-migrations fedimint-dummy-tests
+  just snapshot-server-db-migrations fedimint-mint-tests
+  just snapshot-server-db-migrations fedimint-ln-tests
+  just snapshot-server-db-migrations fedimint-wallet-tests
+  just snapshot-server-db-migrations fedimint-server
+  just snapshot-server-db-migrations fedimint-ln-gateway
+  just test-db-migrations
 
 # start mprocs with a dev federation setup. Default: 4 nodes, add `-n 1` argument to start only 1 node
 mprocs *PARAMS:
@@ -65,6 +114,15 @@ exit-mprocs:
 tmuxinator:
   ./scripts/dev/tmuxinator/run.sh
 
+devimint-env *PARAMS:
+  ./scripts/dev/devimint-env.sh {{PARAMS}}
+
+devimint-env-tmux *PARAMS:
+  ./scripts/dev/tmuxinator/run.sh {{PARAMS}}
+
+devimint-env-mprocs *PARAMS:
+  ./scripts/dev/mprocs/run.sh {{PARAMS}}
+
 # exit tmuxinator session
 exit-tmuxinator:
   tmux kill-session -t fedimint-dev
@@ -72,3 +130,82 @@ exit-tmuxinator:
 # backport a PR
 backport-pr pr:
   nix shell nixpkgs#nodejs -c npx backport --pr-filter {{pr}}
+
+# sign a release (git tag)
+sign-release tag:
+  ./scripts/release/sign.sh {{tag}}
+
+# benchmark compilation times
+bench-compilation:
+  ./scripts/bench-compilation.sh
+
+fuzz-target TARGET="" *ARGS="--exit_upon_crash":
+  #!/usr/bin/env bash
+  set -euo pipefail
+
+  if [ -z "{{TARGET}}" ]; then
+    >&2 echo "Available targets:"
+    >&2 echo ""
+    ls fuzz/src/bin/ | sed -e 's/.rs$//g'
+    exit 1
+  fi
+  # reference: https://github.com/google/honggfuzz/blob/master/docs/USAGE.md#usage
+  export HFUZZ_RUN_ARGS="{{ARGS}}"
+  # notes:
+  # * TODO: make flakebox set CC, as hfuzz seems to ignore CC_<target>
+  # * TODO: make flakebox set RUSTFLAGS, as hfuzz seems to ignore CARGO_BUILD_<target>_RUSTFLAGS
+  # * can't be run with sccache, so just disable here
+  env -u RUSTC_WRAPPER CC=clang RUSTFLAGS="--cfg tokio_unstable" cargo hfuzz run {{TARGET}}
+
+fuzz-target-debug TARGET="" CRASH="" *ARGS="--exit_upon_crash":
+  #!/usr/bin/env bash
+  set -euo pipefail
+
+  if [ -z "{{TARGET}}" ]; then
+    >&2 echo "Available targets:"
+    >&2 echo ""
+    ls fuzz/src/bin/ | sed -e 's/.rs$//g'
+    exit 1
+  fi
+  # reference: https://github.com/google/honggfuzz/blob/master/docs/USAGE.md#usage
+  export HFUZZ_RUN_ARGS="{{ARGS}}"
+
+  export HFUZZ_DEBUGGER=${HFUZZ_DEBUGGER:-gdb}
+  crash="CRASH"
+  if [ -z "${CRASH:-}" ]; then
+    CRASH="hfuzz_workspace/{{TARGET}}/*.fuzz"
+  fi
+  # notes:
+  # * TODO: make flakebox set CC, as hfuzz seems to ignore CC_<target>
+  # * TODO: make flakebox set RUSTFLAGS, as hfuzz seems to ignore CARGO_BUILD_<target>_RUSTFLAGS
+  # * can't be run with sccache, so just disable here
+  env -u RUSTC_WRAPPER CC=clang RUSTFLAGS="--cfg tokio_unstable" cargo hfuzz run-debug {{TARGET}} ${CRASH}
+
+# Build `cargo doc`-generated documentation
+build-docs:
+  ./scripts/dev/build-docs.sh
+
+# Open `cargo doc`-generated documentation
+docs: build-docs
+  #!/usr/bin/env bash
+  if command -v xdg-open 1>/dev/null 2>/dev/null ; then
+    open_cmd="xdg-open"
+  elif command -v open 1>/dev/null 2>/dev/null ; then
+    open_cmd="open"
+  else
+    >&2 echo "Install xdg-open. Falling back to one from nix"
+    open_cmd="nix shell nixpkgs#xdg-utils -c xdg-open"
+  fi
+  source "scripts/_common.sh"
+  main_index_path="${CARGO_BUILD_TARGET_DIR}/doc/index.html"
+  fallback_index_path="${CARGO_BUILD_TARGET_DIR}/doc/fedimint_core/index.html"
+  if [ -e "$main_index_path" ]; then
+    echo "file://$fallback_index_path"
+    $open_cmd "$main_index_path" || true
+  else
+    echo "file://$fallback_index_path"
+    $open_cmd "$fallback_index_path" || true
+  fi
+
+release-bump-version VERSION="prerelease":
+  cargo workspaces version --all --exact --no-git-commit --yes --force '*' --pre-id rc {{VERSION}}
